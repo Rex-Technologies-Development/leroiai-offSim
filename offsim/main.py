@@ -28,13 +28,14 @@ def cmd_demo(args):
         render_mode="human",
         failure_config=FailureConfig.none(),
         opponent_type=args.opponent,
+        num_allies=args.num_robots,
     )
     obs, _ = env.reset(seed=42)
     rng = np.random.default_rng(42)
     episode = 1
     total_reward = 0.0
 
-    print("VEX AI Sim Demo — random actions")
+    print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s), random actions")
     print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
 
     while True:
@@ -53,7 +54,9 @@ def cmd_demo(args):
 
         actions = rng.integers(0, NUM_ACTIONS, size=2)
         obs, rewards, done, _, _ = env.step(actions)
-        total_reward += rewards[0] + rewards[1]
+        total_reward += rewards[0]
+        if args.num_robots >= 2:
+            total_reward += rewards[1]
 
         if done:
             print(f"Ep {episode}: Us={env.field.my_score} Opp={env.field.opponent_score} "
@@ -193,6 +196,8 @@ def main():
     p = sub.add_parser("demo", help="Visual sim with random actions")
     p.add_argument("--opponent", default="mixed",
                    choices=["random", "greedy", "defensive", "mixed"])
+    p.add_argument("--num-robots", type=int, default=1, choices=[1, 2],
+                   help="Number of allied robots (default: 1)")
     p.set_defaults(func=cmd_demo)
 
     # --- train ---

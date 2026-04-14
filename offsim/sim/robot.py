@@ -59,19 +59,23 @@ class Robot:
         return self.actions_succeeded / self.actions_attempted
 
     # ------------------------------------------------------------------
-    # Tank-drive moveToPoint
+    # Tank-drive moveToPoint  (smooth arc model)
     # ------------------------------------------------------------------
     def move_toward_point(self, target: np.ndarray) -> bool:
-        """Advance one tick (DT seconds) toward target using tank drive.
+        """Advance one tick (DT seconds) toward target using smooth arc drive.
 
-        Tank drive behaviour:
-          1. Compute angle to target
-          2. Turn toward target (clamped by TURN_RATE * DT)
-          3. Drive forward (clamped by MAX_SPEED * DT)
-             - Drive speed scales down when angle error is large (realistic:
-               tank drive turns in place when error > 45deg, arcs when smaller)
+        Motion model (inspired by visual-tracking-demo proportional PID):
+          1. Compute angle error to target.
+          2. Turn proportionally to the error (P controller), capped by TURN_RATE.
+             → Large errors → fast turn; small errors → gentle curve.
+          3. Forward speed = MAX_SPEED * max(0.08, 1 - |angle_err| / π)
+             → Robot never fully stops; it arcs smoothly instead of
+               stopping to turn in place, giving fluid curved paths.
 
-        Returns True if the robot has reached the target (within 0.5in).
+        This matches the behaviour seen in leoxie080808/visual-tracking-demo-python
+        where forward_speed = speed * max(0.1, 1 - abs(angle_diff) / π).
+
+        Returns True when within 0.5in of target.
         """
         self.target = target.copy()
         diff = target - self.position
@@ -83,44 +87,28 @@ class Robot:
 
         self.moving = True
 
-        # Desired heading
+        # Desired heading and error
         desired_heading = np.arctan2(diff[1], diff[0])
-
-        # Angle error (wrapped to [-pi, pi])
         angle_err = _wrap_angle(desired_heading - self.heading)
 
-        # Turn (clamped by turn rate)
-        max_turn = TURN_RATE * DT
-        if abs(angle_err) <= max_turn:
-            self.heading = desired_heading
-        else:
-            self.heading += np.sign(angle_err) * max_turn
-        self.heading = _wrap_angle(self.heading)
+        # Proportional turn — gain of 4.0 rad/s per rad of error, capped by TURN_RATE
+        turn_delta = np.clip(angle_err * 4.0 * DT, -TURN_RATE * DT, TURN_RATE * DT)
+        self.heading = _wrap_angle(self.heading + turn_delta)
 
-        # Drive speed scales with alignment:
-        #   - angle_err > 45deg: turn in place (no forward movement)
-        #   - angle_err < 10deg: full speed
-        #   - in between: proportional
+        # Recompute error after this tick's turn
         abs_err = abs(_wrap_angle(desired_heading - self.heading))
-        if abs_err > np.radians(45):
-            drive_factor = 0.0   # turn in place
-        elif abs_err < np.radians(10):
-            drive_factor = 1.0   # full speed
-        else:
-            drive_factor = 1.0 - (abs_err - np.radians(10)) / np.radians(35)
 
+        # Continuous arc speed: full speed when aligned, 8% minimum when pointing away
+        drive_factor = max(0.08, 1.0 - abs_err / np.pi)
         max_move = MAX_SPEED * DT * drive_factor
-        if max_move > 0:
-            if dist <= max_move:
-                self.position = target.copy()
-            else:
-                forward = np.array([np.cos(self.heading), np.sin(self.heading)])
-                new_pos = self.position + forward * max_move
-                self.position = new_pos
 
-        # Clamp to field bounds
+        if dist <= max_move:
+            self.position = target.copy()
+        else:
+            forward = np.array([np.cos(self.heading), np.sin(self.heading)])
+            self.position = self.position + forward * max_move
+
         self._clamp_to_field()
-
         return np.linalg.norm(target - self.position) < 0.50
 
     def _clamp_to_field(self):

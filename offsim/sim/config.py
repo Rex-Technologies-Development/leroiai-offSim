@@ -1,8 +1,21 @@
 """Field dimensions, action IDs, state dims, timing constants.
 
-Field: 144.00in x 144.00in (12ft x 12ft VEX AI field)
+Game: VEX Push Back 2025-2026
+Field: 144.00in x 144.00in (12ft x 12ft)
 Robot: 15in x 15in footprint, tank drive
 Position precision: 2 decimal places in inches (matches real localization)
+
+Goals (top-down view):
+  OUR_LONG_GOAL  — right wall L-bracket (blue alliance, x≈138)
+  OPP_LONG_GOAL  — left wall L-bracket  (red alliance,  x≈6)
+  CENTER_MID_GOAL — center field, upper half (y≈84)
+  CENTER_LOW_GOAL — center field, lower half (y≈60)
+
+Ball colors:
+  BALL_RED  = 0 (22 red balls, start near left/opp side)
+  BALL_BLUE = 1 (22 blue balls, start near right/our side)
+  Note: color is for display and strategic awareness.
+  Either color can be scored in any goal in this sim.
 
 NOTE: The robot base is mecanum in real life, but we model it as tank drive
 for now. Strafing can be added later by modifying Robot.move_toward_point()
@@ -22,18 +35,24 @@ with open(_SHARED_CFG_PATH, "r") as f:
     SHARED_CFG = yaml.safe_load(f)
 
 # ---------------------------------------------------------------------------
-# Actions — the RL decides WHERE to go, not HOW to move
+# Ball colors
+# ---------------------------------------------------------------------------
+BALL_RED  = 0   # red alliance balls
+BALL_BLUE = 1   # blue alliance balls (our team)
+
+# ---------------------------------------------------------------------------
+# Actions — RL decides WHERE to go, not HOW to move
 # ---------------------------------------------------------------------------
 class Action(enum.IntEnum):
     COLLECT_NEAREST_BALL = 0
-    SCORE_LONG_GOAL = 1
-    SCORE_MID_GOAL = 2
-    DESCORE_OPPONENT_LONG = 3
-    DESCORE_OPPONENT_MID = 4
-    DEFEND_ZONE = 5
-    MOVE_TO_REGION_A = 6
-    MOVE_TO_REGION_B = 7
-    IDLE = 8
+    SCORE_LONG_GOAL      = 1   # score in our long goal (right wall)
+    SCORE_CENTER_GOAL    = 2   # score in nearest center goal
+    DESCORE_OPP_LONG     = 3   # descore from opponent long goal (left wall)
+    DESCORE_CENTER       = 4   # descore from center goals
+    DEFEND_ZONE          = 5
+    MOVE_TO_REGION_A     = 6
+    MOVE_TO_REGION_B     = 7
+    IDLE                 = 8
 
 NUM_ACTIONS = len(Action)
 
@@ -43,56 +62,92 @@ NUM_ACTIONS = len(Action)
 FIELD_W: float = SHARED_CFG["field"]["width"]    # 144.00
 FIELD_H: float = SHARED_CFG["field"]["height"]   # 144.00
 
-# Goal positions (inches, approximate VEX AI High Stakes layout)
-OUR_LONG_GOAL    = np.array([6.00, 72.00])
-OUR_MID_GOAL     = np.array([36.00, 6.00])
-OPP_LONG_GOAL    = np.array([138.00, 72.00])
-OPP_MID_GOAL     = np.array([108.00, 138.00])
+# Goal positions (center of scoring zone, inches)
+OUR_LONG_GOAL    = np.array([138.00, 72.00])   # right wall, blue L-bracket
+OPP_LONG_GOAL    = np.array([  6.00, 72.00])   # left wall,  red L-bracket
+CENTER_MID_GOAL  = np.array([ 72.00, 84.00])   # center field, upper
+CENTER_LOW_GOAL  = np.array([ 72.00, 60.00])   # center field, lower
 
-# Named regions
-REGION_A_CENTER  = np.array([36.00, 108.00])
-REGION_B_CENTER  = np.array([108.00, 36.00])
-DEFEND_ZONE_POS  = np.array([36.00, 72.00])
+# Long goal physical extents for rendering (inches)
+LONG_GOAL_Y_MIN  = 48.00   # bottom of L-bracket
+LONG_GOAL_Y_MAX  = 96.00   # top of L-bracket
+LONG_GOAL_DEPTH  = 12.00   # how far inward the arms extend
+
+# Named zones
+REGION_A_CENTER  = np.array([108.00, 108.00])  # upper-right
+REGION_B_CENTER  = np.array([ 36.00,  36.00])  # lower-left
+DEFEND_ZONE_POS  = np.array([120.00,  72.00])  # in front of our long goal
 
 # ---------------------------------------------------------------------------
 # Game rules
 # ---------------------------------------------------------------------------
-MATCH_DURATION: float = SHARED_CFG["game"]["match_duration"]       # 120s
-DT: float             = SHARED_CFG["game"]["dt"]                   # 0.05s per sim tick
-DECISION_INTERVAL: float = SHARED_CFG["game"]["decision_interval"] # 3.0s between RL queries
-TICKS_PER_DECISION: int  = int(DECISION_INTERVAL / DT)             # 60 ticks per decision
-MAX_CARRY: int        = SHARED_CFG["game"]["max_carry"]            # 3
+MATCH_DURATION: float    = SHARED_CFG["game"]["match_duration"]       # 120s
+DT: float                = SHARED_CFG["game"]["dt"]                   # 0.05s
+DECISION_INTERVAL: float = SHARED_CFG["game"]["decision_interval"]    # 3.0s
+TICKS_PER_DECISION: int  = int(DECISION_INTERVAL / DT)                # 60
+MAX_CARRY: int           = SHARED_CFG["game"]["max_carry"]            # 3
 
 # ---------------------------------------------------------------------------
 # Game objects
 # ---------------------------------------------------------------------------
-MAX_GAME_OBJECTS: int = SHARED_CFG["state"]["max_game_objects"]  # 24
-OBJ_FEATURES: int    = SHARED_CFG["state"]["object_features"]   # 3
+MAX_GAME_OBJECTS: int = SHARED_CFG["state"]["max_game_objects"]  # 44
+OBJ_FEATURES: int    = SHARED_CFG["state"]["object_features"]   # 4
 
 # Status codes
-OBJ_ON_FIELD  = 0
-OBJ_HELD      = 1
-OBJ_SCORED_US = 2
+OBJ_ON_FIELD   = 0
+OBJ_HELD       = 1
+OBJ_SCORED_US  = 2
 OBJ_SCORED_OPP = 3
+OBJ_REMOVED    = 4   # deleted via state editor
 
-# Initial ring positions — 24 objects spread across the 144x144 field
-INITIAL_OBJECT_POSITIONS = np.array([
-    # Row 1 (y ≈ 24)
-    [24.00, 24.00], [48.00, 24.00], [72.00, 24.00], [96.00, 24.00], [120.00, 24.00],
-    # Row 2 (y ≈ 48)
-    [24.00, 48.00], [48.00, 48.00], [96.00, 48.00], [120.00, 48.00],
-    # Row 3 (y ≈ 72)
-    [24.00, 72.00], [48.00, 72.00], [96.00, 72.00], [120.00, 72.00],
-    # Row 4 (y ≈ 96)
-    [24.00, 96.00], [48.00, 96.00], [96.00, 96.00], [120.00, 96.00],
-    # Row 5 (y ≈ 120)
-    [24.00, 120.00], [48.00, 120.00], [72.00, 120.00], [96.00, 120.00], [120.00, 120.00],
-    # Extra center objects
-    [72.00, 48.00], [72.00, 96.00],
+# Scoring values
+LONG_GOAL_POINTS   = 5
+CENTER_GOAL_POINTS = 3
+
+# ---------------------------------------------------------------------------
+# Initial ball layout — 22 red (color=0) + 22 blue (color=1) = 44 total
+# Format: [x, y, color]
+# We are BLUE (right side); opponent is RED (left side)
+# ---------------------------------------------------------------------------
+INITIAL_OBJECTS = np.array([
+    # === RED BALLS (color=0) — clustered left/center ===
+    # Top-left corner cluster
+    [12.00, 120.00, 0], [18.00, 126.00, 0], [24.00, 120.00, 0],
+    # Bottom-left corner cluster
+    [12.00,  24.00, 0], [18.00,  18.00, 0], [24.00,  24.00, 0],
+    # Left wall singles
+    [12.00,  96.00, 0], [12.00,  72.00, 0], [12.00,  48.00, 0],
+    # Left zone column
+    [30.00, 108.00, 0], [30.00,  72.00, 0], [30.00,  36.00, 0],
+    # Center-left column
+    [48.00, 108.00, 0], [48.00,  72.00, 0], [48.00,  36.00, 0],
+    # Inner center-left
+    [60.00,  96.00, 0], [60.00,  60.00, 0],
+    # Upper center (red side)
+    [68.00, 108.00, 0], [72.00, 120.00, 0],
+    # Extra left zone
+    [36.00, 108.00, 0], [36.00,  36.00, 0], [36.00,  72.00, 0],
+
+    # === BLUE BALLS (color=1) — clustered right/center ===
+    # Top-right corner cluster
+    [132.00, 120.00, 1], [126.00, 126.00, 1], [120.00, 120.00, 1],
+    # Bottom-right corner cluster
+    [132.00,  24.00, 1], [126.00,  18.00, 1], [120.00,  24.00, 1],
+    # Right wall singles
+    [132.00,  96.00, 1], [132.00,  72.00, 1], [132.00,  48.00, 1],
+    # Right zone column
+    [114.00, 108.00, 1], [114.00,  72.00, 1], [114.00,  36.00, 1],
+    # Center-right column
+    [ 96.00, 108.00, 1], [ 96.00,  72.00, 1], [ 96.00,  36.00, 1],
+    # Inner center-right
+    [ 84.00,  96.00, 1], [ 84.00,  60.00, 1],
+    # Lower center (blue side)
+    [ 76.00,  36.00, 1], [ 72.00,  24.00, 1],
+    # Extra right zone
+    [108.00, 108.00, 1], [108.00,  36.00, 1], [108.00,  72.00, 1],
 ], dtype=np.float64)
 
-LONG_GOAL_POINTS = 5
-MID_GOAL_POINTS  = 3
+assert len(INITIAL_OBJECTS) == 44, f"Expected 44 balls, got {len(INITIAL_OBJECTS)}"
 
 # ---------------------------------------------------------------------------
 # Heatmap
@@ -102,21 +157,23 @@ HEATMAP_H: int = SHARED_CFG["state"]["heatmap_grid_h"]  # 12
 
 # ---------------------------------------------------------------------------
 # State vector dimension (flat)
+# role_id(1) + time(1) + my_score(1) + opp_score(1)
+# + x(1) + y(1) + heading(1) + balls_held(1) + balls_nearby(1) = 9
+# + game_objects(44 * 4) = 176
+# + heatmap(12 * 12) = 144
+# + extra(2) = 2
+# Total = 331
 # ---------------------------------------------------------------------------
-# role_id(1) + time_remaining(1) + my_score(1) + opp_score(1)
-# + my_x(1) + my_y(1) + my_heading(1) + balls_held(1) + balls_nearby(1)
-# + game_objects(24 * 3) + heatmap(12 * 12)
-# + expected_state_delta(1) + actions_completed_ratio(1)
 STATE_DIM = 9 + (MAX_GAME_OBJECTS * OBJ_FEATURES) + (HEATMAP_W * HEATMAP_H) + 2
 
 # ---------------------------------------------------------------------------
 # Robot physics
 # ---------------------------------------------------------------------------
-ROBOT_W: float     = SHARED_CFG["robot"]["width"]          # 15.00 in
-ROBOT_H: float     = SHARED_CFG["robot"]["height"]         # 15.00 in
-MAX_SPEED: float   = SHARED_CFG["robot"]["max_speed"]      # 30.00 in/s
-TURN_RATE: float   = SHARED_CFG["robot"]["turn_rate"]      # 3.14 rad/s
-COLLECT_RANGE: float = SHARED_CFG["robot"]["collect_range"] # 8.00 in
-SCORE_RANGE: float = SHARED_CFG["robot"]["score_range"]     # 10.00 in
+ROBOT_W: float       = SHARED_CFG["robot"]["width"]           # 15.00 in
+ROBOT_H: float       = SHARED_CFG["robot"]["height"]          # 15.00 in
+MAX_SPEED: float     = SHARED_CFG["robot"]["max_speed"]       # 30.00 in/s
+TURN_RATE: float     = SHARED_CFG["robot"]["turn_rate"]       # 3.14 rad/s
+COLLECT_RANGE: float = SHARED_CFG["robot"]["collect_range"]   # 8.00 in
+SCORE_RANGE: float   = SHARED_CFG["robot"]["score_range"]     # 10.00 in
 
-MAX_SCORE = 150  # normalisation ceiling
+MAX_SCORE = 200  # normalisation ceiling (44 balls * 5pts max)

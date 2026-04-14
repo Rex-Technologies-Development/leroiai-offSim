@@ -1,12 +1,13 @@
 # Shared contract between training repo and ROS 2 deployment repo.
 # Both repos must agree on action IDs and state vector shape.
+# Game: VEX Push Back 2025-2026
 
 actions:
   0: COLLECT_NEAREST_BALL
   1: SCORE_LONG_GOAL
-  2: SCORE_MID_GOAL
-  3: DESCORE_OPPONENT_LONG
-  4: DESCORE_OPPONENT_MID
+  2: SCORE_CENTER_GOAL
+  3: DESCORE_OPP_LONG
+  4: DESCORE_CENTER
   5: DEFEND_ZONE
   6: MOVE_TO_REGION_A
   7: MOVE_TO_REGION_B
@@ -14,7 +15,7 @@ actions:
 
 num_actions: 9
 
-# VEX AI field — 12ft x 12ft = 144in x 144in
+# VEX field — 12ft x 12ft = 144in x 144in
 field:
   width: 144.00    # inches
   height: 144.00   # inches
@@ -22,19 +23,19 @@ field:
 game:
   match_duration: 120    # seconds
   dt: 0.05               # seconds per sim tick (fine-grained for movement animation)
-  decision_interval: 3.0 # seconds between RL re-queries (60 decisions per match)
+  decision_interval: 3.0 # seconds between RL re-queries (40 decisions per match)
   max_carry: 3
 
 state:
-  max_game_objects: 24
-  object_features: 3     # x, y, status
+  max_game_objects: 44   # VEX Push Back: 22 red + 22 blue balls
+  object_features: 4     # x, y, status, color
   heatmap_grid_w: 12
   heatmap_grid_h: 12
 
 robot:
   width: 15.00       # inches (top-down square footprint)
   height: 15.00      # inches
-  max_speed: 30.00   # inches per second (realistic VEX competition speed)
+  max_speed: 30.00   # inches per second
   turn_rate: 3.14    # radians per second (~180 deg/s)
-  collect_range: 8.00   # inches — how close to pick up a ring
+  collect_range: 8.00   # inches — how close to pick up a ball
   score_range: 10.00    # inches — how close to a goal to score
