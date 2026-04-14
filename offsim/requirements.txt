@@ -1,0 +1,11 @@
+torch
+gymnasium
+stable-baselines3
+d3rlpy
+pygame-ce
+numpy
+scipy
+onnx
+onnxruntime
+tensorboard
+pyyaml
