@@ -62,21 +62,53 @@ NUM_ACTIONS = len(Action)
 FIELD_W: float = SHARED_CFG["field"]["width"]    # 144.00
 FIELD_H: float = SHARED_CFG["field"]["height"]   # 144.00
 
-# Goal positions (center of scoring zone, inches)
-OUR_LONG_GOAL    = np.array([138.00, 72.00])   # right wall, blue L-bracket
-OPP_LONG_GOAL    = np.array([  6.00, 72.00])   # left wall,  red L-bracket
-CENTER_MID_GOAL  = np.array([ 72.00, 84.00])   # center field, upper
-CENTER_LOW_GOAL  = np.array([ 72.00, 60.00])   # center field, lower
+# Goal positions — center of each goal body (scoring target for robots).
+# Long goals are FREE-STANDING (~14" alley between goal and nearest wall).
+# Outer face at ~129.6 / ~14.4" from wall; inner face ~10.9" further in.
+OUR_LONG_GOAL    = np.array([119.00, 72.00])  # center of right goal body (23" alley from wall)
+OPP_LONG_GOAL    = np.array([ 25.00, 72.00])  # center of left goal body
+CENTER_MID_GOAL  = np.array([ 72.00, 80.94])  # center field, upper X half
+CENTER_LOW_GOAL  = np.array([ 72.00, 63.06])  # center field, lower X half
 
-# Long goal physical extents for rendering (inches)
-LONG_GOAL_Y_MIN  = 48.00   # bottom of L-bracket
-LONG_GOAL_Y_MAX  = 96.00   # top of L-bracket
-LONG_GOAL_DEPTH  = 12.00   # how far inward the arms extend
+# Long goal physical extents
+# Goals are FREE-STANDING with a ~23" alley between the wall and the outer goal face.
+# Goal body is ~4.125" wide (tray depth).
+LONG_GOAL_Y_MIN    = 47.61   # bottom of goal bar
+LONG_GOAL_Y_MAX    = 96.39   # top of goal bar
+LONG_GOAL_WALL_GAP = 21.50   # alley width: gap between wall and outer face of goal
+LONG_GOAL_WIDTH    =  4.125  # goal tray width (outer → inner/scoring face)
+
+# Center goal X-structure — two crossing rectangular bars forming an X.
+# The upper two arms = MID goal; lower two arms = LOW goal.
+# ARM_LEN is the half-length from center to each arm tip.
+CENTER_GOAL_ARM_LEN = 23.18   # half-diagonal from center to arm tip (scaled from spec)
+CENTER_GOAL_ARM_W   =  4.00   # arm width (bar thickness)
+
+# Matchload tubes — stand along the TOP and BOTTOM walls at the
+# tile-1/tile-2 seam (x=24" and x=120" from each side wall).
+MATCHLOAD_TUBE_RADIUS = 2.00
+MATCHLOAD_TUBES = np.array([
+    [ 24.0,   2.0],   # bottom wall, 1-tile seam from left
+    [120.0,   2.0],   # bottom wall, 1-tile seam from right
+    [ 24.0, 142.0],   # top wall, 1-tile seam from left
+    [120.0, 142.0],   # top wall, 1-tile seam from right
+], dtype=np.float64)
+
+# Parking zones — raised platforms centered on the top and bottom walls.
+# ~25" wide (centered at x=72), 24" deep (1 tile) against each wall.
+PARK_ZONE_X_MIN  = 59.5    # left edge  (72 - 12.5)
+PARK_ZONE_X_MAX  = 84.5    # right edge (72 + 12.5)
+PARK_ZONE_BOTTOM = 24.0    # top edge of bottom park zone
+PARK_ZONE_TOP    = 120.0   # bottom edge of top park zone
+
+# Vision cone — wide-angle camera in front of robot
+VISION_HALF_ANGLE = np.radians(65.0)   # ±65° → 130° total FOV
+VISION_RANGE      = 72.0               # max depth in inches
 
 # Named zones
 REGION_A_CENTER  = np.array([108.00, 108.00])  # upper-right
 REGION_B_CENTER  = np.array([ 36.00,  36.00])  # lower-left
-DEFEND_ZONE_POS  = np.array([120.00,  72.00])  # in front of our long goal
+DEFEND_ZONE_POS  = np.array([108.00,  72.00])  # in front of our long goal
 
 # ---------------------------------------------------------------------------
 # Game rules

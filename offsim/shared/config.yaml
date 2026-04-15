@@ -24,7 +24,7 @@ game:
   match_duration: 120    # seconds
   dt: 0.05               # seconds per sim tick (fine-grained for movement animation)
   decision_interval: 3.0 # seconds between RL re-queries (40 decisions per match)
-  max_carry: 3
+  max_carry: 7
 
 state:
   max_game_objects: 44   # VEX Push Back: 22 red + 22 blue balls

@@ -8,6 +8,8 @@ The env (env.py) orchestrates stepping; the field tracks state.
 from __future__ import annotations
 import numpy as np
 
+import math
+
 from sim.config import (
     FIELD_W, FIELD_H, MAX_GAME_OBJECTS, INITIAL_OBJECTS,
     OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP, OBJ_REMOVED,
@@ -15,7 +17,13 @@ from sim.config import (
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS,
     COLLECT_RANGE, SCORE_RANGE, MAX_CARRY, ROBOT_W,
     BALL_RED, BALL_BLUE,
+    MATCHLOAD_TUBES, MATCHLOAD_TUBE_RADIUS,
 )
+
+# How close a ball must be to a tube to be considered "at the tube"
+_TUBE_SNAP_DIST = MATCHLOAD_TUBE_RADIUS * 3.0
+# Heading tolerance for facing a matchload tube (radians)
+_TUBE_FACE_TOL  = math.radians(30.0)
 from sim.game_object import BALL_RADIUS
 
 # Robot push constants
@@ -41,8 +49,8 @@ class Field:
     def __init__(self):
         # Allied robots — blue team, start right side
         self.allies: list[Robot] = [
-            Robot(x=120.00, y=18.00,  heading=np.pi, role_id=0),
-            Robot(x=120.00, y=126.00, heading=np.pi, role_id=1),
+            Robot(x=108.00, y=18.00,  heading=np.pi, role_id=0),
+            Robot(x=108.00, y=126.00, heading=np.pi, role_id=1),
         ]
         # Opponent robots — red team, start left side
         self.opponents: list[Robot] = [
@@ -61,8 +69,8 @@ class Field:
 
     def reset(self, rng: np.random.Generator):
         """Reset field to starting positions (clears any editor changes)."""
-        self.allies[0].reset(120.00,  18.00, heading=np.pi)
-        self.allies[1].reset(120.00, 126.00, heading=np.pi)
+        self.allies[0].reset(108.00,  18.00, heading=np.pi)
+        self.allies[1].reset(108.00, 126.00, heading=np.pi)
         self.opponents[0].reset(24.00, 126.00, heading=0.0)
         self.opponents[1].reset(24.00,  18.00, heading=0.0)
 
@@ -93,6 +101,24 @@ class Field:
         if 0 <= idx < len(self.objects):
             obj = self.objects[idx]
             obj.color = BALL_BLUE if obj.color == BALL_RED else BALL_RED
+
+    def clear_all_balls(self):
+        """Remove all game objects from the field (for setup mode)."""
+        self.objects.clear()
+
+    def set_robot_start(self, idx: int, x: float, y: float, heading: float | None = None):
+        """Reposition (and optionally re-orient) an allied robot (for setup mode)."""
+        if 0 <= idx < len(self.allies):
+            half = ROBOT_W / 2
+            self.allies[idx].x = round(float(np.clip(x, half, FIELD_W - half)), 2)
+            self.allies[idx].y = round(float(np.clip(y, half, FIELD_H - half)), 2)
+            if heading is not None:
+                self.allies[idx].heading = float(heading)
+
+    def set_robot_heading(self, idx: int, heading: float):
+        """Set heading of an allied robot without moving it."""
+        if 0 <= idx < len(self.allies):
+            self.allies[idx].heading = float(heading)
 
     # ------------------------------------------------------------------
     # Queries
@@ -127,8 +153,28 @@ class Field:
     # ------------------------------------------------------------------
     # Allied action effects
     # ------------------------------------------------------------------
+    def _ball_at_tube(self, obj) -> np.ndarray | None:
+        """Return tube position if this ball is sitting at a matchload tube, else None."""
+        for tube in MATCHLOAD_TUBES:
+            if np.linalg.norm(obj.position - tube) < _TUBE_SNAP_DIST:
+                return tube
+        return None
+
+    def _facing_toward(self, robot: Robot, target_pos: np.ndarray) -> bool:
+        """True if robot heading is within _TUBE_FACE_TOL of the direction to target."""
+        vec = target_pos - robot.position
+        if np.linalg.norm(vec) < 0.1:
+            return True
+        angle_to = math.atan2(vec[1], vec[0])
+        diff = abs(((robot.heading - angle_to + math.pi) % (2 * math.pi)) - math.pi)
+        return diff <= _TUBE_FACE_TOL
+
     def try_collect(self, robot: Robot) -> bool:
-        """Pick up nearest on-field ball. Returns True if collected."""
+        """Pick up nearest on-field ball. Returns True if collected.
+
+        If the nearest ball is at a matchload tube, the robot must be facing
+        the tube (within 30°) to pick it up.
+        """
         if robot.balls_held >= MAX_CARRY:
             return False
 
@@ -141,6 +187,9 @@ class Field:
                     best_idx = i
 
         if best_idx >= 0 and best_dist < COLLECT_RANGE:
+            tube = self._ball_at_tube(self.objects[best_idx])
+            if tube is not None and not self._facing_toward(robot, tube):
+                return False   # must face the tube head-on
             self.objects[best_idx].status = OBJ_HELD
             robot.balls_held += 1
             robot.held_object_ids.append(best_idx)

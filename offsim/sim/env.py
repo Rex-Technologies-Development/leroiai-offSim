@@ -14,6 +14,7 @@ For SB3 compatibility, use SingleAgentWrapper (concatenated obs, flat action).
 """
 
 from __future__ import annotations
+import math
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -21,16 +22,114 @@ import numpy as np
 from sim.config import (
     Action, NUM_ACTIONS, STATE_DIM,
     FIELD_W, FIELD_H, MATCH_DURATION, DT, TICKS_PER_DECISION, MAX_CARRY,
-    MAX_GAME_OBJECTS, OBJ_FEATURES, OBJ_ON_FIELD, OBJ_SCORED_US, OBJ_SCORED_OPP,
+    MAX_GAME_OBJECTS, OBJ_FEATURES, OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP,
     HEATMAP_W, HEATMAP_H, MAX_SCORE,
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     REGION_A_CENTER, REGION_B_CENTER, DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
+    LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
+    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W,
 )
 from sim.field import Field
 from sim.robot import Robot
 from sim.failure import FailureConfig, FailureInjector
 from sim.opponent import get_opponent
+
+
+# ---------------------------------------------------------------------------
+# Goal collision resolution
+# ---------------------------------------------------------------------------
+# Margin = half robot width + 0.25" ghost boundary
+_GOAL_MARGIN = ROBOT_W / 2 + 0.25   # 7.75"
+
+# Long goal X extents (precomputed from config)
+_RIGHT_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH  # inner face
+_RIGHT_GOAL_X_HI = FIELD_W - LONG_GOAL_WALL_GAP                     # outer face
+_LEFT_GOAL_X_LO  = LONG_GOAL_WALL_GAP                               # outer face
+_LEFT_GOAL_X_HI  = LONG_GOAL_WALL_GAP + LONG_GOAL_WIDTH             # inner face
+
+# Center goal X-structure
+_CX, _CY  = 72.0, 72.0
+_ARM_LEN  = CENTER_GOAL_ARM_LEN    # half-length along arm axis
+_ARM_HW   = CENTER_GOAL_ARM_W / 2  # half-width across arm
+
+# Center goal approach points — just outside both arm collision zones,
+# within SCORE_RANGE (10") of the actual goal centers.
+# A robot at these positions can score without entering the X structure.
+_CENTER_MID_APPROACH = np.array([72.0, 87.0])   # above CENTER_MID_GOAL (72, 80.94)
+_CENTER_LOW_APPROACH = np.array([72.0, 57.0])   # below CENTER_LOW_GOAL (72, 63.06)
+
+
+def _resolve_goal_collisions(robot) -> None:
+    """Push robot out of goal bounding boxes.
+
+    Long goals use AABB. Center X arms are checked simultaneously so that
+    the dual-arm overlap case (robot at center intersection) is handled by
+    pushing to the nearest cardinal clear position instead of bouncing
+    between both arms indefinitely.
+    """
+    m = _GOAL_MARGIN
+
+    # --- Long goals (axis-aligned rectangles) — re-read position each time ---
+    for gx_lo, gx_hi in ((_RIGHT_GOAL_X_LO, _RIGHT_GOAL_X_HI),
+                          (_LEFT_GOAL_X_LO,  _LEFT_GOAL_X_HI)):
+        rx, ry = robot.x, robot.y
+        ex_lo = gx_lo - m;  ex_hi = gx_hi + m
+        ey_lo = LONG_GOAL_Y_MIN - m;  ey_hi = LONG_GOAL_Y_MAX + m
+        if ex_lo < rx < ex_hi and ey_lo < ry < ey_hi:
+            d_lo = rx - ex_lo;  d_hi = ex_hi - rx
+            d_yd = ry - ey_lo;  d_yu = ey_hi - ry
+            s = min(d_lo, d_hi, d_yd, d_yu)
+            if   s == d_lo: robot.x = ex_lo
+            elif s == d_hi: robot.x = ex_hi
+            elif s == d_yd: robot.y = ey_lo
+            else:           robot.y = ey_hi
+
+    # --- Center goal arms — evaluate both before applying any push ---
+    # Minimum distance from X centre to be simultaneously clear of BOTH arms:
+    # clear_dist = (ARM_HW + margin) / sin(45°) = (ARM_HW + m) * √2
+    clear_dist = (_ARM_HW + m) * math.sqrt(2)
+
+    rx, ry = robot.x, robot.y
+    arm_data = []   # (angle, along, perp) for each overlapping arm
+    for angle in (math.pi / 4, -math.pi / 4):
+        ca, sa = math.cos(angle), math.sin(angle)
+        dx, dy = rx - _CX, ry - _CY
+        along = dx * ca  + dy * sa
+        perp  = dx * -sa + dy * ca
+        if abs(along) < _ARM_LEN + m and abs(perp) < _ARM_HW + m:
+            arm_data.append((angle, along, perp))
+
+    if not arm_data:
+        return
+
+    if len(arm_data) == 2:
+        # Robot is inside BOTH arms (centre intersection).
+        # Push to the nearest cardinal clear position.
+        exits = [
+            (abs(ry - (_CY + clear_dist)), _CX,              _CY + clear_dist),
+            (abs(ry - (_CY - clear_dist)), _CX,              _CY - clear_dist),
+            (abs(rx - (_CX + clear_dist)), _CX + clear_dist, _CY),
+            (abs(rx - (_CX - clear_dist)), _CX - clear_dist, _CY),
+        ]
+        _, nx, ny = min(exits, key=lambda e: e[0])
+        robot.x, robot.y = nx, ny
+    else:
+        # Single arm overlap — push perpendicularly (shortest exit).
+        angle, along, perp = arm_data[0]
+        ca, sa = math.cos(angle), math.sin(angle)
+        exit_perp  = _ARM_HW + m - abs(perp)
+        exit_along = _ARM_LEN + m - abs(along)
+        if exit_perp <= exit_along:
+            sign     = 1 if perp >= 0 else -1
+            new_perp = sign * (_ARM_HW + m)
+            robot.x  = _CX + along * ca + new_perp * (-sa)
+            robot.y  = _CY + along * sa + new_perp * ca
+        else:
+            sign      = 1 if along >= 0 else -1
+            new_along = sign * (_ARM_LEN + m)
+            robot.x   = _CX + new_along * ca + perp * (-sa)
+            robot.y   = _CY + new_along * sa + perp * ca
 
 
 # ---------------------------------------------------------------------------
@@ -43,16 +142,16 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
     elif action == Action.SCORE_LONG_GOAL:
         return OUR_LONG_GOAL.copy()
     elif action == Action.SCORE_CENTER_GOAL:
-        # Go to whichever center goal is closer
-        d_mid = np.linalg.norm(robot.position - CENTER_MID_GOAL)
-        d_low = np.linalg.norm(robot.position - CENTER_LOW_GOAL)
-        return CENTER_MID_GOAL.copy() if d_mid < d_low else CENTER_LOW_GOAL.copy()
+        # Navigate to the approach point outside the X structure, within scoring range.
+        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
+        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
+        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
     elif action == Action.DESCORE_OPP_LONG:
         return OPP_LONG_GOAL.copy()
     elif action == Action.DESCORE_CENTER:
-        d_mid = np.linalg.norm(robot.position - CENTER_MID_GOAL)
-        d_low = np.linalg.norm(robot.position - CENTER_LOW_GOAL)
-        return CENTER_MID_GOAL.copy() if d_mid < d_low else CENTER_LOW_GOAL.copy()
+        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
+        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
+        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
     elif action == Action.DEFEND_ZONE:
         return DEFEND_ZONE_POS.copy()
     elif action == Action.MOVE_TO_REGION_A:
@@ -71,15 +170,15 @@ def _opp_action_to_target(action: Action, field: Field, robot: Robot) -> np.ndar
     elif action == Action.SCORE_LONG_GOAL:
         return OPP_LONG_GOAL.copy()
     elif action == Action.SCORE_CENTER_GOAL:
-        d_mid = np.linalg.norm(robot.position - CENTER_MID_GOAL)
-        d_low = np.linalg.norm(robot.position - CENTER_LOW_GOAL)
-        return CENTER_MID_GOAL.copy() if d_mid < d_low else CENTER_LOW_GOAL.copy()
+        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
+        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
+        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
     elif action == Action.DESCORE_OPP_LONG:
         return OUR_LONG_GOAL.copy()
     elif action == Action.DESCORE_CENTER:
-        d_mid = np.linalg.norm(robot.position - CENTER_MID_GOAL)
-        d_low = np.linalg.norm(robot.position - CENTER_LOW_GOAL)
-        return CENTER_MID_GOAL.copy() if d_mid < d_low else CENTER_LOW_GOAL.copy()
+        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
+        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
+        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
     elif action == Action.DEFEND_ZONE:
         return np.array([24.00, 72.00])   # opp defend zone (left side)
     elif action == Action.MOVE_TO_REGION_A:
@@ -113,7 +212,7 @@ class VexAIEnv(gym.Env):
         self.render_mode    = render_mode
         self.failure_config = failure_config or FailureConfig()
         self.num_allies     = max(1, min(num_allies, 2))  # 1 or 2
-        self.num_opponents  = self.num_allies              # mirror — 1v1 or 2v2
+        self.num_opponents  = 0                            # no opponents by default
 
         self.action_space = spaces.MultiDiscrete([NUM_ACTIONS, NUM_ACTIONS])
         self.observation_space = spaces.Dict({
@@ -160,6 +259,45 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = False
         self.opp_targets: list[np.ndarray | None] = [None, None]
+
+        return self._get_obs(), {}
+
+    def setup_reset(self):
+        """Partial reset after setup mode: keeps robot/ball positions but clears scores and physics."""
+        self.rng = np.random.default_rng(None)
+        self.field.time_remaining = MATCH_DURATION
+        self.field.my_score       = 0
+        self.field.opponent_score = 0
+
+        # Reset robot physics state (NOT position/heading)
+        for robot in self.field.allies + self.field.opponents:
+            robot.balls_held = 0
+            robot.held_object_ids.clear()
+            robot.actions_attempted = 0
+            robot.actions_succeeded = 0
+            robot.target = None
+            robot.moving = False
+
+        # Reset ball physics; un-hold any held balls
+        for obj in self.field.objects:
+            if obj.status == OBJ_HELD:
+                obj.status = OBJ_ON_FIELD
+            obj.vx = 0.0
+            obj.vy = 0.0
+
+        self.failure_injector = FailureInjector(self.failure_config, self.rng)
+        self.failure_injector.reset()
+
+        self.score_events[:]         = 0
+        self.descore_events[:]       = 0
+        self.collected_this_step[:]  = 0
+        self.current_actions[:]      = Action.IDLE
+        self.expected_state_delta[:] = 0
+        self.prev_predicted_score[:] = 0
+        self.done          = False
+        self.decision_tick = 0
+        self.executing     = False
+        self.opp_targets   = [None, None]
 
         return self._get_obs(), {}
 
@@ -212,10 +350,12 @@ class VexAIEnv(gym.Env):
                 target = ally_targets[idx]
                 if target is not None:
                     self.field.allies[idx].move_toward_point(target)
+                _resolve_goal_collisions(self.field.allies[idx])
 
             for oi in range(self.num_opponents):
                 if self.opp_targets[oi] is not None:
                     self.field.opponents[oi].move_toward_point(self.opp_targets[oi])
+                _resolve_goal_collisions(self.field.opponents[oi])
 
             # Apply robot→ball pushes
             for idx in range(self.num_allies):
@@ -268,18 +408,22 @@ class VexAIEnv(gym.Env):
                 robot.actions_succeeded += 1
 
         elif action == Action.SCORE_LONG_GOAL:
-            pts = self.field.try_score(robot, OUR_LONG_GOAL, LONG_GOAL_POINTS)
-            if pts > 0:
-                self.score_events[idx] += pts
-                robot.actions_succeeded += 1
+            # Heading constraint: must face up or down (within 30° of ±π/2)
+            if abs(math.sin(robot.heading)) > 0.866:
+                pts = self.field.try_score(robot, OUR_LONG_GOAL, LONG_GOAL_POINTS)
+                if pts > 0:
+                    self.score_events[idx] += pts
+                    robot.actions_succeeded += 1
 
         elif action == Action.SCORE_CENTER_GOAL:
-            pts = self.field.try_score(robot, CENTER_MID_GOAL, CENTER_GOAL_POINTS)
-            if pts == 0:
-                pts = self.field.try_score(robot, CENTER_LOW_GOAL, CENTER_GOAL_POINTS)
-            if pts > 0:
-                self.score_events[idx] += pts
-                robot.actions_succeeded += 1
+            # Heading constraint: must face a diagonal direction (within 30° of 45°/135°/225°/315°)
+            if abs(math.sin(2 * robot.heading)) > 0.5:
+                pts = self.field.try_score(robot, CENTER_MID_GOAL, CENTER_GOAL_POINTS)
+                if pts == 0:
+                    pts = self.field.try_score(robot, CENTER_LOW_GOAL, CENTER_GOAL_POINTS)
+                if pts > 0:
+                    self.score_events[idx] += pts
+                    robot.actions_succeeded += 1
 
         elif action == Action.DESCORE_OPP_LONG:
             pts = self.field.try_descore(robot, OPP_LONG_GOAL, self.rng)
