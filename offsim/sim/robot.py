@@ -20,6 +20,9 @@ from sim.config import (
     FIELD_W, FIELD_H, ROBOT_W, ROBOT_H, MAX_SPEED, TURN_RATE, DT, MAX_CARRY,
 )
 
+ACCEL = 150.0   # in/s² — ramp-up rate
+DECEL = 280.0   # in/s² — braking rate (stronger so stops feel snappy)
+
 
 class Robot:
     """A single robot on the field."""
@@ -39,6 +42,9 @@ class Robot:
         # Movement state (for animation)
         self.target: np.ndarray | None = None   # current moveToPoint target
         self.moving: bool = False
+        self.speed: float = 0.0                  # current forward speed (in/s)
+        self.score_timer: float = 0.0            # elapsed seconds in scoring sequence
+        self.intake_active: bool = False         # True while intake is spinning (collecting)
 
     @property
     def position(self) -> np.ndarray:
@@ -62,54 +68,68 @@ class Robot:
     # Tank-drive moveToPoint  (smooth arc model)
     # ------------------------------------------------------------------
     def move_toward_point(self, target: np.ndarray) -> bool:
-        """Advance one tick (DT seconds) toward target using smooth arc drive.
+        """Advance one tick (DT seconds) toward target with accel/decel.
 
-        Motion model (inspired by visual-tracking-demo proportional PID):
-          1. Compute angle error to target.
-          2. Turn proportionally to the error (P controller), capped by TURN_RATE.
-             → Large errors → fast turn; small errors → gentle curve.
-          3. Forward speed = MAX_SPEED * max(0.08, 1 - |angle_err| / π)
-             → Robot never fully stops; it arcs smoothly instead of
-               stopping to turn in place, giving fluid curved paths.
+        Motion model:
+          1. Turn proportionally toward target (P controller, capped by TURN_RATE).
+          2. Compute target speed — full when aligned & far; reduced when:
+               a) heading error is large (arc turning penalty)
+               b) close enough that braking is needed to stop cleanly
+          3. Ramp self.speed toward target speed at ACCEL / DECEL rates.
+          4. Move forward at self.speed.
 
-        This matches the behaviour seen in leoxie080808/visual-tracking-demo-python
-        where forward_speed = speed * max(0.1, 1 - abs(angle_diff) / π).
-
-        Returns True when within 0.5in of target.
+        Returns True when within 0.5 in of target.
         """
         self.target = target.copy()
         diff = target - self.position
-        dist = np.linalg.norm(diff)
+        dist = float(np.linalg.norm(diff))
 
         if dist < 0.50:
             self.moving = False
+            self.speed  = 0.0
             return True
 
         self.moving = True
 
-        # Desired heading and error
+        # --- Heading control ---
         desired_heading = np.arctan2(diff[1], diff[0])
         angle_err = _wrap_angle(desired_heading - self.heading)
-
-        # Proportional turn — gain of 4.0 rad/s per rad of error, capped by TURN_RATE
         turn_delta = np.clip(angle_err * 4.0 * DT, -TURN_RATE * DT, TURN_RATE * DT)
         self.heading = _wrap_angle(self.heading + turn_delta)
-
-        # Recompute error after this tick's turn
         abs_err = abs(_wrap_angle(desired_heading - self.heading))
 
-        # Continuous arc speed: full speed when aligned, 8% minimum when pointing away
-        drive_factor = max(0.08, 1.0 - abs_err / np.pi)
-        max_move = MAX_SPEED * DT * drive_factor
+        # --- Speed target ---
+        # Turning penalty: slow when pointing away, full speed when aligned
+        heading_factor = max(0.08, 1.0 - abs_err / np.pi)
 
+        # Deceleration ramp: how far do we need to begin braking from current speed?
+        # d_stop = v² / (2 * DECEL)
+        stop_dist = (self.speed ** 2) / (2.0 * DECEL + 1e-6)
+        if dist <= stop_dist + 1.0:
+            # Inside braking window — scale down proportionally
+            decel_factor = max(0.0, dist / (stop_dist + 1.0))
+            target_speed = MAX_SPEED * min(heading_factor, decel_factor)
+        else:
+            target_speed = MAX_SPEED * heading_factor
+
+        # --- Ramp current speed toward target ---
+        if self.speed < target_speed:
+            self.speed = min(self.speed + ACCEL * DT, target_speed)
+        else:
+            self.speed = max(self.speed - DECEL * DT, target_speed)
+        self.speed = float(np.clip(self.speed, 0.0, MAX_SPEED))
+
+        # --- Move ---
+        max_move = self.speed * DT
         if dist <= max_move:
             self.position = target.copy()
+            self.speed    = 0.0
         else:
             forward = np.array([np.cos(self.heading), np.sin(self.heading)])
             self.position = self.position + forward * max_move
 
         self._clamp_to_field()
-        return np.linalg.norm(target - self.position) < 0.50
+        return float(np.linalg.norm(target - self.position)) < 0.50
 
     def _clamp_to_field(self):
         half = self.half_w
@@ -124,8 +144,11 @@ class Robot:
         self.held_object_ids = []
         self.actions_attempted = 0
         self.actions_succeeded = 0
-        self.target = None
-        self.moving = False
+        self.target        = None
+        self.moving        = False
+        self.speed         = 0.0
+        self.score_timer   = 0.0
+        self.intake_active = False
 
 
 def _wrap_angle(a: float) -> float:

@@ -28,7 +28,7 @@ from sim.config import (
     REGION_A_CENTER, REGION_B_CENTER, DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
-    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W,
+    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE,
 )
 from sim.field import Field
 from sim.robot import Robot
@@ -39,8 +39,10 @@ from sim.opponent import get_opponent
 # ---------------------------------------------------------------------------
 # Goal collision resolution
 # ---------------------------------------------------------------------------
-# Margin = half robot width + 0.25" ghost boundary
+# Margin for long goals = half robot width + 0.25" ghost boundary
 _GOAL_MARGIN = ROBOT_W / 2 + 0.25   # 7.75"
+# Wider margin for center X arms — gives a visually clear gap between robot body and arm body
+_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 2.5   # 10.0"
 
 # Long goal X extents (precomputed from config)
 _RIGHT_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH  # inner face
@@ -53,11 +55,82 @@ _CX, _CY  = 72.0, 72.0
 _ARM_LEN  = CENTER_GOAL_ARM_LEN    # half-length along arm axis
 _ARM_HW   = CENTER_GOAL_ARM_W / 2  # half-width across arm
 
-# Center goal approach points — just outside both arm collision zones,
+# Center goal approach points — just outside center arm collision zone,
 # within SCORE_RANGE (10") of the actual goal centers.
-# A robot at these positions can score without entering the X structure.
-_CENTER_MID_APPROACH = np.array([72.0, 87.0])   # above CENTER_MID_GOAL (72, 80.94)
-_CENTER_LOW_APPROACH = np.array([72.0, 57.0])   # below CENTER_LOW_GOAL (72, 63.06)
+_CENTER_MID_APPROACH = np.array([72.0, 90.0])   # above CENTER_MID_GOAL (72, 80.94)
+_CENTER_LOW_APPROACH = np.array([72.0, 54.0])   # below CENTER_LOW_GOAL (72, 63.06)
+
+# Long goal scoring positions — robot backs in so front/intake faces AWAY from goal entrance.
+# Right goal inner face at x=118.375; collision boundary at x=110.625.
+# Left  goal inner face at x=25.625;  collision boundary at x=33.375.
+_RIGHT_GOAL_SCORE_X  = _RIGHT_GOAL_X_LO - _GOAL_MARGIN      # ≈ 110.625
+_LEFT_GOAL_SCORE_X   = _LEFT_GOAL_X_HI  + _GOAL_MARGIN      # ≈ 33.375
+_LONG_GOAL_SCORE_Y_MIN = LONG_GOAL_Y_MIN + 7.5               # within goal opening
+_LONG_GOAL_SCORE_Y_MAX = LONG_GOAL_Y_MAX - 7.5
+
+# Scoring headings: front (intake) faces AWAY from goal, so back enters goal.
+_SCORE_HDG_RIGHT    = math.pi    # front west → back east into right goal
+_SCORE_HDG_LEFT     = 0.0        # front east → back west into left goal
+_SCORE_HDG_TOL      = math.pi / 6.0   # 30° tolerance
+_SCORE_ARRIVAL_DIST = 8.0        # within this dist of scoring pos → start turning
+_SCORE_INTERVAL     = 1.5        # seconds to score one ball
+
+
+def _wrap_angle(a: float) -> float:
+    """Wrap angle to [-π, π]."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+# ---------------------------------------------------------------------------
+# Navigation waypoints (path avoidance around center X)
+# ---------------------------------------------------------------------------
+# These approach-corridor points sit in the clear field quadrants, safely
+# outside all X-arm and long-goal collision zones.  Verified:
+#   (95,  40): below X arms (arm tips at ~y=55.6),  right side
+#   (95, 104): above X arms (arm tips at ~y=88.4),  right side
+#   (49,  40): below X arms, left side
+#   (49, 104): above X arms, left side
+# Generic center corridors kept for COLLECT-route detours.
+_NAV_ABOVE_X     = np.array([ 72.0, 103.0])
+_NAV_BELOW_X     = np.array([ 72.0,  41.0])
+_NAV_RIGHT_LOW   = np.array([ 95.0,  40.0])  # right-goal approach, below X
+_NAV_RIGHT_HIGH  = np.array([ 95.0, 104.0])  # right-goal approach, above X
+_NAV_LEFT_LOW    = np.array([ 49.0,  40.0])  # left-goal approach,  below X
+_NAV_LEFT_HIGH   = np.array([ 49.0, 104.0])  # left-goal approach,  above X
+
+
+def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarray]:
+    """Return [corridor_waypoint, final_target] routing around the center X structure.
+
+    Uses a position-based rule: if the robot is not already well past the X
+    structure toward the target goal, always route through a clear approach
+    corridor first.  This is more reliable than a marginal LOS check because
+    the corridor points are geometrically guaranteed clear of both X arms and
+    long-goal bodies for a 15" robot.
+
+    Right goal (final.x > 72): skip corridor if robot x ≥ 88 (past X arm tips).
+    Left  goal (final.x ≤ 72): skip corridor if robot x ≤ 56.
+    Corridor y chosen above or below the X based on robot's y position.
+    """
+    from sim.route_planner import _los_blocked, _NAV_MARGIN
+
+    use_low = start[1] <= 72.0
+
+    if final[0] > 72.0:       # heading to right goal
+        if start[0] >= 88.0:  # robot past X arm tips — no crossing needed
+            return [final]
+        corridor = _NAV_RIGHT_LOW.copy() if use_low else _NAV_RIGHT_HIGH.copy()
+    else:                      # heading to left goal
+        if start[0] <= 56.0:  # robot past X arm tips on the left
+            return [final]
+        corridor = _NAV_LEFT_LOW.copy() if use_low else _NAV_LEFT_HIGH.copy()
+
+    # Safety: verify corridor→final is clear with full robot-width margin
+    if _los_blocked(corridor[0], corridor[1], final[0], final[1],
+                    margin=_NAV_MARGIN):
+        center = _NAV_BELOW_X.copy() if use_low else _NAV_ABOVE_X.copy()
+        return [center, corridor, final]
+    return [corridor, final]
 
 
 def _resolve_goal_collisions(robot) -> None:
@@ -85,10 +158,11 @@ def _resolve_goal_collisions(robot) -> None:
             elif s == d_yd: robot.y = ey_lo
             else:           robot.y = ey_hi
 
-    # --- Center goal arms — evaluate both before applying any push ---
+    # --- Center goal arms — use wider margin for visible clearance ---
+    mc = _CENTER_GOAL_MARGIN
     # Minimum distance from X centre to be simultaneously clear of BOTH arms:
-    # clear_dist = (ARM_HW + margin) / sin(45°) = (ARM_HW + m) * √2
-    clear_dist = (_ARM_HW + m) * math.sqrt(2)
+    # clear_dist = (ARM_HW + mc) / sin(45°) = (ARM_HW + mc) * √2
+    clear_dist = (_ARM_HW + mc) * math.sqrt(2)
 
     rx, ry = robot.x, robot.y
     arm_data = []   # (angle, along, perp) for each overlapping arm
@@ -97,7 +171,7 @@ def _resolve_goal_collisions(robot) -> None:
         dx, dy = rx - _CX, ry - _CY
         along = dx * ca  + dy * sa
         perp  = dx * -sa + dy * ca
-        if abs(along) < _ARM_LEN + m and abs(perp) < _ARM_HW + m:
+        if abs(along) < _ARM_LEN + mc and abs(perp) < _ARM_HW + mc:
             arm_data.append((angle, along, perp))
 
     if not arm_data:
@@ -118,16 +192,16 @@ def _resolve_goal_collisions(robot) -> None:
         # Single arm overlap — push perpendicularly (shortest exit).
         angle, along, perp = arm_data[0]
         ca, sa = math.cos(angle), math.sin(angle)
-        exit_perp  = _ARM_HW + m - abs(perp)
-        exit_along = _ARM_LEN + m - abs(along)
+        exit_perp  = _ARM_HW + mc - abs(perp)
+        exit_along = _ARM_LEN + mc - abs(along)
         if exit_perp <= exit_along:
             sign     = 1 if perp >= 0 else -1
-            new_perp = sign * (_ARM_HW + m)
+            new_perp = sign * (_ARM_HW + mc)
             robot.x  = _CX + along * ca + new_perp * (-sa)
             robot.y  = _CY + along * sa + new_perp * ca
         else:
             sign      = 1 if along >= 0 else -1
-            new_along = sign * (_ARM_LEN + m)
+            new_along = sign * (_ARM_LEN + mc)
             robot.x   = _CX + new_along * ca + perp * (-sa)
             robot.y   = _CY + new_along * sa + perp * ca
 
@@ -138,9 +212,27 @@ def _resolve_goal_collisions(robot) -> None:
 def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray | None:
     """Convert allied RL action to a moveToPoint target."""
     if action == Action.COLLECT_NEAREST_BALL:
-        return field.nearest_on_field_target(robot.position)
+        # Priority 1: route planner with full vision cone + LOS + strategic scoring
+        from sim.route_planner import compute_collection_route
+        route = compute_collection_route(
+            robot.position, field,
+            already_held=robot.balls_held,
+            max_volley=1,
+            robot=robot,
+        )
+        if route:
+            return route[0][1].copy()   # centroid of best cluster
+        # Priority 2: nearest ball with LOS check (ball not behind a goal)
+        return field.nearest_navigable_target(robot.position)
     elif action == Action.SCORE_LONG_GOAL:
-        return OUR_LONG_GOAL.copy()
+        # Navigate to the NEAREST long goal scoring position.
+        # Right goal: robot backs in from west (x≈110.6), heading=π.
+        # Left  goal: robot backs in from east (x≈33.4),  heading=0.
+        score_y = float(np.clip(robot.y, _LONG_GOAL_SCORE_Y_MIN, _LONG_GOAL_SCORE_Y_MAX))
+        if robot.x >= FIELD_W / 2:
+            return np.array([_RIGHT_GOAL_SCORE_X, score_y])
+        else:
+            return np.array([_LEFT_GOAL_SCORE_X, score_y])
     elif action == Action.SCORE_CENTER_GOAL:
         # Navigate to the approach point outside the X structure, within scoring range.
         d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
@@ -233,9 +325,12 @@ class VexAIEnv(gym.Env):
         self.done = False
 
         # Decision progress — updated each tick so renderer can show a progress bar
-        # 0 = idle/waiting, 1..TICKS_PER_DECISION = executing, -1 = just finished
         self.decision_tick: int = 0
         self.executing: bool = False
+
+        # Scoring animations — list of dicts the renderer consumes and removes.
+        # Each: {x0,y0, x1,y1, color, elapsed, duration}
+        self.score_animations: list[dict] = []
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -275,8 +370,9 @@ class VexAIEnv(gym.Env):
             robot.held_object_ids.clear()
             robot.actions_attempted = 0
             robot.actions_succeeded = 0
-            robot.target = None
-            robot.moving = False
+            robot.target      = None
+            robot.moving      = False
+            robot.score_timer = 0.0
 
         # Reset ball physics; un-hold any held balls
         for obj in self.field.objects:
@@ -298,6 +394,7 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = False
         self.opp_targets   = [None, None]
+        self.score_animations.clear()
 
         return self._get_obs(), {}
 
@@ -316,11 +413,6 @@ class VexAIEnv(gym.Env):
         if self.num_allies < 2 or fi.teammate_offline or fi.should_teammate_fail():
             a1 = Action.IDLE
 
-        ally_targets = [
-            _action_to_target(Action(a0), self.field, self.field.allies[0]),
-            _action_to_target(Action(a1), self.field, self.field.allies[1]),
-        ]
-
         for oi in range(self.num_opponents):
             opp = self.field.opponents[oi]
             opp_state = {
@@ -337,8 +429,60 @@ class VexAIEnv(gym.Env):
             if fi.should_steal_object():
                 self._steal_nearest(idx)
 
-        for tick in range(TICKS_PER_DECISION):
+        # ── Waypoint queues: each robot gets an ordered list of nav points. ──
+        # SCORE_LONG_GOAL may insert a detour waypoint to avoid the center X.
+        # live_actions mirrors the current per-robot action and updates on replanning.
+        live_actions = [a0, a1]
+
+        def _build_wq(idx: int) -> list:
+            """Build the waypoint queue for robot idx using its current live action."""
+            robot  = self.field.allies[idx]
+            act    = Action(live_actions[idx])
+            final  = _action_to_target(act, self.field, robot)
+            if final is None:
+                return []
+            if act in (Action.SCORE_LONG_GOAL,):
+                return _build_nav_waypoints(robot.position, final)
+            return [final]
+
+        ally_wq: list[list] = [_build_wq(0), _build_wq(1)]
+
+        def _current_target(idx: int):
+            return ally_wq[idx][0] if ally_wq[idx] else None
+
+        # ── Dynamic step length ──────────────────────────────────────────
+        # Base ticks = TICKS_PER_DECISION (3 s).  If any robot is still actively
+        # moving toward a target after that, extend up to MAX_STEP_TICKS so
+        # it completes the trajectory rather than timing out mid-path.
+        MAX_STEP_TICKS = TICKS_PER_DECISION * 4  # up to 12 s
+
+        for tick in range(MAX_STEP_TICKS):
+            # After base window: keep running only if a robot is still in motion
+            if tick >= TICKS_PER_DECISION and self.field.time_remaining > 0:
+                still_moving = any(
+                    self.field.allies[i].moving and bool(ally_wq[i])
+                    for i in range(self.num_allies)
+                )
+                if not still_moving:
+                    break
+
             fi.on_tick(num_robots=2)
+
+            # ── Mid-step adaptive replanning ──────────────────────────────
+            for idx in range(self.num_allies):
+                robot = self.field.allies[idx]
+                act   = Action(live_actions[idx])
+                new_act = None
+                # Full robot → always score, regardless of current action
+                if robot.balls_held >= MAX_CARRY and act != Action.SCORE_LONG_GOAL:
+                    new_act = Action.SCORE_LONG_GOAL
+                # Finished scoring → go collect
+                elif act == Action.SCORE_LONG_GOAL and robot.balls_held == 0:
+                    new_act = Action.COLLECT_NEAREST_BALL
+                if new_act is not None:
+                    live_actions[idx]          = int(new_act)
+                    self.current_actions[idx]  = live_actions[idx]
+                    ally_wq[idx]               = _build_wq(idx)
 
             # Save positions before movement for push calculation
             ally_prev = [self.field.allies[i].position.copy()     for i in range(self.num_allies)]
@@ -347,9 +491,13 @@ class VexAIEnv(gym.Env):
             for idx in range(self.num_allies):
                 if fi.is_stuck(idx):
                     continue
-                target = ally_targets[idx]
+                target = _current_target(idx)
                 if target is not None:
-                    self.field.allies[idx].move_toward_point(target)
+                    arrived = self.field.allies[idx].move_toward_point(target)
+                    if arrived and len(ally_wq[idx]) > 1:
+                        ally_wq[idx].pop(0)      # advance to next waypoint
+                    elif arrived:
+                        ally_wq[idx].clear()     # reached final destination
                 _resolve_goal_collisions(self.field.allies[idx])
 
             for oi in range(self.num_opponents):
@@ -357,7 +505,21 @@ class VexAIEnv(gym.Env):
                     self.field.opponents[oi].move_toward_point(self.opp_targets[oi])
                 _resolve_goal_collisions(self.field.opponents[oi])
 
-            # Apply robot→ball pushes
+            # Update intake state: spinning only while actively collecting and not full
+            for idx in range(self.num_allies):
+                robot = self.field.allies[idx]
+                robot.intake_active = (
+                    Action(live_actions[idx]) == Action.COLLECT_NEAREST_BALL
+                    and robot.balls_held < MAX_CARRY
+                )
+
+            # Check collect/score before push so balls in intake range don't get kicked away
+            self._check_ally_effects(0, Action(live_actions[0]))
+            if self.num_allies >= 2:
+                self._check_ally_effects(1, Action(live_actions[1]))
+            self._check_opp_effects()
+
+            # Apply robot→ball pushes (already-held balls are skipped)
             for idx in range(self.num_allies):
                 self.field.apply_robot_push(self.field.allies[idx], ally_prev[idx])
             for oi in range(self.num_opponents):
@@ -365,11 +527,6 @@ class VexAIEnv(gym.Env):
 
             # Advance ball rolling physics
             self.field.physics_tick(DT)
-
-            self._check_ally_effects(0, Action(a0))
-            if self.num_allies >= 2:
-                self._check_ally_effects(1, Action(a1))
-            self._check_opp_effects()
 
             self.field.time_remaining -= DT
             self.decision_tick += 1
@@ -408,12 +565,52 @@ class VexAIEnv(gym.Env):
                 robot.actions_succeeded += 1
 
         elif action == Action.SCORE_LONG_GOAL:
-            # Heading constraint: must face up or down (within 30° of ±π/2)
-            if abs(math.sin(robot.heading)) > 0.866:
-                pts = self.field.try_score(robot, OUR_LONG_GOAL, LONG_GOAL_POINTS)
-                if pts > 0:
-                    self.score_events[idx] += pts
-                    robot.actions_succeeded += 1
+            if robot.balls_held <= 0:
+                robot.score_timer = 0.0
+                return
+
+            # Choose the same goal that the navigation target selected:
+            # right half of field → right goal, left half → left goal.
+            score_y = float(np.clip(robot.y, _LONG_GOAL_SCORE_Y_MIN, _LONG_GOAL_SCORE_Y_MAX))
+            if robot.x >= FIELD_W / 2:
+                score_pos        = np.array([_RIGHT_GOAL_SCORE_X, score_y])
+                target_goal      = OUR_LONG_GOAL
+                required_heading = _SCORE_HDG_RIGHT
+            else:
+                score_pos        = np.array([_LEFT_GOAL_SCORE_X, score_y])
+                target_goal      = OPP_LONG_GOAL
+                required_heading = _SCORE_HDG_LEFT
+
+            dist = float(np.linalg.norm(robot.position - score_pos))
+
+            if dist < _SCORE_ARRIVAL_DIST:
+                # At scoring position — turn intake away from goal entrance
+                angle_err  = _wrap_angle(required_heading - robot.heading)
+                turn_delta = float(np.clip(angle_err * 4.0, -TURN_RATE, TURN_RATE)) * DT
+                robot.heading = _wrap_angle(robot.heading + turn_delta)
+
+                if abs(_wrap_angle(required_heading - robot.heading)) < _SCORE_HDG_TOL:
+                    robot.score_timer += DT
+                    interval = _SCORE_INTERVAL / robot.balls_held
+                    if robot.score_timer >= interval:
+                        robot.score_timer = 0.0
+                        # Save ball color before try_score_one pops it
+                        ball_color = (self.field.objects[robot.held_object_ids[0]].color
+                                      if robot.held_object_ids else None)
+                        pts = self.field.try_score_one(robot, target_goal, LONG_GOAL_POINTS)
+                        if pts > 0:
+                            self.score_events[idx] += pts
+                            robot.actions_succeeded += 1
+                            if ball_color is not None:
+                                self.score_animations.append({
+                                    'x0': robot.x, 'y0': robot.y,
+                                    'x1': float(target_goal[0]), 'y1': float(target_goal[1]),
+                                    'color': ball_color,
+                                    'start_ms': None,
+                                    'duration': 0.5,
+                                })
+            else:
+                robot.score_timer = 0.0
 
         elif action == Action.SCORE_CENTER_GOAL:
             # Heading constraint: must face a diagonal direction (within 30° of 45°/135°/225°/315°)

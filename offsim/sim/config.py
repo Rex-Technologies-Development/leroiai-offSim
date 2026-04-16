@@ -102,7 +102,7 @@ PARK_ZONE_BOTTOM = 24.0    # top edge of bottom park zone
 PARK_ZONE_TOP    = 120.0   # bottom edge of top park zone
 
 # Vision cone — wide-angle camera in front of robot
-VISION_HALF_ANGLE = np.radians(65.0)   # ±65° → 130° total FOV
+VISION_HALF_ANGLE = np.radians(34.5)   # ±34.5° → 69° total HFOV (OAK-D Lite Auto Focus)
 VISION_RANGE      = 72.0               # max depth in inches
 
 # Named zones

@@ -18,10 +18,40 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+def _greedy_demo_action(robot_idx: int, env) -> int:
+    """Greedy demo policy: collect until full, then score nearest long goal.
+
+    Priority:
+      1. Full (MAX_CARRY balls) → SCORE_LONG_GOAL
+      2. Accessible balls exist → COLLECT_NEAREST_BALL
+      3. Holding any balls but none accessible → SCORE_LONG_GOAL
+      4. No balls anywhere → IDLE
+    """
+    from sim.route_planner import compute_collection_route
+    from sim.config import Action, MAX_CARRY
+
+    robot = env.field.allies[robot_idx]
+
+    if robot.balls_held >= MAX_CARRY:
+        return int(Action.SCORE_LONG_GOAL)
+
+    route = compute_collection_route(
+        robot.position, env.field,
+        already_held=robot.balls_held,
+        max_volley=1,
+        robot=robot,
+    )
+    if route:
+        return int(Action.COLLECT_NEAREST_BALL)
+    if robot.balls_held > 0:
+        return int(Action.SCORE_LONG_GOAL)
+    return int(Action.COLLECT_NEAREST_BALL)   # fallback: drive toward field to get LOS
+
+
 def cmd_demo(args):
-    """Run the sim with random actions and Pygame visualization."""
+    """Run the sim with greedy (or random) actions and Pygame visualization."""
     from sim.env import VexAIEnv
-    from sim.config import NUM_ACTIONS
+    from sim.config import Action
     from sim.failure import FailureConfig
 
     env = VexAIEnv(
@@ -35,8 +65,9 @@ def cmd_demo(args):
     episode = 1
     total_reward = 0.0
 
-    print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s), random actions")
+    print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
     print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
+    print("          Panel: RUN to run, AUTO PLAY for smart greedy policy")
 
     while True:
         env.render()
@@ -52,7 +83,26 @@ def cmd_demo(args):
                 episode += 1
                 continue
 
-        actions = rng.integers(0, NUM_ACTIONS, size=2)
+        if renderer and renderer.demo_score:
+            # Demo scoring: force SCORE_LONG_GOAL until robots have emptied all balls.
+            from sim.config import Action
+            actions = np.array([int(Action.SCORE_LONG_GOAL)] * 2)
+            # Auto-exit demo mode once all robots have finished scoring
+            all_done = all(env.field.allies[i].balls_held == 0
+                           for i in range(env.num_allies))
+            if all_done:
+                renderer.demo_score = False
+        elif renderer and renderer.auto_collect:
+            # Greedy policy: collect → fill → score nearest goal → repeat
+            actions = np.array([
+                _greedy_demo_action(0, env),
+                _greedy_demo_action(min(1, env.num_allies - 1), env),
+            ])
+        else:
+            demo_actions = [int(Action.COLLECT_NEAREST_BALL), int(Action.SCORE_LONG_GOAL),
+                            int(Action.SCORE_CENTER_GOAL), int(Action.IDLE)]
+            actions = np.array([rng.choice(demo_actions) for _ in range(2)])
+
         obs, rewards, done, _, _ = env.step(actions)
         total_reward += rewards[0]
         if args.num_robots >= 2:

@@ -23,12 +23,93 @@ from sim.config import (
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
     CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W,
     MATCHLOAD_TUBES, MATCHLOAD_TUBE_RADIUS,
+    VISION_HALF_ANGLE, VISION_RANGE,
+    ROBOT_W,
 )
 
+# Half of the robot's physical width — used to expand obstacles so the path
+# planner routes the robot's CENTRE along a path that keeps the whole body clear.
+_NAV_MARGIN: float = ROBOT_W / 2   # 7.5"
+
+# ---- Goal obstacle definitions for line-of-sight occlusion ----------------
+# Long goal AABBs [x_lo, x_hi, y_lo, y_hi]
+_LOS_AABB_OBSTACLES = [
+    (LONG_GOAL_WALL_GAP, LONG_GOAL_WALL_GAP + LONG_GOAL_WIDTH,
+     LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX),
+    (FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH, FIELD_W - LONG_GOAL_WALL_GAP,
+     LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX),
+]
+# Center X arms: (cx, cy, angle, half_len, half_w)
+_LOS_ARM_OBSTACLES = [
+    (72.0, 72.0, math.pi / 4,  CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W / 2),
+    (72.0, 72.0, -math.pi / 4, CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W / 2),
+]
+
+
+def _seg_hits_aabb(p1x: float, p1y: float, p2x: float, p2y: float,
+                   ax0: float, ax1: float, ay0: float, ay1: float) -> bool:
+    """Liang-Barsky: does segment p1→p2 intersect AABB [ax0,ax1]×[ay0,ay1]?"""
+    dx, dy = p2x - p1x, p2y - p1y
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, p1x - ax0), (dx, ax1 - p1x),
+                  (-dy, p1y - ay0), (dy, ay1 - p1y)):
+        if abs(p) < 1e-9:
+            if q < 0:
+                return False
+        elif p < 0:
+            r = q / p
+            if r > t1:
+                return False
+            if r > t0:
+                t0 = r
+        else:
+            r = q / p
+            if r < t0:
+                return False
+            if r < t1:
+                t1 = r
+    return t0 <= t1
+
+
+def _seg_hits_arm(p1x: float, p1y: float, p2x: float, p2y: float,
+                  cx: float, cy: float, angle: float,
+                  half_len: float, half_w: float) -> bool:
+    """Does segment p1→p2 intersect a rotated-rectangle obstacle?"""
+    ca, sa = math.cos(angle), math.sin(angle)
+    def to_local(x: float, y: float):
+        dx, dy = x - cx, y - cy
+        return dx * ca + dy * sa, dx * (-sa) + dy * ca
+    lp1 = to_local(p1x, p1y)
+    lp2 = to_local(p2x, p2y)
+    return _seg_hits_aabb(lp1[0], lp1[1], lp2[0], lp2[1],
+                           -half_len, half_len, -half_w, half_w)
+
+
+def _los_blocked(rx: float, ry: float, bx: float, by: float,
+                 margin: float = 0.0) -> bool:
+    """True if the path from (rx,ry) to (bx,by) is blocked by any goal obstacle.
+
+    margin: expand each obstacle outward by this many inches before checking.
+    Pass margin=_NAV_MARGIN (7.5") for navigation paths so the full robot body
+    is accounted for, not just its centre point.
+    """
+    for ax0, ax1, ay0, ay1 in _LOS_AABB_OBSTACLES:
+        if _seg_hits_aabb(rx, ry, bx, by,
+                          ax0 - margin, ax1 + margin,
+                          ay0 - margin, ay1 + margin):
+            return True
+    for cx, cy, angle, hl, hw in _LOS_ARM_OBSTACLES:
+        if _seg_hits_arm(rx, ry, bx, by, cx, cy, angle,
+                         hl + margin, hw + margin):
+            return True
+    return False
+
 # ---- Proximity thresholds --------------------------------------------------
-_WALL_MARGIN  = 24.0    # 1 tile from any wall → "near a wall"
-_GOAL_MARGIN  = 16.0    # inches from a goal center → "near goal"
-_CLUSTER_DIST = 36.0    # inches — balls within this are "in the same cluster"
+_WALL_MARGIN         = 24.0   # 1 tile from any wall → "near a wall"
+_GOAL_MARGIN         = 16.0   # inches from a goal center → "near goal"
+_CLUSTER_DIST        = 36.0   # scoring cluster distance (strategic grouping)
+_CLUSTER_PICKUP_DIST = 15.0   # balls this close → single drive-to waypoint
+_MIN_ROUTE_VALUE     = 0.06   # score/dist ratio below this → stop adding waypoints
 
 # Pre-computed goal extents (long goal bodies)
 _R_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH   # inner face right goal
@@ -101,6 +182,24 @@ def _cluster_counts(obj, on_field_objs):
     return same, opp
 
 
+def _in_vision(robot, ball_x: float, ball_y: float) -> bool:
+    """True if the ball is within the robot's vision cone AND not occluded
+    by any goal obstacle."""
+    dx = ball_x - robot.x
+    dy = ball_y - robot.y
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist > VISION_RANGE:
+        return False
+    angle_to = math.atan2(dy, dx)
+    diff = abs(((robot.heading - angle_to + math.pi) % (2 * math.pi)) - math.pi)
+    if diff > VISION_HALF_ANGLE:
+        return False
+    # Goal structures block line of sight
+    if _los_blocked(robot.x, robot.y, ball_x, ball_y):
+        return False
+    return True
+
+
 def _score_ball(obj, on_field_objs: list) -> float:
     """Return strategic desirability score for collecting this ball.
 
@@ -150,6 +249,52 @@ def _score_ball(obj, on_field_objs: list) -> float:
     return base
 
 
+# ---- Cluster builder -------------------------------------------------------
+
+def _build_pickup_clusters(
+    candidates: list,   # [(field_idx, obj, score), ...]
+) -> list[tuple[list[int], np.ndarray, float]]:
+    """Group nearby candidates into single-waypoint clusters.
+
+    Two balls belong to the same cluster when any pair within the group is
+    within _CLUSTER_PICKUP_DIST of each other (single-linkage).
+
+    Returns list of (field_indices, centroid_pos, combined_score).
+    Single-ball groups are returned as clusters of size 1.
+    """
+    unvisited = list(candidates)   # copy
+    clusters: list[tuple[list[int], np.ndarray, float]] = []
+
+    while unvisited:
+        # Seed a new cluster with the first unvisited ball
+        cluster_entries = [unvisited.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            still_outside = []
+            for candidate in unvisited:
+                _, c_obj, _ = candidate
+                # Check against every member already in this cluster
+                merged = False
+                for _, m_obj, _ in cluster_entries:
+                    if math.hypot(c_obj.x - m_obj.x, c_obj.y - m_obj.y) <= _CLUSTER_PICKUP_DIST:
+                        cluster_entries.append(candidate)
+                        merged = True
+                        changed = True
+                        break
+                if not merged:
+                    still_outside.append(candidate)
+            unvisited = still_outside
+
+        idxs  = [e[0] for e in cluster_entries]
+        cx    = sum(e[1].x for e in cluster_entries) / len(cluster_entries)
+        cy    = sum(e[1].y for e in cluster_entries) / len(cluster_entries)
+        total = sum(e[2] for e in cluster_entries)
+        clusters.append((idxs, np.array([cx, cy]), total))
+
+    return clusters
+
+
 # ---- Public API ------------------------------------------------------------
 
 def compute_collection_route(
@@ -157,12 +302,15 @@ def compute_collection_route(
     field,
     already_held: int = 0,
     max_volley: int = 5,
-) -> list[tuple[int, float]]:
-    """Return an ordered list of (ball_index, score) representing the best
-    collection route starting from robot_pos.
+    robot=None,
+) -> list[tuple[list[int], np.ndarray, float]]:
+    """Return an ordered list of (ball_indices, waypoint_pos, score).
 
-    Picks up to min(MAX_CARRY - already_held, max_volley - already_held) balls.
-    Uses greedy selection weighted by score / (distance + 20).
+    Nearby balls are merged into cluster waypoints so the robot drives to a
+    single centroid to collect all of them, rather than threading each center.
+
+    Only considers balls visible within the robot's vision cone (if robot is
+    provided). Returns at most max_volley waypoints.
     """
     slots_left = min(MAX_CARRY - already_held, max_volley - already_held)
     if slots_left <= 0:
@@ -172,51 +320,68 @@ def compute_collection_route(
     if not on_field:
         return []
 
-    # Score all eligible balls
+    # Score all eligible, navigable balls.
+    # LOS check is always applied (even without a robot heading) so the planner
+    # never routes toward balls that are physically behind goal structures.
     def _make_candidates(pool):
         result = []
+        rx, ry = float(robot_pos[0]), float(robot_pos[1])
         for i, obj in enumerate(field.objects):
             if obj.status != OBJ_ON_FIELD:
+                continue
+            # Skip balls whose direct path is blocked when accounting for robot width
+            if _los_blocked(rx, ry, obj.x, obj.y, margin=_NAV_MARGIN):
+                continue
+            # Vision cone + range check only when a robot object is provided
+            if robot is not None and not _in_vision(robot, obj.x, obj.y):
                 continue
             s = _score_ball(obj, pool)
             if s > 0:
                 result.append((i, obj, s))
         return result
 
-    available = _make_candidates(on_field)
-    if not available:
+    candidates = _make_candidates(on_field)
+    if not candidates:
         return []
 
-    route: list[tuple[int, float]] = []
-    current_pos = robot_pos.copy()
+    # Group into pickup clusters (nearby balls → single waypoint)
+    clusters = _build_pickup_clusters(candidates)
 
-    for _ in range(slots_left):
+    route: list[tuple[list[int], np.ndarray, float]] = []
+    used_indices: set[int] = set()
+    current_pos = robot_pos.copy()
+    waypoints_added = 0
+
+    for _ in range(len(clusters)):
+        if waypoints_added >= max_volley:
+            break
+
+        # Filter clusters that still have unused balls
+        available = [
+            (idxs, pos, sc)
+            for idxs, pos, sc in clusters
+            if any(i not in used_indices for i in idxs)
+        ]
         if not available:
             break
 
         best_j   = -1
         best_val = -1.0
-        for j, (idx, obj, s) in enumerate(available):
-            dist = float(np.linalg.norm(np.array([obj.x, obj.y]) - current_pos))
-            val  = s / (dist + 20.0)
+        for j, (idxs, pos, sc) in enumerate(available):
+            dist = float(np.linalg.norm(pos - current_pos))
+            val  = sc / (dist + 20.0)
             if val > best_val:
                 best_val = val
                 best_j   = j
 
-        if best_j < 0:
+        if best_j < 0 or best_val < _MIN_ROUTE_VALUE:
             break
 
-        idx, obj, s = available.pop(best_j)
-        route.append((idx, s))
-        current_pos = np.array([obj.x, obj.y])
-
-        # Re-score remaining with updated cluster context
-        remaining_pool = [entry[1] for entry in available]
-        new_available  = []
-        for entry_idx, entry_obj, _ in available:
-            new_s = _score_ball(entry_obj, remaining_pool)
-            if new_s > 0:
-                new_available.append((entry_idx, entry_obj, new_s))
-        available = new_available
+        idxs, pos, sc = available[best_j]
+        fresh = [i for i in idxs if i not in used_indices]
+        route.append((fresh, pos, sc))
+        used_indices.update(fresh)
+        current_pos = pos
+        waypoints_added += 1
 
     return route
