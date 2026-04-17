@@ -1544,12 +1544,34 @@ class PygameRenderer:
                 self.selected_ball = -1
         y += BTN_H + 4
 
-        # ── Brush selector ──
-        brush_name = "RED" if self.brush_color == BALL_RED else "BLUE"
-        brush_col  = LIGHT_RED if self.brush_color == BALL_RED else LIGHT_BLUE
-        surf = self.font_sm.render(f"RClick brush: {brush_name}", True, brush_col)
-        self.screen.blit(surf, (px, y))
-        y += 16
+        # ── Brush color selector ──
+        self.btn_add_red.update(px, y, BTN_W, BTN_H)
+        self.btn_add_blue.update(px + BTN_W + 10, y, BTN_W, BTN_H)
+        for btn, label, bcolor, col in [
+            (self.btn_add_red,  "Brush: RED",  BALL_RED,  RED),
+            (self.btn_add_blue, "Brush: BLUE", BALL_BLUE, BLUE),
+        ]:
+            active = (self.brush_color == bcolor)
+            bg = tuple(max(0, c - 60) for c in col) if active else (35, 35, 45)
+            fg = col if active else (80, 80, 90)
+            hover_b = btn.collidepoint(mouse)
+            if hover_b:
+                bg = tuple(min(255, c + 20) for c in bg)
+            pygame.draw.rect(self.screen, bg, btn, border_radius=3)
+            pygame.draw.rect(self.screen, fg, btn, 2 if active else 1, border_radius=3)
+            s = self.font_sm.render(label, True, fg)
+            self.screen.blit(s, (btn.centerx - s.get_width() // 2,
+                                 btn.y + (BTN_H - s.get_height()) // 2))
+        if self._click_this_frame is not None:
+            if self.btn_add_red.collidepoint(self._click_this_frame):
+                self.brush_color = BALL_RED
+            elif self.btn_add_blue.collidepoint(self._click_this_frame):
+                self.brush_color = BALL_BLUE
+        y += BTN_H + 2
+
+        brush_col = LIGHT_RED if self.brush_color == BALL_RED else LIGHT_BLUE
+        self.screen.blit(self.font_sm.render("RClick on field to add ball", True, brush_col), (px, y))
+        y += 14
 
         return y
 
@@ -1603,10 +1625,11 @@ class PygameRenderer:
         """Place a ball at (fx, fy) in setup mode.
 
         - Snap to matchload tube if within snap distance.
-        - Auto-score if placed inside a long-goal body.
-        - Place in nearest center-goal arm region → score in that goal.
+        - Auto-score if placed inside/near a long-goal body (expanded hit zone).
+        - Place near center X arms → score in appropriate center goal.
+        - Otherwise place as on-field ball at clicked position.
         """
-        from sim.config import OBJ_SCORED_US, OBJ_SCORED_OPP
+        from sim.config import OBJ_SCORED_US
 
         # Snap to matchload tube?
         snap_dist = MATCHLOAD_TUBE_RADIUS * 3.0
@@ -1615,40 +1638,60 @@ class PygameRenderer:
                 fx, fy = float(tube[0]), float(tube[1])
                 break
 
-        obj_id = len(env.field.objects)
-        env.field.add_ball(round(fx, 2), round(fy, 2), color)
-        obj = env.field.objects[-1]
+        # Expanded hit zones for goal placement (easier clicking)
+        _GOAL_PAD_X = 8.0   # extra inches on each side for click detection
+        _GOAL_PAD_Y = 4.0
 
-        # Auto-score if inside right long goal body
-        if (_R_GOAL_X_LO <= fx <= _R_GOAL_X_HI and LONG_GOAL_Y_MIN <= fy <= LONG_GOAL_Y_MAX):
+        # Auto-score if near right long goal body
+        if (_R_GOAL_X_LO - _GOAL_PAD_X <= fx <= _R_GOAL_X_HI + _GOAL_PAD_X
+                and LONG_GOAL_Y_MIN - _GOAL_PAD_Y <= fy <= LONG_GOAL_Y_MAX + _GOAL_PAD_Y):
+            # Clamp Y to goal bounds, X to goal center
+            gy = float(np.clip(fy, LONG_GOAL_Y_MIN + 2.0, LONG_GOAL_Y_MAX - 2.0))
+            gx = (_R_GOAL_X_LO + _R_GOAL_X_HI) / 2.0
+            obj_id = len(env.field.objects)
+            env.field.add_ball(round(gx, 2), round(gy, 2), color)
+            obj = env.field.objects[-1]
             obj.status = OBJ_SCORED_US
             obj.scored_in_goal = "our_long"
             env.field.goal_state.score_ball("our_long", obj_id, color)
             return
 
-        # Auto-score if inside left long goal body
-        if (_L_GOAL_X_LO <= fx <= _L_GOAL_X_HI and LONG_GOAL_Y_MIN <= fy <= LONG_GOAL_Y_MAX):
+        # Auto-score if near left long goal body
+        if (_L_GOAL_X_LO - _GOAL_PAD_X <= fx <= _L_GOAL_X_HI + _GOAL_PAD_X
+                and LONG_GOAL_Y_MIN - _GOAL_PAD_Y <= fy <= LONG_GOAL_Y_MAX + _GOAL_PAD_Y):
+            gy = float(np.clip(fy, LONG_GOAL_Y_MIN + 2.0, LONG_GOAL_Y_MAX - 2.0))
+            gx = (_L_GOAL_X_LO + _L_GOAL_X_HI) / 2.0
+            obj_id = len(env.field.objects)
+            env.field.add_ball(round(gx, 2), round(gy, 2), color)
+            obj = env.field.objects[-1]
             obj.status = OBJ_SCORED_US
             obj.scored_in_goal = "opp_long"
             env.field.goal_state.score_ball("opp_long", obj_id, color)
             return
 
-        # Check center X arms
+        # Check near center X arms (expanded hit zone for easier clicking)
         dx, dy = fx - 72.0, fy - 72.0
         arm_len = CENTER_GOAL_ARM_LEN
-        arm_hw  = CENTER_GOAL_ARM_W / 2
+        arm_pad = 10.0   # generous perpendicular hit zone
         for angle in (math.pi / 4, -math.pi / 4):
             ca, sa = math.cos(angle), math.sin(angle)
             along = dx * ca + dy * sa
             perp  = dx * (-sa) + dy * ca
-            if abs(along) <= arm_len and abs(perp) <= arm_hw:
-                # Inside an X arm — score in the appropriate center goal
-                # Upper arm region (y > 72): center_mid; lower: center_low
+            if abs(along) <= arm_len and abs(perp) <= arm_pad:
                 gname = "center_mid" if fy >= 72.0 else "center_low"
+                # Snap position onto the arm centerline
+                snap_x = 72.0 + along * ca
+                snap_y = 72.0 + along * sa
+                obj_id = len(env.field.objects)
+                env.field.add_ball(round(snap_x, 2), round(snap_y, 2), color)
+                obj = env.field.objects[-1]
                 obj.status = OBJ_SCORED_US
                 obj.scored_in_goal = gname
                 env.field.goal_state.score_ball(gname, obj_id, color)
                 return
+
+        # Default: place on field at clicked position
+        env.field.add_ball(round(fx, 2), round(fy, 2), color)
 
     def _handle_setup_click(self, pos, env):
         """Handle left-click while in setup mode."""

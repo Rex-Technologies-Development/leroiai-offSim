@@ -92,6 +92,7 @@ def cmd_demo(args):
                            for i in range(env.num_allies))
             if all_done:
                 renderer.demo_score = False
+                renderer.paused = True
         elif renderer and renderer.auto_collect:
             # Greedy policy: collect → fill → score nearest goal → repeat
             actions = np.array([
