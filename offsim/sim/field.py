@@ -91,9 +91,33 @@ class GoalState:
         self.center_mid.clear()
         self.center_low.clear()
 
-    def score_ball(self, gname: str, ball_idx: int, color: int):
-        """Append a ball to this goal (becomes the new north/right outer)."""
-        self._list(gname).append((ball_idx, color))
+    def score_ball(self, gname: str, ball_idx: int, color: int,
+                   prepend: bool = False) -> tuple | None:
+        """Score a ball into the goal, respecting capacity limits.
+
+        prepend=False (default): ball enters from the 'end' (N for long, NE for MID, NW for LOW).
+        prepend=True: ball enters from the 'start' (S for long, SW for MID, SE for LOW).
+
+        Capacities: long goals = 14 balls, center goals = 7 balls.
+        If full, the ball at the OPPOSITE end is ejected (rolls out).
+        Returns (ejected_ball_idx, ejected_color) on overflow, else None.
+        """
+        _LONG_CAP   = 14
+        _CENTER_CAP = 7
+        lst = self._list(gname)
+        cap = _LONG_CAP if "long" in gname else _CENTER_CAP
+
+        ejected = None
+        if len(lst) >= cap:
+            # Eject from the end opposite the entry
+            ejected = lst.pop(-1) if prepend else lst.pop(0)
+
+        if prepend:
+            lst.insert(0, (ball_idx, color))
+        else:
+            lst.append((ball_idx, color))
+
+        return ejected
 
     def remove_ball(self, gname: str, ball_idx: int):
         """Remove a specific ball from this goal by ball_idx."""
@@ -118,22 +142,34 @@ class GoalState:
     def compute_quadrant_control(self) -> dict[str, int | None]:
         """Return the controlling color for each quadrant, or None.
 
-        Quadrant layout (y=0 at bottom of field):
-          bottom-left:  opp_long south-outer  & center_low left-outer
-          bottom-right: our_long south-outer  & center_low right-outer
-          top-left:     opp_long north-outer  & center_mid left-outer
-          top-right:    our_long north-outer  & center_mid right-outer
+        A quadrant is controlled when the outermost ball at the adjacent long-goal
+        end AND the adjacent center-goal arm tip are the SAME color.
+
+        Goal list layout (lst[0] = first-entry end, lst[-1] = last-entry end):
+          our_long:    lst[0] = South end,  lst[-1] = North end
+          opp_long:    lst[0] = South end,  lst[-1] = North end
+          center_mid:  lst[0] = SW  end,    lst[-1] = NE  end   (NE-SW bar)
+          center_low:  lst[0] = SE  end,    lst[-1] = NW  end   (NW-SE bar)
+
+        Quadrant pairings:
+          bottom-right (BR): our_long[South]  +  center_low[SE]
+          top-right    (TR): our_long[North]  +  center_mid[NE]
+          bottom-left  (BL): opp_long[South]  +  center_mid[SW]
+          top-left     (TL): opp_long[North]  +  center_low[NW]
         """
-        opp_s, opp_n = self.outer_colors("opp_long")
-        our_s, our_n = self.outer_colors("our_long")
-        low_l, low_r = self.outer_colors("center_low")
-        mid_l, mid_r = self.outer_colors("center_mid")
+        our_s, our_n  = self.outer_colors("our_long")   # S=lst[0], N=lst[-1]
+        opp_s, opp_n  = self.outer_colors("opp_long")
+        mid_sw, mid_ne = self.outer_colors("center_mid") # SW=lst[0], NE=lst[-1]
+        low_se, low_nw = self.outer_colors("center_low") # SE=lst[0], NW=lst[-1]
+
+        def _ctrl(a, b):
+            return a if (a is not None and a == b) else None
 
         return {
-            "bottom_left":  opp_s if (opp_s is not None and opp_s == low_l) else None,
-            "bottom_right": our_s if (our_s is not None and our_s == low_r) else None,
-            "top_left":     opp_n if (opp_n is not None and opp_n == mid_l) else None,
-            "top_right":    our_n if (our_n is not None and our_n == mid_r) else None,
+            "bottom_right": _ctrl(our_s,  low_se),
+            "top_right":    _ctrl(our_n,  mid_ne),
+            "bottom_left":  _ctrl(opp_s,  mid_sw),
+            "top_left":     _ctrl(opp_n,  low_nw),
         }
 
 
@@ -169,11 +205,16 @@ class Field:
         self.opponents[0].reset(24.00, 126.00, heading=0.0)
         self.opponents[1].reset(24.00,  18.00, heading=0.0)
 
-        # Rebuild from INITIAL_OBJECTS (removes any editor additions)
+        # Rebuild from INITIAL_OBJECTS with randomized position+color assignment
+        all_pos    = [(float(row[0]), float(row[1])) for row in INITIAL_OBJECTS]
+        all_colors = [int(row[2]) for row in INITIAL_OBJECTS]
+        pos_perm   = rng.permutation(len(all_pos))
+        col_perm   = rng.permutation(len(all_colors))
         self.objects = []
-        for i in range(len(INITIAL_OBJECTS)):
-            row = INITIAL_OBJECTS[i]
-            self.objects.append(GameObject(i, row[0], row[1], int(row[2])))
+        for i, (pi, ci) in enumerate(zip(pos_perm, col_perm)):
+            x, y  = all_pos[pi]
+            color = all_colors[ci]
+            self.objects.append(GameObject(i, x, y, color))
 
         self.my_score = 0
         self.opponent_score = 0
@@ -298,39 +339,62 @@ class Field:
         return False
 
     def try_score(self, robot: Robot, goal_pos: np.ndarray, points: int) -> int:
-        """Score held balls at goal. Returns points scored."""
+        """Score held balls at goal. Ball color determines which team scores.
+
+        Blue balls → my_score, Red balls → opponent_score.
+        Returns total points added across both teams.
+        """
         if robot.balls_held <= 0:
             return 0
         if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
             return 0
 
-        n = robot.balls_held
-        scored = points * n
-        self.my_score += scored
         gname = _goal_name(goal_pos)
+        total = 0
         for idx in robot.held_object_ids:
-            self.objects[idx].status = OBJ_SCORED_US
+            self.objects[idx].status       = OBJ_SCORED_US
             self.objects[idx].scored_in_goal = gname
-            self.goal_state.score_ball(gname, idx, self.objects[idx].color)
+            color = self.objects[idx].color
+            self.goal_state.score_ball(gname, idx, color)
+            if color == BALL_BLUE:
+                self.my_score += points
+            else:
+                self.opponent_score += points
+            total += points
         robot.held_object_ids.clear()
         robot.balls_held = 0
-        return scored
+        return total
 
-    def try_score_one(self, robot: Robot, goal_pos: np.ndarray, points: int) -> int:
-        """Score exactly one held ball at goal. Returns points scored (0 if none)."""
+    def try_score_one(self, robot: Robot, goal_pos: np.ndarray, points: int,
+                       gname: str | None = None,
+                       prepend: bool = False) -> tuple[int, tuple | None]:
+        """Score exactly one held ball at goal.
+
+        Returns (points_scored, ejected_ball) where ejected_ball is
+        (ball_idx, color) if the goal overflowed, else None.
+        goal_pos is the scoring reference point.
+        gname overrides goal-name lookup when goal_pos isn't the centre.
+        prepend=True: ball enters from the 'start' end (S / SW / SE).
+        """
         if robot.balls_held <= 0:
-            return 0
+            return 0, None
         if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
-            return 0
+            return 0, None
 
         idx = robot.held_object_ids.pop(0)
         robot.balls_held -= 1
         self.objects[idx].status = OBJ_SCORED_US
-        gname = _goal_name(goal_pos)
+        if gname is None:
+            gname = _goal_name(goal_pos)
         self.objects[idx].scored_in_goal = gname
-        self.goal_state.score_ball(gname, idx, self.objects[idx].color)
-        self.my_score += points
-        return points
+        ball_color = self.objects[idx].color
+        ejected = self.goal_state.score_ball(gname, idx, ball_color, prepend=prepend)
+        # Ball color determines which alliance earns the points
+        if ball_color == BALL_BLUE:
+            self.my_score += points
+        else:
+            self.opponent_score += points
+        return points, ejected
 
     def try_descore(self, robot: Robot, goal_pos: np.ndarray, rng: np.random.Generator) -> int:
         """Remove an opponent-scored ball from goal. Returns points removed."""

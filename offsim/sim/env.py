@@ -28,7 +28,8 @@ from sim.config import (
     REGION_A_CENTER, REGION_B_CENTER, DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
-    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE,
+    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE, MAX_SPEED,
+    BALL_BLUE, BALL_RED,
 )
 from sim.field import Field
 from sim.robot import Robot
@@ -55,25 +56,91 @@ _CX, _CY  = 72.0, 72.0
 _ARM_LEN  = CENTER_GOAL_ARM_LEN    # half-length along arm axis
 _ARM_HW   = CENTER_GOAL_ARM_W / 2  # half-width across arm
 
-# Center goal approach points — just outside center arm collision zone,
-# within SCORE_RANGE (10") of the actual goal centers.
-_CENTER_MID_APPROACH = np.array([72.0, 90.0])   # above CENTER_MID_GOAL (72, 80.94)
-_CENTER_LOW_APPROACH = np.array([72.0, 54.0])   # below CENTER_LOW_GOAL (72, 63.06)
+# ---------------------------------------------------------------------------
+# Scoring geometry — robot backs into each goal end so the BACK feeds the goal.
+# ---------------------------------------------------------------------------
+# Distance from goal opening to robot center when scoring (half robot + clearance)
+_SCORE_APPROACH_GAP = ROBOT_W / 2 + 2.0   # ≈ 9.5"
 
-# Long goal scoring positions — robot backs in so front/intake faces AWAY from goal entrance.
-# Right goal inner face at x=118.375; collision boundary at x=110.625.
-# Left  goal inner face at x=25.625;  collision boundary at x=33.375.
-_RIGHT_GOAL_SCORE_X  = _RIGHT_GOAL_X_LO - _GOAL_MARGIN      # ≈ 110.625
-_LEFT_GOAL_SCORE_X   = _LEFT_GOAL_X_HI  + _GOAL_MARGIN      # ≈ 33.375
-_LONG_GOAL_SCORE_Y_MIN = LONG_GOAL_Y_MIN + 7.5               # within goal opening
-_LONG_GOAL_SCORE_Y_MAX = LONG_GOAL_Y_MAX - 7.5
+# Long goal scoring positions (top end and bottom end of each vertical goal).
+# Robot center sits beyond the open end; back faces into the goal.
+_RIGHT_GOAL_CX = (_RIGHT_GOAL_X_LO + _RIGHT_GOAL_X_HI) / 2.0   # ≈ 120.4
+_LEFT_GOAL_CX  = (_LEFT_GOAL_X_LO  + _LEFT_GOAL_X_HI)  / 2.0   # ≈ 23.6
 
-# Scoring headings: front (intake) faces AWAY from goal, so back enters goal.
-_SCORE_HDG_RIGHT    = math.pi    # front west → back east into right goal
-_SCORE_HDG_LEFT     = 0.0        # front east → back west into left goal
+_RIGHT_GOAL_TOP_POS = np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MAX + _SCORE_APPROACH_GAP])
+_RIGHT_GOAL_BOT_POS = np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MIN - _SCORE_APPROACH_GAP])
+_LEFT_GOAL_TOP_POS  = np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MAX + _SCORE_APPROACH_GAP])
+_LEFT_GOAL_BOT_POS  = np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MIN - _SCORE_APPROACH_GAP])
+
+# Required headings (sim radians, 0=E, CCW). Robot faces AWAY from goal so back enters.
+# At TOP end: robot above goal → faces NORTH (+y) → sim heading +π/2.
+# At BOTTOM end: robot below goal → faces SOUTH (-y) → sim heading -π/2.
+_HDG_NORTH = math.pi / 2.0
+_HDG_SOUTH = -math.pi / 2.0
+
+# Center X-structure scoring — 4 arm tips, robot backs into each tip along the arm axis.
+# Arm half-length _ARM_LEN ≈ 23.18, tips at distance _ARM_LEN from (72, 72) at ±45°.
+_X_TIP_DIST = _ARM_LEN + _SCORE_APPROACH_GAP
+_X_DIAG = _X_TIP_DIST / math.sqrt(2.0)   # decompose along axes
+
+# Mid goal (upper X half) tips: NE and NW
+_MID_NE_POS = np.array([_CX + _X_DIAG, _CY + _X_DIAG])
+_MID_NW_POS = np.array([_CX - _X_DIAG, _CY + _X_DIAG])
+# Low goal (lower X half) tips: SE and SW
+_LOW_SE_POS = np.array([_CX + _X_DIAG, _CY - _X_DIAG])
+_LOW_SW_POS = np.array([_CX - _X_DIAG, _CY - _X_DIAG])
+
+# Required headings for each X tip (robot's back points toward the center).
+_HDG_NE =  math.pi / 4.0     # face NE (back faces SW into NE arm)
+_HDG_NW =  3.0 * math.pi / 4.0
+_HDG_SE = -math.pi / 4.0
+_HDG_SW = -3.0 * math.pi / 4.0
+
 _SCORE_HDG_TOL      = math.pi / 6.0   # 30° tolerance
-_SCORE_ARRIVAL_DIST = 8.0        # within this dist of scoring pos → start turning
-_SCORE_INTERVAL     = 1.5        # seconds to score one ball
+_SCORE_ARRIVAL_DIST = 6.0
+_SCORE_INTERVAL     = 1.5
+
+
+def _nearest_long_goal_target(robot):
+    """Pick nearest long-goal scoring end for this robot.
+
+    Returns (approach_pos, goal_end_pos, required_heading, goal_name).
+    """
+    options = [
+        (_RIGHT_GOAL_TOP_POS, np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MAX]), _HDG_NORTH, "our_long"),
+        (_RIGHT_GOAL_BOT_POS, np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MIN]), _HDG_SOUTH, "our_long"),
+        (_LEFT_GOAL_TOP_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MAX]), _HDG_NORTH, "opp_long"),
+        (_LEFT_GOAL_BOT_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MIN]), _HDG_SOUTH, "opp_long"),
+    ]
+    return min(options, key=lambda o: float(np.linalg.norm(robot.position - o[0])))
+
+
+_ARM_TIP_X = _ARM_LEN / math.sqrt(2.0)
+_TIP_NE = np.array([_CX + _ARM_TIP_X, _CY + _ARM_TIP_X])
+_TIP_NW = np.array([_CX - _ARM_TIP_X, _CY + _ARM_TIP_X])
+_TIP_SE = np.array([_CX + _ARM_TIP_X, _CY - _ARM_TIP_X])
+_TIP_SW = np.array([_CX - _ARM_TIP_X, _CY - _ARM_TIP_X])
+
+
+def _nearest_center_tip(robot, lower: bool):
+    """Pick nearest center goal tip.
+
+    MID goal = NE–SW bar (+45° diagonal): NE tip and SW tip.
+    LOW goal = NW–SE bar (-45° diagonal): NW tip and SE tip.
+    lower=True → prefer LOW goal; lower=False → prefer MID goal.
+    Returns (approach_pos, tip_pos, required_heading, goal_name).
+    """
+    if lower:   # LOW goal = NW-SE bar
+        options = [
+            (_MID_NW_POS, _TIP_NW, _HDG_NW, "center_low"),
+            (_LOW_SE_POS, _TIP_SE, _HDG_SE, "center_low"),
+        ]
+    else:       # MID goal = NE-SW bar
+        options = [
+            (_MID_NE_POS, _TIP_NE, _HDG_NE, "center_mid"),
+            (_LOW_SW_POS, _TIP_SW, _HDG_SW, "center_mid"),
+        ]
+    return min(options, key=lambda o: float(np.linalg.norm(robot.position - o[0])))
 
 
 def _wrap_angle(a: float) -> float:
@@ -100,35 +167,46 @@ _NAV_LEFT_HIGH   = np.array([ 49.0, 104.0])  # left-goal approach,  above X
 
 
 def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarray]:
-    """Return [corridor_waypoint, final_target] routing around the center X structure.
+    """Build waypoint list from `start` to `final` avoiding all goal obstacles.
 
-    Uses a position-based rule: if the robot is not already well past the X
-    structure toward the target goal, always route through a clear approach
-    corridor first.  This is more reliable than a marginal LOS check because
-    the corridor points are geometrically guaranteed clear of both X arms and
-    long-goal bodies for a 15" robot.
+    Strategy:
+      1. If LOS to final is clear, go direct.
+      2. Otherwise pick an approach corridor in the appropriate field quadrant.
+      3. If corridor→final is still blocked, add the central go-around point.
 
-    Right goal (final.x > 72): skip corridor if robot x ≥ 88 (past X arm tips).
-    Left  goal (final.x ≤ 72): skip corridor if robot x ≤ 56.
-    Corridor y chosen above or below the X based on robot's y position.
+    Corridor points (90% guaranteed clear of X arms AND long-goal bodies for a
+    15"-wide robot):
+      • (95, 40)  / (95, 104)  — right side, below / above X
+      • (49, 40)  / (49, 104)  — left side,  below / above X
     """
     from sim.route_planner import _los_blocked, _NAV_MARGIN
 
-    use_low = start[1] <= 72.0
+    # Direct path?
+    if not _los_blocked(start[0], start[1], final[0], final[1], margin=_NAV_MARGIN):
+        return [final]
 
-    if final[0] > 72.0:       # heading to right goal
-        if start[0] >= 88.0:  # robot past X arm tips — no crossing needed
-            return [final]
+    use_low = (start[1] + final[1]) / 2.0 <= 72.0
+    if final[0] > 72.0:
         corridor = _NAV_RIGHT_LOW.copy() if use_low else _NAV_RIGHT_HIGH.copy()
-    else:                      # heading to left goal
-        if start[0] <= 56.0:  # robot past X arm tips on the left
-            return [final]
-        corridor = _NAV_LEFT_LOW.copy() if use_low else _NAV_LEFT_HIGH.copy()
+    else:
+        corridor = _NAV_LEFT_LOW.copy()  if use_low else _NAV_LEFT_HIGH.copy()
 
-    # Safety: verify corridor→final is clear with full robot-width margin
-    if _los_blocked(corridor[0], corridor[1], final[0], final[1],
-                    margin=_NAV_MARGIN):
-        center = _NAV_BELOW_X.copy() if use_low else _NAV_ABOVE_X.copy()
+    # If approaching a long-goal end, swap corridor side based on final.y
+    if abs(final[0] - _RIGHT_GOAL_CX) < 6.0 or abs(final[0] - _LEFT_GOAL_CX) < 6.0:
+        # We want the corridor on the same side as the final's Y
+        use_low = final[1] < 72.0
+        if final[0] > 72.0:
+            corridor = _NAV_RIGHT_LOW.copy() if use_low else _NAV_RIGHT_HIGH.copy()
+        else:
+            corridor = _NAV_LEFT_LOW.copy()  if use_low else _NAV_LEFT_HIGH.copy()
+
+    # Verify corridor→final is clear; if not, add center go-around
+    if _los_blocked(corridor[0], corridor[1], final[0], final[1], margin=_NAV_MARGIN):
+        center = _NAV_BELOW_X.copy() if start[1] <= 72.0 else _NAV_ABOVE_X.copy()
+        return [center, corridor, final]
+    # Verify start→corridor is clear too
+    if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
+        center = _NAV_BELOW_X.copy() if start[1] <= 72.0 else _NAV_ABOVE_X.copy()
         return [center, corridor, final]
     return [corridor, final]
 
@@ -225,25 +303,22 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
         # Priority 2: nearest ball with LOS check (ball not behind a goal)
         return field.nearest_navigable_target(robot.position)
     elif action == Action.SCORE_LONG_GOAL:
-        # Navigate to the NEAREST long goal scoring position.
-        # Right goal: robot backs in from west (x≈110.6), heading=π.
-        # Left  goal: robot backs in from east (x≈33.4),  heading=0.
-        score_y = float(np.clip(robot.y, _LONG_GOAL_SCORE_Y_MIN, _LONG_GOAL_SCORE_Y_MAX))
-        if robot.x >= FIELD_W / 2:
-            return np.array([_RIGHT_GOAL_SCORE_X, score_y])
-        else:
-            return np.array([_LEFT_GOAL_SCORE_X, score_y])
+        approach, _, _, _ = _nearest_long_goal_target(robot)
+        return approach.copy()
     elif action == Action.SCORE_CENTER_GOAL:
-        # Navigate to the approach point outside the X structure, within scoring range.
-        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
-        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
-        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
+        # MID = NE+SW tips; LOW = NW+SE tips — pick globally nearest
+        d_mid = min(np.linalg.norm(robot.position - _MID_NE_POS),
+                    np.linalg.norm(robot.position - _LOW_SW_POS))
+        d_low = min(np.linalg.norm(robot.position - _MID_NW_POS),
+                    np.linalg.norm(robot.position - _LOW_SE_POS))
+        lower = d_low < d_mid
+        approach, _, _, _ = _nearest_center_tip(robot, lower=lower)
+        return approach.copy()
     elif action == Action.DESCORE_OPP_LONG:
         return OPP_LONG_GOAL.copy()
     elif action == Action.DESCORE_CENTER:
-        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
-        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
-        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
+        approach, _, _, _ = _nearest_center_tip(robot, lower=False)
+        return approach.copy()
     elif action == Action.DEFEND_ZONE:
         return DEFEND_ZONE_POS.copy()
     elif action == Action.MOVE_TO_REGION_A:
@@ -262,15 +337,13 @@ def _opp_action_to_target(action: Action, field: Field, robot: Robot) -> np.ndar
     elif action == Action.SCORE_LONG_GOAL:
         return OPP_LONG_GOAL.copy()
     elif action == Action.SCORE_CENTER_GOAL:
-        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
-        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
-        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
+        approach, _, _ = _nearest_center_tip(robot, lower=False)
+        return approach.copy()
     elif action == Action.DESCORE_OPP_LONG:
         return OUR_LONG_GOAL.copy()
     elif action == Action.DESCORE_CENTER:
-        d_mid = np.linalg.norm(robot.position - _CENTER_MID_APPROACH)
-        d_low = np.linalg.norm(robot.position - _CENTER_LOW_APPROACH)
-        return _CENTER_MID_APPROACH.copy() if d_mid < d_low else _CENTER_LOW_APPROACH.copy()
+        approach, _, _ = _nearest_center_tip(robot, lower=False)
+        return approach.copy()
     elif action == Action.DEFEND_ZONE:
         return np.array([24.00, 72.00])   # opp defend zone (left side)
     elif action == Action.MOVE_TO_REGION_A:
@@ -339,7 +412,7 @@ class VexAIEnv(gym.Env):
         super().reset(seed=seed)
         self.rng = np.random.default_rng(seed)
         self.field.reset(self.rng)
-        self.field.time_remaining = MATCH_DURATION
+        self.field.time_remaining = MATCH_DURATION   # display only — not decremented
 
         self.failure_injector = FailureInjector(self.failure_config, self.rng)
         self.failure_injector.reset()
@@ -398,6 +471,219 @@ class VexAIEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    def manual_tick(self, renderer) -> None:
+        """One physics tick driven by WASD input from the renderer.
+
+        Called from the demo loop instead of step() when renderer.wasd_mode is True.
+        Handles movement, goal collision, intake, and scoring for the selected robot.
+        Does NOT render — the caller's env.render() already drew this frame.
+        """
+        import math
+
+        # Tuned for ~60fps feel: 65% speed, 30% turn rate so driving is smooth
+        _WASD_SPEED = MAX_SPEED * 0.65
+        _WASD_TURN  = TURN_RATE * 0.30
+
+        ridx  = renderer.wasd_robot_idx
+        robot = self.field.allies[ridx]
+        prev_pos = robot.position.copy()
+
+        # --- Movement ---
+        fwd  = renderer.wasd_fwd    # -1 / 0 / +1
+        turn = renderer.wasd_turn   # -1=A / 0 / +1=D
+
+        if turn != 0:
+            robot.heading = _wrap_angle(robot.heading + turn * _WASD_TURN * DT)
+
+        if fwd != 0:
+            fwd_vec = np.array([math.cos(robot.heading), math.sin(robot.heading)])
+            robot.x = round(robot.x + fwd_vec[0] * fwd * _WASD_SPEED * DT, 2)
+            robot.y = round(robot.y + fwd_vec[1] * fwd * _WASD_SPEED * DT, 2)
+            robot.moving = True
+        else:
+            robot.speed  = 0.0
+            robot.moving = False
+
+        robot._clamp_to_field()
+        _resolve_goal_collisions(robot)
+
+        # --- Intake (collect balls when near) ---
+        robot.intake_active = renderer.wasd_intake_on and robot.balls_held < MAX_CARRY
+        if robot.intake_active:
+            self.field.try_collect(robot)
+
+        # --- Scoring (hold F) — eject balls if robot leaves position while F held ---
+        if renderer.wasd_score_on and robot.balls_held > 0:
+            robot.intake_active = True   # show intake animation while scoring
+            timer_before = robot.score_timer
+            balls_before = robot.balls_held
+            self._do_manual_scoring(robot)
+            # If timer reset to 0 without a ball leaving, the robot moved away
+            left_position = (timer_before > 0.0 and robot.score_timer == 0.0
+                             and robot.balls_held == balls_before)
+            if left_position:
+                self._eject_held_balls(robot)
+        elif robot.score_timer > 0.0:
+            # F was released — timer stays, balls stay, just stop the clock
+            robot.score_timer = 0.0
+
+        # --- Ball push & rolling physics ---
+        self.field.apply_robot_push(robot, prev_pos)
+        self.field.physics_tick(DT)
+
+    def _eject_held_balls(self, robot) -> None:
+        """Scatter all balls the robot is holding out from its back face.
+
+        Called when the robot moves away from a goal while F is still held.
+        Each ball gets an independent random scatter so they must be
+        re-collected individually.
+        """
+        import math
+        bx = robot.x - math.cos(robot.heading) * (ROBOT_W / 2)
+        by = robot.y - math.sin(robot.heading) * (ROBOT_W / 2)
+
+        rng = getattr(self, "rng", None)
+        for obj_idx in robot.held_object_ids:
+            obj = self.field.objects[obj_idx]
+            obj.status = OBJ_ON_FIELD
+            scatter = 8.0
+            ox = bx + (float(rng.uniform(-scatter, scatter)) if rng else 0.0)
+            oy = by + (float(rng.uniform(-scatter, scatter)) if rng else 0.0)
+            obj.x = round(float(np.clip(ox, ROBOT_W / 2 + 1, FIELD_W - ROBOT_W / 2 - 1)), 2)
+            obj.y = round(float(np.clip(oy, ROBOT_W / 2 + 1, FIELD_H - ROBOT_W / 2 - 1)), 2)
+            # Velocity: primarily outward from the back face, with random spread
+            speed = 12.0 + (float(rng.uniform(0, 8)) if rng else 0.0)
+            obj.vx = float(-math.cos(robot.heading) * speed)  # -heading = back direction
+            obj.vy = float(-math.sin(robot.heading) * speed)
+            if rng:
+                obj.vx += float(rng.uniform(-4, 4))
+                obj.vy += float(rng.uniform(-4, 4))
+
+        robot.held_object_ids.clear()
+        robot.balls_held = 0
+        robot.score_timer = 0.0
+
+    def _do_manual_scoring(self, robot) -> None:
+        """Back-face proximity scoring for WASD mode.
+
+        Checks if the robot's BACK FACE CENTER is near any goal scoring surface
+        (long goal field-side face, long goal ends, or center X arm tips) and the
+        robot heading points roughly away from that surface (back INTO goal).
+
+        Balls score in FIFO order (first collected → first ejected). No specific
+        approach waypoint required — just get the back face close and face away.
+        """
+        import math
+
+        _BACK_DIST = 12.0            # back-face-center → goal-surface threshold (in)
+        _HDG_TOL   = math.pi / 4.0  # ±45° heading tolerance (generous for manual)
+
+        # Robot back-face centre
+        bx = robot.x - math.cos(robot.heading) * (ROBOT_W / 2)
+        by = robot.y - math.sin(robot.heading) * (ROBOT_W / 2)
+        back = np.array([bx, by])
+
+        # Collect all goal surfaces the back face is near: (req_heading, anim_target, gname, pts)
+        candidates: list[tuple] = []
+        in_y = LONG_GOAL_Y_MIN - _BACK_DIST < by < LONG_GOAL_Y_MAX + _BACK_DIST
+
+        # ── Right long goal ──
+        # Field side: back faces east (heading ≈ π)
+        if abs(bx - _RIGHT_GOAL_X_LO) < _BACK_DIST and in_y:
+            gy = float(np.clip(by, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX))
+            candidates.append((math.pi,
+                                np.array([_RIGHT_GOAL_CX, gy]),
+                                "our_long", LONG_GOAL_POINTS))
+        # Top opening: back faces south (heading ≈ +π/2)
+        if abs(by - LONG_GOAL_Y_MAX) < _BACK_DIST and abs(bx - _RIGHT_GOAL_CX) < _BACK_DIST:
+            candidates.append((_HDG_NORTH,
+                                np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MAX]),
+                                "our_long", LONG_GOAL_POINTS))
+        # Bottom opening: back faces north (heading ≈ −π/2)
+        if abs(by - LONG_GOAL_Y_MIN) < _BACK_DIST and abs(bx - _RIGHT_GOAL_CX) < _BACK_DIST:
+            candidates.append((_HDG_SOUTH,
+                                np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MIN]),
+                                "our_long", LONG_GOAL_POINTS))
+
+        # ── Left long goal ──
+        # Field side: back faces west (heading ≈ 0)
+        if abs(bx - _LEFT_GOAL_X_HI) < _BACK_DIST and in_y:
+            gy = float(np.clip(by, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX))
+            candidates.append((0.0,
+                                np.array([_LEFT_GOAL_CX, gy]),
+                                "opp_long", LONG_GOAL_POINTS))
+        # Top opening
+        if abs(by - LONG_GOAL_Y_MAX) < _BACK_DIST and abs(bx - _LEFT_GOAL_CX) < _BACK_DIST:
+            candidates.append((_HDG_NORTH,
+                                np.array([_LEFT_GOAL_CX, LONG_GOAL_Y_MAX]),
+                                "opp_long", LONG_GOAL_POINTS))
+        # Bottom opening
+        if abs(by - LONG_GOAL_Y_MIN) < _BACK_DIST and abs(bx - _LEFT_GOAL_CX) < _BACK_DIST:
+            candidates.append((_HDG_SOUTH,
+                                np.array([_LEFT_GOAL_CX, LONG_GOAL_Y_MIN]),
+                                "opp_long", LONG_GOAL_POINTS))
+
+        # ── Center X arm tips — MID=NE-SW bar, LOW=NW-SE bar ──
+        for tip, req_hdg, gname in [
+            (_TIP_NE, _HDG_NE, "center_mid"),
+            (_TIP_SW, _HDG_SW, "center_mid"),
+            (_TIP_NW, _HDG_NW, "center_low"),
+            (_TIP_SE, _HDG_SE, "center_low"),
+        ]:
+            if float(np.linalg.norm(back - tip)) < _BACK_DIST:
+                candidates.append((req_hdg, tip.copy(), gname, CENTER_GOAL_POINTS))
+
+        if not candidates:
+            robot.score_timer = 0.0
+            return
+
+        # Best candidate = smallest heading error
+        req_hdg, anim_target, gname, points = min(
+            candidates,
+            key=lambda c: abs(_wrap_angle(c[0] - robot.heading)),
+        )
+
+        if abs(_wrap_angle(req_hdg - robot.heading)) > _HDG_TOL:
+            robot.score_timer = 0.0
+            return
+
+        robot.score_timer += DT
+        interval = _SCORE_INTERVAL / max(robot.balls_held, 1)
+        if robot.score_timer < interval:
+            return
+
+        robot.score_timer = 0.0
+        if robot.balls_held <= 0 or not robot.held_object_ids:
+            return
+
+        # heading < 0 → enters from the 'start' end (S / SW / SE) → prepend
+        prepend    = req_hdg < 0.0
+
+        # Score oldest held ball (FIFO: first collected = first ejected)
+        idx        = robot.held_object_ids.pop(0)
+        ball_color = self.field.objects[idx].color
+        robot.balls_held -= 1
+        self.field.objects[idx].status         = OBJ_SCORED_US
+        self.field.objects[idx].scored_in_goal = gname
+        ejected = self.field.goal_state.score_ball(gname, idx, ball_color, prepend=prepend)
+        # Ball color determines which alliance earns the points
+        if ball_color == BALL_BLUE:
+            self.field.my_score += points
+        else:
+            self.field.opponent_score += points
+
+        if ejected is not None:
+            self._handle_overflow(ejected, gname, prepend, points)
+
+        # Ball flies from robot back face to goal entry position
+        self.score_animations.append({
+            'x0': bx, 'y0': by,
+            'x1': float(anim_target[0]), 'y1': float(anim_target[1]),
+            'color':    ball_color,
+            'start_ms': None,
+            'duration': 0.4,
+        })
+
     def step(self, actions: np.ndarray):
         """One RL decision cycle = TICKS_PER_DECISION sim ticks."""
         a0, a1 = int(actions[0]), int(actions[1])
@@ -441,7 +727,8 @@ class VexAIEnv(gym.Env):
             final  = _action_to_target(act, self.field, robot)
             if final is None:
                 return []
-            if act in (Action.SCORE_LONG_GOAL,):
+            if act in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_GOAL,
+                        Action.COLLECT_NEAREST_BALL):
                 return _build_nav_waypoints(robot.position, final)
             return [final]
 
@@ -451,14 +738,11 @@ class VexAIEnv(gym.Env):
             return ally_wq[idx][0] if ally_wq[idx] else None
 
         # ── Dynamic step length ──────────────────────────────────────────
-        # Base ticks = TICKS_PER_DECISION (3 s).  If any robot is still actively
-        # moving toward a target after that, extend up to MAX_STEP_TICKS so
-        # it completes the trajectory rather than timing out mid-path.
-        MAX_STEP_TICKS = TICKS_PER_DECISION * 4  # up to 12 s
+        # Timer disabled: simply run until robots stop moving or a tick cap is hit.
+        MAX_STEP_TICKS = TICKS_PER_DECISION * 8
 
         for tick in range(MAX_STEP_TICKS):
-            # After base window: keep running only if a robot is still in motion
-            if tick >= TICKS_PER_DECISION and self.field.time_remaining > 0:
+            if tick >= TICKS_PER_DECISION:
                 still_moving = any(
                     self.field.allies[i].moving and bool(ally_wq[i])
                     for i in range(self.num_allies)
@@ -528,16 +812,14 @@ class VexAIEnv(gym.Env):
             # Advance ball rolling physics
             self.field.physics_tick(DT)
 
-            self.field.time_remaining -= DT
+            # Timer disabled — clock does not decrement, episode does not end.
             self.decision_tick += 1
-            if self.field.time_remaining <= 0:
-                break
 
             if self.render_mode == "human" and self._renderer is not None:
                 self._renderer.draw(self)
 
         self.executing = False
-        self.done = self.field.time_remaining <= 0
+        self.done = False   # timer disabled
 
         for idx in range(2):
             self.field.allies[idx].actions_attempted += 1
@@ -568,59 +850,22 @@ class VexAIEnv(gym.Env):
             if robot.balls_held <= 0:
                 robot.score_timer = 0.0
                 return
-
-            # Choose the same goal that the navigation target selected:
-            # right half of field → right goal, left half → left goal.
-            score_y = float(np.clip(robot.y, _LONG_GOAL_SCORE_Y_MIN, _LONG_GOAL_SCORE_Y_MAX))
-            if robot.x >= FIELD_W / 2:
-                score_pos        = np.array([_RIGHT_GOAL_SCORE_X, score_y])
-                target_goal      = OUR_LONG_GOAL
-                required_heading = _SCORE_HDG_RIGHT
-            else:
-                score_pos        = np.array([_LEFT_GOAL_SCORE_X, score_y])
-                target_goal      = OPP_LONG_GOAL
-                required_heading = _SCORE_HDG_LEFT
-
-            dist = float(np.linalg.norm(robot.position - score_pos))
-
-            if dist < _SCORE_ARRIVAL_DIST:
-                # At scoring position — turn intake away from goal entrance
-                angle_err  = _wrap_angle(required_heading - robot.heading)
-                turn_delta = float(np.clip(angle_err * 4.0, -TURN_RATE, TURN_RATE)) * DT
-                robot.heading = _wrap_angle(robot.heading + turn_delta)
-
-                if abs(_wrap_angle(required_heading - robot.heading)) < _SCORE_HDG_TOL:
-                    robot.score_timer += DT
-                    interval = _SCORE_INTERVAL / robot.balls_held
-                    if robot.score_timer >= interval:
-                        robot.score_timer = 0.0
-                        # Save ball color before try_score_one pops it
-                        ball_color = (self.field.objects[robot.held_object_ids[0]].color
-                                      if robot.held_object_ids else None)
-                        pts = self.field.try_score_one(robot, target_goal, LONG_GOAL_POINTS)
-                        if pts > 0:
-                            self.score_events[idx] += pts
-                            robot.actions_succeeded += 1
-                            if ball_color is not None:
-                                self.score_animations.append({
-                                    'x0': robot.x, 'y0': robot.y,
-                                    'x1': float(target_goal[0]), 'y1': float(target_goal[1]),
-                                    'color': ball_color,
-                                    'start_ms': None,
-                                    'duration': 0.5,
-                                })
-            else:
-                robot.score_timer = 0.0
+            score_pos, goal_pos, required_heading, gname = _nearest_long_goal_target(robot)
+            self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
+                                     required_heading, LONG_GOAL_POINTS)
 
         elif action == Action.SCORE_CENTER_GOAL:
-            # Heading constraint: must face a diagonal direction (within 30° of 45°/135°/225°/315°)
-            if abs(math.sin(2 * robot.heading)) > 0.5:
-                pts = self.field.try_score(robot, CENTER_MID_GOAL, CENTER_GOAL_POINTS)
-                if pts == 0:
-                    pts = self.field.try_score(robot, CENTER_LOW_GOAL, CENTER_GOAL_POINTS)
-                if pts > 0:
-                    self.score_events[idx] += pts
-                    robot.actions_succeeded += 1
+            if robot.balls_held <= 0:
+                robot.score_timer = 0.0
+                return
+            d_mid = min(np.linalg.norm(robot.position - _MID_NE_POS),
+                        np.linalg.norm(robot.position - _LOW_SW_POS))
+            d_low = min(np.linalg.norm(robot.position - _MID_NW_POS),
+                        np.linalg.norm(robot.position - _LOW_SE_POS))
+            lower = d_low < d_mid
+            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower)
+            self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
+                                     required_heading, CENTER_GOAL_POINTS)
 
         elif action == Action.DESCORE_OPP_LONG:
             pts = self.field.try_descore(robot, OPP_LONG_GOAL, self.rng)
@@ -635,6 +880,121 @@ class VexAIEnv(gym.Env):
             if pts > 0:
                 self.descore_events[idx] += pts
                 robot.actions_succeeded += 1
+
+    def _do_back_in_scoring(self, idx: int, robot, score_pos: np.ndarray,
+                              goal_pos: np.ndarray, gname: str,
+                              required_heading: float, points: int) -> None:
+        """Common back-in scoring routine.
+
+        Robot arrives at score_pos, turns to required_heading (back faces goal),
+        then scores one ball at a time on a timer.
+        """
+        dist = float(np.linalg.norm(robot.position - score_pos))
+        if dist >= _SCORE_ARRIVAL_DIST:
+            robot.score_timer = 0.0
+            return
+
+        angle_err  = _wrap_angle(required_heading - robot.heading)
+        turn_delta = float(np.clip(angle_err * 4.0, -TURN_RATE, TURN_RATE)) * DT
+        robot.heading = _wrap_angle(robot.heading + turn_delta)
+
+        if abs(_wrap_angle(required_heading - robot.heading)) >= _SCORE_HDG_TOL:
+            robot.score_timer = 0.0
+            return
+
+        robot.score_timer += DT
+        interval = _SCORE_INTERVAL / max(robot.balls_held, 1)
+        if robot.score_timer < interval:
+            return
+        robot.score_timer = 0.0
+
+        # heading < 0 → scores from the "start" end (S / SW / SE) → prepend
+        prepend    = required_heading < 0.0
+        ball_color = (self.field.objects[robot.held_object_ids[0]].color
+                      if robot.held_object_ids else None)
+        pts, ejected = self.field.try_score_one(robot, goal_pos, points,
+                                                gname=gname, prepend=prepend)
+        if pts > 0:
+            self.score_events[idx] += pts
+            robot.actions_succeeded += 1
+            if ejected is not None:
+                self._handle_overflow(ejected, gname, prepend, points)
+            if ball_color is not None:
+                self.score_animations.append({
+                    'x0': robot.x, 'y0': robot.y,
+                    'x1': float(goal_pos[0]), 'y1': float(goal_pos[1]),
+                    'color': ball_color,
+                    'start_ms': None,
+                    'duration': 0.5,
+                })
+
+    def _handle_overflow(self, ejected: tuple, gname: str,
+                          prepend: bool, points: int) -> None:
+        """Put an overflow ball back on the field at the goal exit end.
+
+        prepend=True means the ball entered from the 'start' end, so it exits
+        from the 'end' end, and vice versa.
+        """
+        import math
+        ej_idx, ej_color = ejected
+        obj = self.field.objects[ej_idx]
+        obj.status         = OBJ_ON_FIELD
+        obj.scored_in_goal = None
+        # Subtract from whichever team earned this ball's points
+        if ej_color == BALL_BLUE:
+            self.field.my_score -= points
+        else:
+            self.field.opponent_score -= points
+
+        # Place ball just outside the exit end of each goal
+        gap = ROBOT_W + 4.0
+        if gname == "our_long":
+            if prepend:   # entered S → exits N
+                obj.x, obj.y = _RIGHT_GOAL_CX, LONG_GOAL_Y_MAX + gap
+                obj.vy = 12.0
+            else:         # entered N → exits S
+                obj.x, obj.y = _RIGHT_GOAL_CX, LONG_GOAL_Y_MIN - gap
+                obj.vy = -12.0
+            obj.vx = 0.0
+        elif gname == "opp_long":
+            if prepend:
+                obj.x, obj.y = _LEFT_GOAL_CX, LONG_GOAL_Y_MAX + gap
+                obj.vy = 12.0
+            else:
+                obj.x, obj.y = _LEFT_GOAL_CX, LONG_GOAL_Y_MIN - gap
+                obj.vy = -12.0
+            obj.vx = 0.0
+        elif gname == "center_mid":
+            exit_tip = _TIP_NE if prepend else _TIP_SW
+            d = gap / math.sqrt(2.0)
+            sign = 1.0 if prepend else -1.0
+            obj.x, obj.y = float(exit_tip[0]) + sign * d, float(exit_tip[1]) + sign * d
+            obj.vx =  sign * 8.0;  obj.vy =  sign * 8.0
+        elif gname == "center_low":
+            exit_tip = _TIP_NW if prepend else _TIP_SE
+            d = gap / math.sqrt(2.0)
+            if prepend:   # exits NW
+                obj.x, obj.y = float(exit_tip[0]) - d, float(exit_tip[1]) + d
+                obj.vx = -8.0;  obj.vy =  8.0
+            else:         # exits SE
+                obj.x, obj.y = float(exit_tip[0]) + d, float(exit_tip[1]) - d
+                obj.vx =  8.0;  obj.vy = -8.0
+        else:
+            obj.vx = obj.vy = 0.0
+
+        # Scatter each ball with a random offset + lateral velocity so
+        # consecutive overflow balls land at different spots and must be
+        # collected individually.
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            scatter = 10.0  # max scatter radius in inches
+            obj.x += float(rng.uniform(-scatter, scatter))
+            obj.y += float(rng.uniform(-scatter, scatter))
+            obj.vx += float(rng.uniform(-8.0, 8.0))
+            obj.vy += float(rng.uniform(-8.0, 8.0))
+
+        obj.x = round(float(np.clip(obj.x, ROBOT_W / 2 + 1, FIELD_W - ROBOT_W / 2 - 1)), 2)
+        obj.y = round(float(np.clip(obj.y, ROBOT_W / 2 + 1, FIELD_H - ROBOT_W / 2 - 1)), 2)
 
     def _check_opp_effects(self):
         for oi in range(self.num_opponents):

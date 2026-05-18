@@ -67,21 +67,32 @@ def cmd_demo(args):
 
     print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
     print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
+    print("          Tab=WASD mode  (W/S=fwd/rev  A/D=turn  I=intake  F=score)")
     print("          Panel: RUN to run, AUTO PLAY for smart greedy policy")
 
     while True:
         env.render()
         renderer = env._renderer
+
+        # Reset always takes priority
+        if renderer and renderer.should_reset:
+            renderer.should_reset = False
+            obs, _ = env.reset()
+            total_reward = 0.0
+            episode += 1
+            continue
+
+        # WASD manual mode: one physics tick per render frame, no RL step
+        if renderer and renderer.wasd_mode:
+            if not renderer.paused or renderer.step_once:
+                renderer.step_once = False
+                env.manual_tick(renderer)
+            continue
+
         if renderer and renderer.paused and not renderer.step_once:
             continue
         if renderer:
             renderer.step_once = False
-            if renderer.should_reset:
-                renderer.should_reset = False
-                obs, _ = env.reset()
-                total_reward = 0.0
-                episode += 1
-                continue
 
         if renderer and renderer.demo_score:
             # Demo scoring: force SCORE_LONG_GOAL until robots have emptied all balls.

@@ -132,9 +132,11 @@ OBJ_SCORED_US  = 2
 OBJ_SCORED_OPP = 3
 OBJ_REMOVED    = 4   # deleted via state editor
 
-# Scoring values
-LONG_GOAL_POINTS   = 5
+# Scoring values — all balls are worth 3 pts regardless of goal type.
+# Ball COLOR determines which alliance earns the points (blue ball = blue score, red = red).
+LONG_GOAL_POINTS   = 3
 CENTER_GOAL_POINTS = 3
+CONTROL_BONUS_PTS  = 10   # points per controlled quadrant
 
 # ---------------------------------------------------------------------------
 # Initial ball layout — 22 red (color=0) + 22 blue (color=1) = 44 total

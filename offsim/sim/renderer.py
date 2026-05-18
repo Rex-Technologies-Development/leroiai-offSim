@@ -165,6 +165,14 @@ class PygameRenderer:
         self.demo_score         = False   # when True: give robots balls, force SCORE actions
         self._click_this_frame  = None    # set once per frame from MOUSEBUTTONDOWN event
 
+        # WASD manual control
+        self.wasd_mode      = False
+        self.wasd_robot_idx = 0       # which robot is driven (0 or 1)
+        self.wasd_fwd       = 0       # -1=reverse, 0=stop, +1=forward
+        self.wasd_turn      = 0       # -1=left(A), 0=none, +1=right(D)
+        self.wasd_intake_on = False   # I toggles intake on/off
+        self.wasd_score_on  = False   # F toggles scoring on/off
+
         # State editor
         self.selected_ball = -1           # index into field.objects, -1 = none
         self.brush_color   = BALL_BLUE    # color for right-click add
@@ -235,18 +243,43 @@ class PygameRenderer:
                     self.sim_speed = max(self.sim_speed / 2, 0.25)
                 elif event.key == pygame.K_1:
                     self.highlight_robot = 0 if self.highlight_robot != 0 else -1
+                    if self.wasd_mode:
+                        self.wasd_robot_idx = 0
                 elif event.key == pygame.K_2:
                     self.highlight_robot = 1 if self.highlight_robot != 1 else -1
+                    if self.wasd_mode:
+                        self.wasd_robot_idx = 1
                 elif event.key == pygame.K_c:
                     signals["change_color"] = True
                 elif event.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
                     signals["delete_ball"] = True
+                elif event.key == pygame.K_TAB:
+                    self.wasd_mode = not self.wasd_mode
+                    if self.wasd_mode:
+                        self.paused         = False
+                        self.wasd_intake_on = False
+                        self.wasd_score_on  = False
+                elif event.key == pygame.K_i and self.wasd_mode:
+                    self.wasd_intake_on = not self.wasd_intake_on
+                    # F is hold-only — no toggle here
 
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:   # left click
                     signals["mouse_left"] = event.pos
                 elif event.button == 3: # right click
                     signals["mouse_right"] = event.pos
+
+        # Read held keys for WASD movement + F score (updated every frame)
+        if self.wasd_mode:
+            keys = pygame.key.get_pressed()
+            self.wasd_fwd      = int(keys[pygame.K_w]) - int(keys[pygame.K_s])
+            # A = turn left (CCW, +heading), D = turn right (CW, -heading)
+            self.wasd_turn     = int(keys[pygame.K_a]) - int(keys[pygame.K_d])
+            # F = hold-to-score: active only while key is physically held
+            self.wasd_score_on = bool(keys[pygame.K_f])
+        else:
+            self.wasd_fwd  = 0
+            self.wasd_turn = 0
 
         return signals
 
@@ -297,14 +330,15 @@ class PygameRenderer:
         self.screen.fill(DARK_GRAY)
         pygame.draw.rect(self.screen, GRAY, (0, 0, FIELD_PX, FIELD_PY))
         self._draw_grid()
-        pygame.draw.rect(self.screen, WHITE, (0, 0, FIELD_PX, FIELD_PY), 2)
 
         if self.show_heatmap:
             self._draw_heatmap(env)
 
-        self._draw_goals(env)
         self._draw_balls(env)
+        self._draw_goals(env)
         self._draw_route_overlay(env)
+        # Border + quadrant control L-brackets drawn last so they're always on top
+        self._draw_field_border_with_control(env)
 
         if self.setup_mode:
             # Always draw both robots in setup mode regardless of num_allies
@@ -405,22 +439,7 @@ class PygameRenderer:
         lbl = self.font_sm.render(f"L.GOAL {_rb_str(opp_balls)}", True, GOAL_OUT)
         self.screen.blit(lbl, (lx_inner + 4, y0 + h // 2 - 6))
 
-        # Quadrant control indicators (small colored dots in field corners)
-        if gs:
-            ctrl = gs.compute_quadrant_control()
-            _ctrl_positions = {
-                "bottom_left":  _to_screen(12.0,  12.0),
-                "bottom_right": _to_screen(132.0, 12.0),
-                "top_left":     _to_screen(12.0,  132.0),
-                "top_right":    _to_screen(132.0, 132.0),
-            }
-            for qname, (qsx, qsy) in _ctrl_positions.items():
-                color = ctrl.get(qname)
-                if color is None:
-                    continue
-                col = RED if color == BALL_RED else BLUE
-                pygame.draw.circle(self.screen, col, (qsx, qsy), 8)
-                pygame.draw.circle(self.screen, WHITE, (qsx, qsy), 8, 1)
+        # Quadrant control — drawn on the field border (see _draw_quadrant_border).
 
         # ---- Park zones (raised platforms, top and bottom walls) ----
         park_x0, park_x1 = _to_screen(PARK_ZONE_X_MIN, 0)[0], _to_screen(PARK_ZONE_X_MAX, 0)[0]
@@ -484,15 +503,17 @@ class PygameRenderer:
         msx, msy = _to_screen(cx, cy + off)
         lsx, lsy = _to_screen(cx, cy - off)
 
-        def _goal_color_bar(ball_list) -> str:
-            """Build a compact color string like 'BRRB' for the ball order."""
-            return "".join("R" if c == BALL_RED else "B" for _, c in ball_list)
+        # Draw balls linearly along each bar.
+        # MID = NE-SW bar: lst[0] at SW end, lst[-1] at NE end.
+        # LOW = NW-SE bar: lst[0] at SE end, lst[-1] at NW end.
+        if mid_balls:
+            self._draw_center_goal_bar(mid_balls, cx, cy, arm_len,  math.pi / 4)   # SW→NE
+        if low_balls:
+            self._draw_center_goal_bar(low_balls, cx, cy, arm_len, 3*math.pi / 4)  # SE→NW
 
-        mid_bar = _goal_color_bar(mid_balls)
-        low_bar = _goal_color_bar(low_balls)
-        lbl = self.font_sm.render(f"MID [{mid_n}] {mid_bar}", True, ORANGE)
+        lbl = self.font_sm.render(f"MID [{mid_n}]", True, ORANGE)
         self.screen.blit(lbl, (msx - lbl.get_width() // 2, msy - 6))
-        lbl = self.font_sm.render(f"LOW [{low_n}] {low_bar}", True, YELLOW)
+        lbl = self.font_sm.render(f"LOW [{low_n}]", True, YELLOW)
         self.screen.blit(lbl, (lsx - lbl.get_width() // 2, lsy - 6))
 
         # ---- Matchload tubes (top-down: orange circles at tile-corner positions) ----
@@ -503,6 +524,96 @@ class PygameRenderer:
             r = max(4, int(MATCHLOAD_TUBE_RADIUS * SCALE))
             pygame.draw.circle(self.screen, TUBE_COL,     (sx, sy), r)
             pygame.draw.circle(self.screen, TUBE_OUTLINE, (sx, sy), r, 2)
+
+    def _draw_center_goal_bar(self, ball_list, cx: float, cy: float,
+                              arm_len: float, bar_angle: float):
+        """Draw all balls linearly along a center goal bar.
+
+        ball_list is ordered: index 0 = ball at the negative-angle end,
+        index -1 = ball at the positive-angle end (NE for MID, NW for LOW).
+        Balls are evenly spaced along 80% of the full bar length.
+        """
+        n = len(ball_list)
+        if n == 0:
+            return
+        ca, sa = math.cos(bar_angle), math.sin(bar_angle)
+        use_frac = 0.80  # fraction of arm_len used on each side
+        for i, (_, color) in enumerate(ball_list):
+            if n == 1:
+                t = 0.0
+            else:
+                t = 2.0 * i / (n - 1) - 1.0   # maps i → [-1.0, +1.0]
+            dist  = arm_len * use_frac * t
+            sx, sy = _to_screen(cx + ca * dist, cy + sa * dist)
+            dot_col = RED       if color == BALL_RED else BLUE
+            dot_out = LIGHT_RED if color == BALL_RED else LIGHT_BLUE
+            pygame.draw.circle(self.screen, dot_col, (sx, sy), 4)
+            pygame.draw.circle(self.screen, dot_out, (sx, sy), 4, 1)
+            if i == 0 or i == n - 1:
+                pygame.draw.circle(self.screen, WHITE, (sx, sy), 4, 1)
+
+    def _draw_field_border_with_control(self, env):
+        """Draw the field border with quadrant control shown as colored half-edges.
+
+        Each of the 4 edges is split at its midpoint.  Each half is colored by
+        the alliance that controls the adjacent quadrant:
+          top-left half of top + left edges → TL color
+          top-right half of top + right edges → TR color
+          … etc.
+        A thin white base border is drawn first so gaps at the midpoints remain clean.
+        Quadrant labels appear just inside each corner.
+        """
+        gs   = getattr(env.field, "goal_state", None)
+        ctrl = gs.compute_quadrant_control() if gs else {}
+
+        def _qcol(qname):
+            c = ctrl.get(qname)
+            if c == BALL_BLUE: return BLUE
+            if c == BALL_RED:  return RED
+            return (65, 65, 75)   # neutral
+
+        tl = _qcol("top_left")
+        tr = _qcol("top_right")
+        bl = _qcol("bottom_left")
+        br = _qcol("bottom_right")
+
+        mx = FIELD_PX // 2   # midpoint x
+        my = FIELD_PY // 2   # midpoint y
+
+        THICK = 7    # border thickness in pixels
+        INNER = 2    # thin white underlay
+
+        # 1. Thin white base border (always visible even on neutral quadrants)
+        pygame.draw.rect(self.screen, WHITE, (0, 0, FIELD_PX, FIELD_PY), INNER)
+
+        # 2. Colored half-edges (drawn on top of the white underlay)
+        # Top edge: left half = TL, right half = TR
+        pygame.draw.line(self.screen, tl, (0,  0),  (mx,       0),       THICK)
+        pygame.draw.line(self.screen, tr, (mx, 0),  (FIELD_PX, 0),       THICK)
+        # Bottom edge
+        pygame.draw.line(self.screen, bl, (0,  FIELD_PY), (mx,       FIELD_PY), THICK)
+        pygame.draw.line(self.screen, br, (mx, FIELD_PY), (FIELD_PX, FIELD_PY), THICK)
+        # Left edge: top half = TL, bottom half = BL
+        pygame.draw.line(self.screen, tl, (0, 0),  (0, my),       THICK)
+        pygame.draw.line(self.screen, bl, (0, my), (0, FIELD_PY), THICK)
+        # Right edge
+        pygame.draw.line(self.screen, tr, (FIELD_PX, 0),  (FIELD_PX, my),       THICK)
+        pygame.draw.line(self.screen, br, (FIELD_PX, my), (FIELD_PX, FIELD_PY), THICK)
+
+        # 3. Corner labels just inside each corner (label color matches quadrant)
+        PAD = THICK + 4
+        labels = [
+            ("TL", tl, PAD,             PAD),
+            ("TR", tr, FIELD_PX - 26,   PAD),
+            ("BL", bl, PAD,             FIELD_PY - 14),
+            ("BR", br, FIELD_PX - 26,   FIELD_PY - 14),
+        ]
+        for abbr, col, lx, ly in labels:
+            # Small filled pill background so label is readable regardless of field color
+            surf = self.font_sm.render(abbr, True, WHITE)
+            bg_r = pygame.Rect(lx - 2, ly - 1, surf.get_width() + 4, surf.get_height() + 2)
+            pygame.draw.rect(self.screen, col, bg_r, border_radius=2)
+            self.screen.blit(surf, (lx, ly))
 
     def _draw_goal_ball_stack(self, ball_list, x_lo_px: int, x_hi_px: int,
                               y_top_px: int, y_bot_px: int):
@@ -515,18 +626,27 @@ class PygameRenderer:
         """
         if not ball_list:
             return
-        n   = len(ball_list)
-        cx  = (x_lo_px + x_hi_px) // 2
+        n  = len(ball_list)
+        cx = (x_lo_px + x_hi_px) // 2
+        goal_h = y_bot_px - y_top_px
+
+        # Dark strip behind the dots for contrast against the goal body color
+        strip_w = 14
+        pygame.draw.rect(self.screen, (30, 30, 30),
+                         (cx - strip_w // 2, y_top_px, strip_w, goal_h))
+
+        # Evenly space dots; clamp radius so they never touch
+        max_r    = max(3, min(6, goal_h // (2 * n + 2)))
+        r        = max_r
         for i, (_, color) in enumerate(ball_list):
             # i=0 → south outer (near y_bot_px), i=n-1 → north outer (near y_top_px)
             t  = (i + 0.5) / n
-            sy = int(y_bot_px - t * (y_bot_px - y_top_px))
-            dot_col = RED      if color == BALL_RED else BLUE
+            sy = int(y_bot_px - t * goal_h)
+            dot_col = RED       if color == BALL_RED else BLUE
             dot_out = LIGHT_RED if color == BALL_RED else LIGHT_BLUE
-            r = 4
             pygame.draw.circle(self.screen, dot_col, (cx, sy), r)
             pygame.draw.circle(self.screen, dot_out, (cx, sy), r, 1)
-            # White ring on the two outermost positions
+            # White ring on outermost (first in and last in)
             if i == 0 or i == n - 1:
                 pygame.draw.circle(self.screen, WHITE, (cx, sy), r + 2, 1)
 
@@ -686,23 +806,30 @@ class PygameRenderer:
         corners = _robot_corners(sx, sy, half, robot.heading)
         pygame.draw.polygon(self.screen, color, corners, border)
 
-        # ── Held balls: small colored dots inside robot body ──────────────────
+        # ── Held balls: colored dots stacked at the BACK of robot ──
+        # Front intakes, back scores — so balls sit lined up at the back end.
         if robot.balls_held > 0 and hasattr(env, "field"):
-            # Screen-space directional unit vectors
-            rgt_x =  math.sin(robot.heading)
-            rgt_y =  math.cos(robot.heading)   # y-down: cos gives correct right
-            DOT_R   = 4
-            spacing = (half * 2 - 6) / max(robot.balls_held, 1)
+            # Forward unit vector (screen-space, y-down)
+            fwd_x =  math.cos(robot.heading)
+            fwd_y = -math.sin(robot.heading)
+            DOT_R = 5
+            # Stack position: from back face moving forward
+            back_offset = half - 6
+            ball_spacing = 9
             for i, obj_idx in enumerate(robot.held_object_ids):
                 obj_color = env.field.objects[obj_idx].color
                 dot_col  = RED      if obj_color == BALL_RED else BLUE
                 dot_ring = LIGHT_RED if obj_color == BALL_RED else LIGHT_BLUE
-                # Position: evenly spread across robot width
-                t    = -half + 3 + int(spacing * (i + 0.5))
-                bx   = sx + int(t * rgt_x)
-                by   = sy + int(t * rgt_y)
+                along = -back_offset + i * ball_spacing   # negative = behind center (back)
+                bx = sx + int(along * fwd_x)
+                by = sy + int(along * fwd_y)
                 pygame.draw.circle(self.screen, dot_col,  (bx, by), DOT_R)
-                pygame.draw.circle(self.screen, dot_ring, (bx, by), DOT_R, 1)
+                pygame.draw.circle(self.screen, dot_ring, (bx, by), DOT_R, 2)
+
+        # ── Back-face indicator: thin line showing where balls exit ──
+        bl = corners[2]   # back-left
+        br = corners[3]   # back-right
+        pygame.draw.line(self.screen, (200, 200, 200), bl, br, 2)
 
         # ── Intake face indicator ───────────────────────────────────────────
         # Front-face screen endpoints  (corners[1] = front-left, corners[0] = front-right)
@@ -810,12 +937,19 @@ class PygameRenderer:
                 to_remove.append(i)
                 continue
 
-            # Linear interpolation with a parabolic arc upward
+            # Interpolate along flight path. Arc is perpendicular to trajectory
+            # and scales with distance — close shots are nearly straight.
             x = anim["x0"] + t * (anim["x1"] - anim["x0"])
             y = anim["y0"] + t * (anim["y1"] - anim["y0"])
-            arc_h = 10.0               # peak height of arc in field inches
-            y_arc = arc_h * 4.0 * t * (1.0 - t)   # parabola: 0 at ends, arc_h at t=0.5
-            y += y_arc
+            dx   = anim["x1"] - anim["x0"]
+            dy   = anim["y1"] - anim["y0"]
+            dist = math.sqrt(dx * dx + dy * dy) + 1e-6
+            # No arc for short shots (<12"); gentle arc beyond that
+            arc_h = 0.0 if dist < 12.0 else min((dist - 12.0) * 0.12, 5.0)
+            if arc_h > 0.0:
+                parab = arc_h * 4.0 * t * (1.0 - t)
+                x += (-dy / dist) * parab   # perpendicular (left-hand side)
+                y += ( dx / dist) * parab
 
             sx, sy = _to_screen(x, y)
 
@@ -873,8 +1007,16 @@ class PygameRenderer:
         state = "PAUSED" if self.paused else "RUNNING"
         hm    = "ON"     if self.show_heatmap else "OFF"
 
-        line1 = (f"Time: {t:6.2f}s  |  Us (Blue): {env.field.my_score:3d}  "
-                 f"Opp (Red): {env.field.opponent_score:3d}  |  Speed: {self.sim_speed:.1f}x  [{state}]")
+        # Include control bonus in HUD totals
+        from sim.config import CONTROL_BONUS_PTS
+        gs = getattr(env.field, "goal_state", None)
+        ctrl = gs.compute_quadrant_control() if gs else {}
+        ctrl_us  = CONTROL_BONUS_PTS * sum(1 for c in ctrl.values() if c == BALL_BLUE)
+        ctrl_opp = CONTROL_BONUS_PTS * sum(1 for c in ctrl.values() if c == BALL_RED)
+        total_us  = env.field.my_score       + ctrl_us
+        total_opp = env.field.opponent_score + ctrl_opp
+        line1 = (f"Time: {t:6.2f}s  |  Us (Blue): {total_us:3d}  "
+                 f"Opp (Red): {total_opp:3d}  |  Speed: {self.sim_speed:.1f}x  [{state}]")
         self.screen.blit(self.font_lg.render(line1, True, WHITE), (10, y0))
 
         num_allies = getattr(env, "num_allies", 2)
@@ -887,8 +1029,13 @@ class PygameRenderer:
                  f"Brush:{'RED' if self.brush_color == BALL_RED else 'BLUE'}")
         self.screen.blit(self.font.render(line2, True, LIGHT_GRAY), (10, y0 + 20))
 
-        line3 = "Space:pause  S:step  H:hmap  R:reset  +/-:speed  1/2:robot  C:color  Del:delete  RClick:add"
-        self.screen.blit(self.font_sm.render(line3, True, (90, 90, 90)), (10, y0 + 38))
+        if self.wasd_mode:
+            line3 = "Tab:exit-WASD  W/S:fwd/rev  A/D:turn  I:intake  F:score  1/2:robot  Space:pause  R:reset"
+            line3_col = (180, 120, 40)
+        else:
+            line3 = "Tab:WASD  Space:pause  S:step  H:hmap  R:reset  +/-:speed  1/2:robot  C:color  Del:del  RClick:add"
+            line3_col = (90, 90, 90)
+        self.screen.blit(self.font_sm.render(line3, True, line3_col), (10, y0 + 38))
 
     # ------------------------------------------------------------------
     # Right panel
@@ -1209,6 +1356,36 @@ class PygameRenderer:
         return y_start + BTN_H
 
     def _draw_panel_timer(self, env, y_start: int) -> int:
+        """Status box — match timer is disabled, shows RUNNING/PAUSED state."""
+        px  = FIELD_PX + 10
+        bw  = PANEL_W - 20
+
+        box = pygame.Rect(px, y_start, bw, 34)
+        pygame.draw.rect(self.screen, SECTION_BG, box, border_radius=4)
+
+        executing = getattr(env, "executing", False)
+        if self.wasd_mode:
+            parts = [f"WASD  R{self.wasd_robot_idx}"]
+            if self.wasd_intake_on:  parts.append("INTAKE")
+            if self.wasd_score_on:   parts.append("SCORE")
+            status, scol, ocol = " | ".join(parts), ORANGE, ORANGE
+        elif self.paused:
+            status, scol, ocol = "PAUSED", YELLOW, YELLOW
+        elif executing:
+            status, scol, ocol = "EXECUTING", GREEN, GREEN
+        else:
+            status, scol, ocol = "RUNNING", LIGHT_BLUE, LIGHT_BLUE
+        pygame.draw.rect(self.screen, ocol, box, 1, border_radius=4)
+
+        big = pygame.font.SysFont("consolas", 18, bold=True)
+        sub = self.font_sm.render("(timer disabled)", True, (110, 110, 120))
+        ssurf = big.render(status, True, scol)
+        self.screen.blit(ssurf, (px + bw // 2 - ssurf.get_width() // 2, y_start + 4))
+        self.screen.blit(sub,   (px + bw // 2 - sub.get_width() // 2,   y_start + 22))
+
+        return y_start + 38
+
+    def _draw_panel_timer_OLD(self, env, y_start: int) -> int:
         """Large match timer + decision-progress bar."""
         from sim.config import TICKS_PER_DECISION
         t   = max(0.0, env.field.time_remaining)
@@ -1272,36 +1449,56 @@ class PygameRenderer:
         return y + 32
 
     def _draw_panel_scoreboard(self, env, y_start: int) -> int:
-        """Compact scoreboard: us vs opp with margin and ball counts."""
+        """Scoreboard: ball points + control bonus, broken down per team."""
+        from sim.config import CONTROL_BONUS_PTS
         y  = y_start
         px = FIELD_PX + 10
         bw = PANEL_W - 20
 
-        us  = env.field.my_score
-        opp = env.field.opponent_score
+        # Ball-score totals (color-based)
+        ball_us  = env.field.my_score
+        ball_opp = env.field.opponent_score
+
+        # Control bonus: 10 pts per controlled quadrant
+        gs   = getattr(env.field, "goal_state", None)
+        ctrl = gs.compute_quadrant_control() if gs else {}
+        ctrl_us  = CONTROL_BONUS_PTS * sum(1 for c in ctrl.values() if c == BALL_BLUE)
+        ctrl_opp = CONTROL_BONUS_PTS * sum(1 for c in ctrl.values() if c == BALL_RED)
+
+        us  = ball_us  + ctrl_us
+        opp = ball_opp + ctrl_opp
         diff = us - opp
 
         # Score boxes side by side
         half = (bw - 10) // 2
         # Us box
-        us_rect = pygame.Rect(px, y, half, 32)
+        us_rect = pygame.Rect(px, y, half, 38)
         pygame.draw.rect(self.screen, (15, 30, 70), us_rect, border_radius=4)
         pygame.draw.rect(self.screen, LIGHT_BLUE, us_rect, 1, border_radius=4)
         us_lbl = self.font_sm.render("US (Blue)", True, LIGHT_BLUE)
         us_val = self.font_lg.render(str(us), True, WHITE)
         self.screen.blit(us_lbl, (us_rect.x + 6, us_rect.y + 2))
-        self.screen.blit(us_val, (us_rect.right - us_val.get_width() - 8,
-                                  us_rect.y + 8))
+        self.screen.blit(us_val, (us_rect.right - us_val.get_width() - 6,
+                                  us_rect.y + 10))
+        # Sub-labels for ball pts and control bonus
+        if ctrl_us > 0:
+            sub_us = self.font_sm.render(f"{ball_us}b+{ctrl_us}ctrl", True, (100, 140, 200))
+            self.screen.blit(sub_us, (us_rect.x + 6, us_rect.y + 24))
+
         # Opp box
-        opp_rect = pygame.Rect(px + half + 10, y, half, 32)
+        opp_rect = pygame.Rect(px + half + 10, y, half, 38)
         pygame.draw.rect(self.screen, (60, 15, 15), opp_rect, border_radius=4)
         pygame.draw.rect(self.screen, LIGHT_RED, opp_rect, 1, border_radius=4)
         opp_lbl = self.font_sm.render("OPP (Red)", True, LIGHT_RED)
         opp_val = self.font_lg.render(str(opp), True, WHITE)
         self.screen.blit(opp_lbl, (opp_rect.x + 6, opp_rect.y + 2))
-        self.screen.blit(opp_val, (opp_rect.right - opp_val.get_width() - 8,
-                                   opp_rect.y + 8))
-        y += 36
+        self.screen.blit(opp_val, (opp_rect.right - opp_val.get_width() - 6,
+                                   opp_rect.y + 10))
+        if ctrl_opp > 0:
+            sub_opp = self.font_sm.render(f"{ball_opp}b+{ctrl_opp}ctrl", True, (200, 100, 100))
+            self.screen.blit(sub_opp, (opp_rect.x + 6, opp_rect.y + 24))
+
+        y += 42
 
         # Margin + balls on field
         if diff > 0:
@@ -1314,7 +1511,7 @@ class PygameRenderer:
         on_field  = sum(1 for o in env.field.objects if o.status == OBJ_ON_FIELD)
         red_field = sum(1 for o in env.field.objects if o.status == OBJ_ON_FIELD and o.color == BALL_RED)
         blu_field = on_field - red_field
-        info = f"Margin: {d_pfx}{diff}   |   Field: {on_field} ({red_field}r {blu_field}b)"
+        info = f"Margin: {d_pfx}{diff}  |  Field: {on_field} ({red_field}r {blu_field}b)"
         self.screen.blit(self.font_sm.render(info, True, d_col), (px, y))
         y += 16
 
@@ -1401,7 +1598,12 @@ class PygameRenderer:
         return y
 
     def _draw_panel_goals(self, env, y_start: int) -> int:
-        """Show ordered ball contents per goal with color dots."""
+        """Show ALL balls in each goal as a compact horizontal color bar.
+
+        Order: left = lst[0] (south/SW/SE end), right = lst[-1] (north/NE/NW end).
+        Direction label shows which end is the 'entry' for each goal type.
+        Capacity: long goals = 14, center goals = 7.
+        """
         y  = y_start
         px = FIELD_PX + 10
 
@@ -1409,46 +1611,62 @@ class PygameRenderer:
         if gs is None:
             return y
 
+        SQ  = 9     # square width (px)
+        SQH = 9     # square height (px)
+        GAP = 1     # gap between squares
+
         all_goals = [
-            ("our_long",   "Right Long Goal"),
-            ("opp_long",   "Left Long Goal"),
-            ("center_mid", "Center MID"),
-            ("center_low", "Center LOW"),
+            ("our_long",   "R.Long",    LIGHT_BLUE, "S", "N",  14),
+            ("opp_long",   "L.Long",    LIGHT_RED,  "S", "N",  14),
+            ("center_mid", "Mid Goal",  ORANGE,     "SW","NE",  7),
+            ("center_low", "Low Goal",  YELLOW,     "SE","NW",  7),
         ]
 
-        for gname, label in all_goals:
+        for gname, label, hdr_col, start_lbl, end_lbl, cap in all_goals:
             lst = gs._list(gname)
+            n   = len(lst)
             n_r = sum(1 for _, c in lst if c == BALL_RED)
-            n_b = len(lst) - n_r
-            count_str = f"{n_r}r {n_b}b" if lst else "empty"
-            header = self.font_sm.render(f"{label}  ({count_str})", True, LIGHT_GRAY)
-            self.screen.blit(header, (px, y))
-            y += 14
-            if lst:
-                sx = px + 4
-                for i, (_, col) in enumerate(lst):
-                    dot_col = LIGHT_RED if col == BALL_RED else LIGHT_BLUE
-                    is_outer = (i == 0 or i == len(lst) - 1)
-                    r = 5 if is_outer else 4
-                    pygame.draw.circle(self.screen, dot_col, (sx + r, y + 5), r)
-                    if is_outer:
-                        pygame.draw.circle(self.screen, WHITE, (sx + r, y + 5), r, 2)
-                    sx += r * 2 + 3
-                y += 14
-            y += 2
+            n_b = n - n_r
 
-        # Quadrant control — compact inline
+            # ── Header ──
+            cap_pct = f"{n}/{cap}"
+            count_s = f"({n_r}r {n_b}b)" if n else "(empty)"
+            hdr = self.font_sm.render(f"{label}  {cap_pct}  {count_s}", True, hdr_col)
+            self.screen.blit(hdr, (px, y))
+            y += 13
+
+            if lst:
+                # Direction label before the bar
+                st = self.font_sm.render(start_lbl + "→", True, (75, 75, 85))
+                self.screen.blit(st, (px, y + 1))
+                sq_x0 = px + st.get_width() + 2
+
+                # Draw ALL balls as colored squares in one row
+                for i, (_, color) in enumerate(lst):
+                    sq_x   = sq_x0 + i * (SQ + GAP)
+                    sq_col = RED       if color == BALL_RED else BLUE
+                    sq_out = LIGHT_RED if color == BALL_RED else LIGHT_BLUE
+                    pygame.draw.rect(self.screen, sq_col, (sq_x, y, SQ, SQH))
+                    # White border on the two outermost (entry/exit) balls
+                    bdr = WHITE if (i == 0 or i == n - 1) else sq_out
+                    pygame.draw.rect(self.screen, bdr, (sq_x, y, SQ, SQH), 1)
+
+                # Direction label after the bar
+                en = self.font_sm.render("→" + end_lbl, True, (75, 75, 85))
+                self.screen.blit(en, (sq_x0 + n * (SQ + GAP) + 2, y + 1))
+
+                y += SQH + 4
+            y += 4
+
+        # ── Quadrant control ──
         ctrl = gs.compute_quadrant_control()
         parts = []
         for qlabel, qkey in [("TL", "top_left"), ("TR", "top_right"),
                              ("BL", "bottom_left"), ("BR", "bottom_right")]:
             c = ctrl.get(qkey)
-            if c == BALL_RED:
-                parts.append((f"{qlabel}:R", LIGHT_RED))
-            elif c == BALL_BLUE:
-                parts.append((f"{qlabel}:B", LIGHT_BLUE))
-            else:
-                parts.append((f"{qlabel}:-", (70, 70, 80)))
+            if c == BALL_RED:   parts.append((f"{qlabel}:R", LIGHT_RED))
+            elif c == BALL_BLUE: parts.append((f"{qlabel}:B", LIGHT_BLUE))
+            else:                parts.append((f"{qlabel}:-", (70, 70, 80)))
 
         ctrl_lbl = self.font_sm.render("Control:", True, LIGHT_GRAY)
         self.screen.blit(ctrl_lbl, (px, y))
@@ -1577,18 +1795,31 @@ class PygameRenderer:
 
     def _draw_panel_controls(self, y_start: int):
         y = y_start
-        lines = [
-            ("Space", "pause / resume"),
-            ("S",     "step one decision"),
-            ("H",     "toggle heatmap"),
-            ("R",     "reset episode"),
-            ("+/-",   "speed up / slow down"),
-            ("1/2",   "highlight robot"),
-            ("C",     "change ball color"),
-            ("Del",   "delete selected ball"),
-            ("LClick","select ball"),
-            ("RClick","add ball (brush color)"),
-        ]
+        if self.wasd_mode:
+            lines = [
+                ("Tab",   "exit WASD mode"),
+                ("W/S",   "forward / reverse"),
+                ("A/D",   "turn left / right"),
+                ("I",     "toggle intake ON/OFF"),
+                ("F",     "hold to score (release = keep)"),
+                ("1/2",   "switch robot"),
+                ("Space", "pause / resume"),
+                ("R",     "reset episode"),
+            ]
+        else:
+            lines = [
+                ("Tab",   "enter WASD mode"),
+                ("Space", "pause / resume"),
+                ("S",     "step one decision"),
+                ("H",     "toggle heatmap"),
+                ("R",     "reset episode"),
+                ("+/-",   "speed up / slow down"),
+                ("1/2",   "highlight robot"),
+                ("C",     "change ball color"),
+                ("Del",   "delete selected ball"),
+                ("LClick","select ball"),
+                ("RClick","add ball (brush color)"),
+            ]
         for key, desc in lines:
             if y > SCREEN_H - 14:
                 break
