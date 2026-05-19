@@ -218,6 +218,25 @@ def train(
                     f"Detected torch={getattr(torch, '__version__', 'unknown')}, torch.version.cuda={getattr(getattr(torch, 'version', None), 'cuda', None)}. "
                     "Install a CUDA-enabled PyTorch build or pass --device cpu."
                 )
+
+            # Guard for very new GPUs (e.g. sm_120) not included in the wheel.
+            try:
+                cap_major, cap_minor = torch.cuda.get_device_capability(0)
+                arch = f"sm_{cap_major}{cap_minor}"
+                arch_list = []
+                try:
+                    arch_list = list(torch.cuda.get_arch_list())
+                except Exception:
+                    arch_list = []
+                if arch_list and arch not in arch_list:
+                    raise RuntimeError(
+                        "CUDA is available, but your GPU compute capability is not included in this PyTorch wheel. "
+                        f"Detected GPU arch={arch}, torch supports: {', '.join(arch_list)}. "
+                        "Install a newer CUDA PyTorch build (often CUDA 12.6 wheels or nightly builds), or pass --device cpu."
+                    )
+            except Exception:
+                # If capability/arch list can't be queried, don't block training here.
+                pass
         except ImportError:
             raise RuntimeError(
                 f"device='{device}' was requested, but PyTorch is not installed. "

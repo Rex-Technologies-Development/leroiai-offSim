@@ -133,6 +133,13 @@ REPLAN_LOCK_TICKS: int   = max(0, int(REPLAN_LOCK_S / DT))
 SCORING_DWELL_S: float   = float(SHARED_CFG["game"].get("scoring_dwell_s", 1.5))
 SCORING_DWELL_TICKS: int = max(0, int(SCORING_DWELL_S / DT))
 
+# Action persistence for scoring intents (per env.step decision).
+SCORE_COMMIT_DECISIONS: int = int(SHARED_CFG["game"].get("score_commit_decisions", 2))
+
+SCORE_COMMIT_UNTIL_EMPTY: bool = bool(SHARED_CFG["game"].get("score_commit_until_empty", True))
+SCORE_COMMIT_MAX_S: float = float(SHARED_CFG["game"].get("score_commit_max_s", 9.0))
+SCORE_COMMIT_MAX_DECISIONS: int = max(1, int(SCORE_COMMIT_MAX_S / max(DECISION_INTERVAL, 1e-6)))
+
 # ---------------------------------------------------------------------------
 # Game objects
 # ---------------------------------------------------------------------------

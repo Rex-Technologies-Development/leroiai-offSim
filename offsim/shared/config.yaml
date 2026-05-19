@@ -30,6 +30,16 @@ game:
   # Once the robot reaches a scoring pose (arrived + heading aligned), keep the
   # decision alive for at least this long so score timers can actually fire.
   scoring_dwell_s: 1.5
+  # When the policy chooses a SCORE_* action, stick with it for this many
+  # consecutive RL decisions (prevents thrashing between long vs center goals
+  # while the robot is still aligning/finishing the scoring sequence).
+  score_commit_decisions: 2
+  # Stronger variant: if true, once a SCORE_* action is chosen, keep that same
+  # SCORE_* intent until the robot has no balls left OR the timeout expires.
+  score_commit_until_empty: true
+  # Timeout for score_commit_until_empty (seconds). Prevents getting stuck
+  # scoring forever if the robot can't align/reach the scoring pose.
+  score_commit_max_s: 9.0
   max_carry: 7
 
 state:

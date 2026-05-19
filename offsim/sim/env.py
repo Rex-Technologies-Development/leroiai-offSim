@@ -24,7 +24,8 @@ from sim.config import (
     N_NEAREST_BLUE, N_NEAREST_RED,
     FIELD_W, FIELD_H, MATCH_DURATION, DT, TICKS_PER_DECISION, MAX_CARRY,
     MAX_GAME_OBJECTS, OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP,
-    HEATMAP_W, HEATMAP_H, INCLUDE_HEATMAP, REPLAN_LOCK_TICKS, SCORING_DWELL_TICKS, MAX_SCORE,
+    HEATMAP_W, HEATMAP_H, INCLUDE_HEATMAP, REPLAN_LOCK_TICKS, SCORING_DWELL_TICKS,
+    SCORE_COMMIT_DECISIONS, SCORE_COMMIT_UNTIL_EMPTY, SCORE_COMMIT_MAX_DECISIONS, MAX_SCORE,
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
@@ -195,6 +196,49 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
       3. Otherwise: corridor detour, with a centre go-around if still blocked.
     """
     from sim.route_planner import _los_blocked, _NAV_MARGIN
+
+    # If we're already at (or extremely close to) the final point, don't run the
+    # LOS/detour planner. Some edge cases around zero-length segments can cause
+    # the planner to incorrectly return a detour, sending the robot away from a
+    # scoring pose and preventing the score timer from ever firing.
+    if float(np.linalg.norm(final - start)) < 0.75:
+        return [final]
+
+    # ── Long-goal scoring approach: force an intermediate waypoint ──────────
+    # Approaching the long-goal score point diagonally often causes the robot
+    # to clip the long-goal collision AABB and get pushed away, never reaching
+    # the precise scoring pose.  For SCORE_LONG_GOAL, the `final` point is the
+    # approach/score position just outside the long goal end.  We insert a
+    # staging point at the SAME y as `final`, but at a safe x inside the field
+    # (right/left corridor). The last leg becomes horizontal, staying outside
+    # the goal AABB in y, so the robot doesn't get bumped while closing.
+    is_right_long = abs(float(final[0] - _RIGHT_GOAL_CX)) < 6.0 and (
+        float(final[1]) > LONG_GOAL_Y_MAX or float(final[1]) < LONG_GOAL_Y_MIN
+    )
+    is_left_long = abs(float(final[0] - _LEFT_GOAL_CX)) < 6.0 and (
+        float(final[1]) > LONG_GOAL_Y_MAX or float(final[1]) < LONG_GOAL_Y_MIN
+    )
+    if is_right_long or is_left_long:
+        corridor_x = 95.0 if is_right_long else 49.0
+        stage = np.array([corridor_x, float(final[1])], dtype=np.float64)
+
+        # If start → stage is blocked (usually by the center X arms), route via
+        # the standard corridor points (and center if needed).
+        if _los_blocked(start[0], start[1], stage[0], stage[1], margin=_NAV_MARGIN):
+            use_low = (start[1] + stage[1]) / 2.0 <= 72.0
+            corridor = (_NAV_RIGHT_LOW if use_low else _NAV_RIGHT_HIGH).copy() \
+                if is_right_long else \
+                (_NAV_LEFT_LOW if use_low else _NAV_LEFT_HIGH).copy()
+            legs: list[np.ndarray] = []
+            if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
+                center = _NAV_BELOW_X if start[1] <= 72.0 else _NAV_ABOVE_X
+                legs.append(center.copy())
+            legs.append(corridor.copy())
+            legs.append(stage)
+            legs.append(final)
+            return legs
+
+        return [stage, final]
 
     # Direct path (most common for collect actions)
     if not _los_blocked(start[0], start[1], final[0], final[1], margin=_NAV_MARGIN):
@@ -521,6 +565,12 @@ class VexAIEnv(gym.Env):
         self.collected_this_step   = np.zeros(2, dtype=np.int32)
         self.red_collected_this_step = np.zeros(2, dtype=np.int32)
         self.current_actions       = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
+
+        # Scoring commitment: when the agent chooses a SCORE_* action, we hold it
+        # for a couple of decisions so it can align + complete scoring instead
+        # of thrashing to a different goal next decision.
+        self._score_commit_left = np.zeros(2, dtype=np.int32)
+        self._score_committed_action = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
         self.expected_state_delta  = np.zeros(2)
         self.prev_predicted_score  = np.zeros(2)
         # Per-decision shaping signals (read by compute_reward)
@@ -582,6 +632,8 @@ class VexAIEnv(gym.Env):
         self.collected_this_step[:]    = 0
         self.red_collected_this_step[:] = 0
         self.current_actions[:]      = Action.IDLE
+        self._score_commit_left[:]   = 0
+        self._score_committed_action[:] = Action.IDLE
         self.expected_state_delta[:] = 0
         self.prev_predicted_score[:] = 0
         self.goal_bump_ticks[:]      = 0
@@ -1007,7 +1059,28 @@ class VexAIEnv(gym.Env):
 
     def step(self, actions: np.ndarray):
         """One RL decision cycle = TICKS_PER_DECISION sim ticks."""
-        a0, a1 = int(actions[0]), int(actions[1])
+        raw_a0, raw_a1 = int(actions[0]), int(actions[1])
+        a0, a1 = raw_a0, raw_a1
+
+        SCORE_INTENTS = (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW)
+
+        # Scoring commitment across DECISIONS (env.step calls).
+        # Goal: once the agent selects SCORE_*, don't allow thrashing to other
+        # objectives while the robot is still aligning/finishing scoring.
+        for idx, chosen in enumerate((a0, a1)):
+            if idx >= self.num_allies:
+                continue
+            if self._score_commit_left[idx] > 0:
+                committed = int(self._score_committed_action[idx])
+                if Action(committed) in SCORE_INTENTS and self.field.allies[idx].balls_held > 0:
+                    if idx == 0:
+                        a0 = committed
+                    else:
+                        a1 = committed
+                    self._score_commit_left[idx] -= 1
+                else:
+                    self._score_commit_left[idx] = 0
+                    self._score_committed_action[idx] = int(Action.IDLE)
 
         # Safety remap: if the chosen action is currently masked, fall back to
         # COLLECT_NEAREST_BALL. MaskablePPO won't ever send a masked action, but
@@ -1018,6 +1091,49 @@ class VexAIEnv(gym.Env):
             a1 = int(Action.COLLECT_NEAREST_BALL)
 
         self.current_actions = np.array([a0, a1], dtype=np.int32)
+
+        # (Re)start scoring commitment when a score action is chosen.
+        # Two modes:
+        #  - until_empty: keep scoring intent until balls are emptied, with a timeout
+        #  - fixed decisions: keep for SCORE_COMMIT_DECISIONS decisions
+        if SCORE_COMMIT_UNTIL_EMPTY:
+            raw_commit_a0, raw_commit_a1 = raw_a0, raw_a1
+            if not self.action_masks(robot_id=0)[raw_commit_a0]:
+                raw_commit_a0 = int(Action.COLLECT_NEAREST_BALL)
+            if not self.action_masks(robot_id=1)[raw_commit_a1]:
+                raw_commit_a1 = int(Action.COLLECT_NEAREST_BALL)
+
+            for idx, act in enumerate((raw_commit_a0, raw_commit_a1)):
+                if idx >= self.num_allies:
+                    continue
+                if self._score_commit_left[idx] > 0:
+                    continue
+                try:
+                    if Action(act) in SCORE_INTENTS and self.field.allies[idx].balls_held > 0:
+                        self._score_committed_action[idx] = int(act)
+                        self._score_commit_left[idx] = SCORE_COMMIT_MAX_DECISIONS
+                except ValueError:
+                    pass
+
+        elif SCORE_COMMIT_DECISIONS > 1:
+            raw_commit_a0, raw_commit_a1 = raw_a0, raw_a1
+            if not self.action_masks(robot_id=0)[raw_commit_a0]:
+                raw_commit_a0 = int(Action.COLLECT_NEAREST_BALL)
+            if not self.action_masks(robot_id=1)[raw_commit_a1]:
+                raw_commit_a1 = int(Action.COLLECT_NEAREST_BALL)
+
+            for idx, act in enumerate((raw_commit_a0, raw_commit_a1)):
+                if idx >= self.num_allies:
+                    continue
+                if self._score_commit_left[idx] > 0:
+                    continue
+                try:
+                    if Action(act) in SCORE_INTENTS and self.field.allies[idx].balls_held > 0:
+                        self._score_committed_action[idx] = int(act)
+                        # We already execute this decision now; hold for N-1 future decisions.
+                        self._score_commit_left[idx] = SCORE_COMMIT_DECISIONS - 1
+                except ValueError:
+                    pass
 
         # Action-change lock-in: if a robot's action differs from last decision,
         # freeze it for _ACTION_CHANGE_PAUSE_TICKS ticks before executing the

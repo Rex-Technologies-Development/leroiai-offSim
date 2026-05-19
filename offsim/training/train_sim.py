@@ -302,6 +302,32 @@ def train(
     else:
         actual_device = "cpu"
 
+    # Extra guard: some CUDA wheels don't include kernels for very new GPUs.
+    # In that case torch.cuda.is_available() can still be True, but you'll get
+    # warnings like "sm_120 is not compatible" and performance/ops may break.
+    if actual_device == "cuda":
+        try:
+            cap_major, cap_minor = torch.cuda.get_device_capability(0)
+            arch = f"sm_{cap_major}{cap_minor}"
+            arch_list = []
+            try:
+                arch_list = list(torch.cuda.get_arch_list())
+            except Exception:
+                arch_list = []
+            if arch_list and arch not in arch_list:
+                raise RuntimeError(
+                    "CUDA is available, but your GPU compute capability is not included in this PyTorch wheel.\n"
+                    f"Detected GPU arch={arch}, torch supports: {', '.join(arch_list)}\n"
+                    f"torch={torch_build}, torch.version.cuda={torch_cuda_ver}.\n\n"
+                    "Fix: install a newer PyTorch build that supports your GPU (often CUDA 12.6 wheels or nightly builds), "
+                    "or run with --device cpu."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            # If we can't query capability/arch list, don't block training.
+            pass
+
     print(f"PyTorch device (requested={device}): {actual_device}  (torch={torch_build}, torch.cuda={torch_cuda_ver})")
 
     if resume:

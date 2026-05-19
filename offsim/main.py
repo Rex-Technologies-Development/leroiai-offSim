@@ -134,6 +134,10 @@ def cmd_demo(args):
 def cmd_train(args):
     """Phase 1: PPO training in sim with curriculum."""
     from training.train_sim import train
+
+    resume_path = args.resume
+    if resume_path == "latest":
+        resume_path = _resolve_model_path("latest", output_dir=args.output_dir)
     train(
         total_timesteps=args.timesteps,
         n_envs=args.n_envs,
@@ -141,7 +145,7 @@ def cmd_train(args):
         checkpoint_freq=args.checkpoint_freq,
         eval_freq=args.eval_freq,
         output_dir=args.output_dir,
-        resume=args.resume,
+        resume=resume_path,
         render=args.render,
         device=args.device,
     )
@@ -229,17 +233,38 @@ def cmd_eval(args):
         env.render()
 
     print(f"Loading model from {model_path}...")
+
+    # Prefer MaskablePPO (sb3-contrib) for action-masked training; fall back to
+    # plain PPO for older checkpoints.
+    model = None
+    is_maskable = False
+    load_err: Exception | None = None
     try:
-        model = PPO.load(model_path)
-    except ValueError as e:
-        if "Observation spaces do not match" in str(e):
-            print(f"\n[!] Observation-space mismatch loading {model_path}.")
-            print(f"    Current env expects shape={env.observation_space.shape}.")
-            print(f"    This model was trained with a different STATE_DIM (e.g. heatmap")
-            print(f"    on/off or other observation changes). Retrain from scratch:")
-            print(f"      python offsim/main.py train --timesteps 200000")
-            raise SystemExit(1)
-        raise
+        from sb3_contrib import MaskablePPO
+        try:
+            model = MaskablePPO.load(model_path, env=env)
+            is_maskable = True
+        except Exception as e:
+            load_err = e
+    except Exception:
+        pass
+
+    if model is None:
+        try:
+            model = PPO.load(model_path)
+        except ValueError as e:
+            if "Observation spaces do not match" in str(e):
+                print(f"\n[!] Observation-space mismatch loading {model_path}.")
+                print(f"    Current env expects shape={env.observation_space.shape}.")
+                print(f"    This model was trained with a different STATE_DIM (e.g. heatmap")
+                print(f"    on/off or other observation changes). Retrain from scratch:")
+                print(f"      python offsim/main.py train --timesteps 200000")
+                raise SystemExit(1)
+            raise
+        except Exception as e:
+            if load_err is not None:
+                raise load_err
+            raise e
 
     wins, losses, ties = 0, 0, 0
     all_rewards, all_scores, all_opp = [], [], []
@@ -250,7 +275,12 @@ def cmd_eval(args):
         ep_reward = 0.0
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
+            if is_maskable:
+                from sb3_contrib.common.maskable.utils import get_action_masks
+                masks = get_action_masks(env)
+                action, _ = model.predict(obs, deterministic=True, action_masks=masks)
+            else:
+                action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, _ = env.step(int(action))
             ep_reward += float(reward)
 
@@ -329,6 +359,10 @@ def main():
     p.add_argument("--eval-freq", type=int, default=25_000)
     p.add_argument("--output-dir", default="models")
     p.add_argument("--resume", default=None, help="Resume from checkpoint path")
+    # Quality-of-life: allow continuing from the freshest known model.
+    # Equivalent to passing the resolved path from models/.
+    # Example: python offsim/main.py train --resume latest --timesteps 200000
+    # (still writes new checkpoints/final_model.zip into output-dir)
     p.add_argument("--render", action="store_true",
                    help="Show the pygame window while training. If n_envs>1, each SubprocVecEnv worker opens its own window.")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
