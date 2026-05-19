@@ -24,6 +24,12 @@ game:
   match_duration: 120    # seconds
   dt: 0.05               # seconds per sim tick (fine-grained for movement animation)
   decision_interval: 3.0 # seconds between RL re-queries (40 decisions per match)
+  # Minimum time before mid-step auto-replanning is allowed to swap the
+  # currently executing action (prevents rapid objective thrashing).
+  replan_lock_s: 1.0
+  # Once the robot reaches a scoring pose (arrived + heading aligned), keep the
+  # decision alive for at least this long so score timers can actually fire.
+  scoring_dwell_s: 1.5
   max_carry: 7
 
 state:
@@ -31,6 +37,9 @@ state:
   object_features: 4     # x, y, status, color
   heatmap_grid_w: 12
   heatmap_grid_h: 12
+  # If true, append a 12x12 (=144) potential heatmap to the flat state.
+  # This is expensive and makes the observation contract larger.
+  include_heatmap: false
 
 robot:
   width: 15.00       # inches (top-down square footprint)

@@ -206,6 +206,24 @@ def train(
 
     print(f"Total transitions: {len(dataset.observations)}")
 
+    # d3rlpy ultimately uses PyTorch under the hood. If the environment has a
+    # CPU-only torch build, requesting a CUDA device will either error later or
+    # silently fall back depending on version. Detect early and fail loudly.
+    if str(device).startswith("cuda"):
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"device='{device}' was requested, but torch.cuda.is_available() is False. "
+                    f"Detected torch={getattr(torch, '__version__', 'unknown')}, torch.version.cuda={getattr(getattr(torch, 'version', None), 'cuda', None)}. "
+                    "Install a CUDA-enabled PyTorch build or pass --device cpu."
+                )
+        except ImportError:
+            raise RuntimeError(
+                f"device='{device}' was requested, but PyTorch is not installed. "
+                "Install PyTorch (CUDA build if desired) or pass --device cpu."
+            )
+
     if algo == "cql":
         model = d3rlpy.algos.DiscreteCQLConfig(
             learning_rate=lr, batch_size=batch_size,

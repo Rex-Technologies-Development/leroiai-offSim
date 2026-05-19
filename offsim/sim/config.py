@@ -124,6 +124,15 @@ DECISION_INTERVAL: float = SHARED_CFG["game"]["decision_interval"]    # 3.0s
 TICKS_PER_DECISION: int  = int(DECISION_INTERVAL / DT)                # 60
 MAX_CARRY: int           = SHARED_CFG["game"]["max_carry"]            # 3
 
+# Mid-step replanning lockout (prevents rapid per-tick objective flipping)
+REPLAN_LOCK_S: float     = float(SHARED_CFG["game"].get("replan_lock_s", 1.0))
+REPLAN_LOCK_TICKS: int   = max(0, int(REPLAN_LOCK_S / DT))
+
+# Post-arrival scoring dwell: once a robot is in-scoring-position and aligned,
+# keep the decision running long enough for score timers to fire.
+SCORING_DWELL_S: float   = float(SHARED_CFG["game"].get("scoring_dwell_s", 1.5))
+SCORING_DWELL_TICKS: int = max(0, int(SCORING_DWELL_S / DT))
+
 # ---------------------------------------------------------------------------
 # Game objects
 # ---------------------------------------------------------------------------
@@ -194,6 +203,9 @@ assert len(INITIAL_OBJECTS) == 44, f"Expected 44 balls, got {len(INITIAL_OBJECTS
 HEATMAP_W: int = SHARED_CFG["state"]["heatmap_grid_w"]  # 12
 HEATMAP_H: int = SHARED_CFG["state"]["heatmap_grid_h"]  # 12
 
+# Whether the 12x12 heatmap is appended to the RL state vector.
+INCLUDE_HEATMAP: bool = bool(SHARED_CFG["state"].get("include_heatmap", False))
+
 # ---------------------------------------------------------------------------
 # State vector dimension (flat)
 # Base scalar features = 13:
@@ -212,7 +224,7 @@ N_NEAREST_BLUE   = 8
 N_NEAREST_RED    = 4
 OBJ_REL_FEATURES = 5
 _REL_OBJ_TOTAL = (N_NEAREST_BLUE + N_NEAREST_RED) * OBJ_REL_FEATURES + 4 * 2  # = 68
-STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H) + 3
+STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H if INCLUDE_HEATMAP else 0) + 3
 
 # ---------------------------------------------------------------------------
 # Robot physics

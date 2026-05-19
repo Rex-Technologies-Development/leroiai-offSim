@@ -275,17 +275,34 @@ def train(
         EpisodeStatsCallback(log_freq_episodes=100, rendered_env=rendered_env, verbose=1),
     ]
 
-    # Resolve PyTorch device. SB3 accepts 'auto', 'cpu', 'cuda'. 'auto' picks
-    # CUDA if available, falling back to CPU.
+    # Resolve PyTorch device. SB3 accepts 'auto', 'cpu', 'cuda'.
+    # IMPORTANT: if torch was installed as a CPU-only build, SB3 will silently
+    # fall back to CPU even if you pass device='cuda'. We detect this and
+    # fail loudly when the user explicitly requests CUDA.
+    try:
+        import torch
+        torch_build = getattr(torch, "__version__", "unknown")
+        torch_cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        torch_build = "not-installed"
+        torch_cuda_ver = None
+        cuda_available = False
+
     if device == "auto":
-        try:
-            import torch
-            actual_device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            actual_device = "cpu"
+        actual_device = "cuda" if cuda_available else "cpu"
+    elif device == "cuda":
+        actual_device = "cuda"
+        if not cuda_available:
+            raise RuntimeError(
+                "--device cuda was requested, but this Python environment does not have CUDA-enabled PyTorch.\n"
+                f"Detected torch={torch_build}, torch.version.cuda={torch_cuda_ver}, torch.cuda.is_available()={cuda_available}.\n\n"
+                "Fix: install a CUDA-enabled PyTorch build (and a Python version supported by those wheels), or run with --device cpu."
+            )
     else:
-        actual_device = device
-    print(f"PyTorch device: {actual_device}")
+        actual_device = "cpu"
+
+    print(f"PyTorch device (requested={device}): {actual_device}  (torch={torch_build}, torch.cuda={torch_cuda_ver})")
 
     if resume:
         print(f"Resuming from {resume}")

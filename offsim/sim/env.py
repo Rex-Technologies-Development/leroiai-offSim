@@ -24,7 +24,7 @@ from sim.config import (
     N_NEAREST_BLUE, N_NEAREST_RED,
     FIELD_W, FIELD_H, MATCH_DURATION, DT, TICKS_PER_DECISION, MAX_CARRY,
     MAX_GAME_OBJECTS, OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP,
-    HEATMAP_W, HEATMAP_H, MAX_SCORE,
+    HEATMAP_W, HEATMAP_H, INCLUDE_HEATMAP, REPLAN_LOCK_TICKS, SCORING_DWELL_TICKS, MAX_SCORE,
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
@@ -555,6 +555,10 @@ class VexAIEnv(gym.Env):
         # Each: {x0,y0, x1,y1, color, elapsed, duration}
         self.score_animations: list[dict] = []
 
+        # Per-decision one-shot effect guards (some actions should not spam-fire
+        # every tick once stationary).
+        self._eject_fired_this_decision = np.zeros(2, dtype=bool)
+
     # ------------------------------------------------------------------
     # Gymnasium API
     # ------------------------------------------------------------------
@@ -653,6 +657,7 @@ class VexAIEnv(gym.Env):
         self.executing     = False
         self.opp_targets   = [None, None]
         self.score_animations.clear()
+        self._eject_fired_this_decision[:] = False
 
         return self._get_obs(), {}
 
@@ -689,6 +694,7 @@ class VexAIEnv(gym.Env):
                 if target is not None else []
             )
             robot.score_timer = 0.0   # reset score timer for fresh approach
+            self._eject_fired_this_decision[ridx] = False
 
         # ── Run active manual RL action (overrides WASD movement) ────────
         if getattr(self, "_manual_rl_action", None) is not None:
@@ -1037,6 +1043,7 @@ class VexAIEnv(gym.Env):
         step_start_pos = [self.field.allies[i].position.copy() for i in range(2)]
         self.decision_tick = 0
         self.executing     = True
+        self._eject_fired_this_decision[:] = False
 
         fi = self.failure_injector
         if self.num_allies < 2 or fi.teammate_offline or fi.should_teammate_fail():
@@ -1087,15 +1094,56 @@ class VexAIEnv(gym.Env):
         # agent from getting locked into one decision for 20+ seconds when its
         # chosen action drives into an obstacle — instead it gets to re-decide
         # roughly every 5 seconds.
-        MAX_STEP_TICKS = 100   # 5 seconds (was 480 = 24s)
+        # Hard cap on per-decision simulation time. Keep it high enough to
+        # honor post-arrival scoring dwell even if that value is increased.
+        MAX_STEP_TICKS = max(100, TICKS_PER_DECISION + SCORING_DWELL_TICKS)
+
+        # How long since the mid-step replanner last changed the executing action.
+        # This is independent of the RL decision interval; it only affects the
+        # adaptive "auto-chain" logic inside the decision.
+        live_action_age = [REPLAN_LOCK_TICKS, REPLAN_LOCK_TICKS]
+
+        # Post-arrival scoring dwell: once in scoring pose (arrived + aligned),
+        # keep the decision alive for a minimum duration so scoring timers can fire.
+        scoring_dwell_left = [0, 0]
 
         for tick in range(MAX_STEP_TICKS):
             if tick >= TICKS_PER_DECISION:
-                still_moving = any(
-                    self.field.allies[i].moving and bool(ally_wq[i])
+                def _busy(i: int) -> bool:
+                    """Return True if robot i should keep this decision alive.
+
+                    Some actions (notably scoring/turning-in-place and one-shot eject)
+                    have important effects even when the robot is not moving.
+                    """
+                    robot = self.field.allies[i]
+                    act_i = Action(live_actions[i])
+                    if scoring_dwell_left[i] > 0:
+                        return True
+                    if act_i in SCORE_INTENTS and robot.balls_held > 0:
+                        if act_i == Action.SCORE_LONG_GOAL:
+                            score_pos, *_ = _nearest_long_goal_target(robot)
+                        elif act_i == Action.SCORE_CENTER_MID:
+                            score_pos, *_ = _nearest_center_tip(robot, lower=False)
+                        else:  # Action.SCORE_CENTER_LOW
+                            score_pos, *_ = _nearest_center_tip(robot, lower=True)
+                        dist = float(np.linalg.norm(robot.position - score_pos))
+                        # Keep sim running while we are close enough to be aligning/scoring.
+                        return dist < (_SCORE_ARRIVAL_DIST * 2.0)
+
+                    if act_i == Action.EJECT_WRONG_COLOR and not self._eject_fired_this_decision[i]:
+                        wrong_held = any(
+                            self.field.objects[oid].color != BALL_BLUE
+                            for oid in robot.held_object_ids
+                        )
+                        return wrong_held
+
+                    return False
+
+                still_active = any(
+                    (self.field.allies[i].moving and bool(ally_wq[i])) or _busy(i)
                     for i in range(self.num_allies)
                 )
-                if not still_moving:
+                if not still_active:
                     break
 
             fi.on_tick(num_robots=2)
@@ -1114,6 +1162,7 @@ class VexAIEnv(gym.Env):
                 act      = Action(live_actions[idx])
                 original = Action(self.current_actions[idx])
                 new_act  = None
+                force_replan = False
                 # Chain-back: SCORE intent paused for COLLECT, balls now held → resume SCORE
                 if (act == Action.COLLECT_NEAREST_BALL
                         and original in SCORE_INTENTS
@@ -1122,6 +1171,7 @@ class VexAIEnv(gym.Env):
                 # SCORE_* with no balls → auto-collect first
                 elif act in SCORE_INTENTS and robot.balls_held == 0:
                     new_act = Action.COLLECT_NEAREST_BALL
+                    force_replan = True
                 # Full robot → score, unless already scoring or ejecting wrong-color
                 elif robot.balls_held >= MAX_CARRY and act not in SCORE_INTENTS + (Action.EJECT_WRONG_COLOR,):
                     # Respect RL's SCORE intent if it had one, else default to long goal
@@ -1131,14 +1181,19 @@ class VexAIEnv(gym.Env):
                 elif act in (Action.DESCORE_OPP_LONG, Action.DESCORE_CENTER) \
                         and n_opp_scored == 0:
                     new_act = Action.COLLECT_NEAREST_BALL
+                    force_replan = True
                 # DEFEND_ZONE only makes sense when (a) an opponent exists AND
                 # (b) we have something scored worth defending. Otherwise route
                 # to COLLECT so we don't waste a decision parked uselessly.
                 elif act == Action.DEFEND_ZONE and not defend_worth_it:
                     new_act = Action.COLLECT_NEAREST_BALL
                 if new_act is not None:
-                    live_actions[idx] = int(new_act)
-                    ally_wq[idx]      = _build_wq(idx)
+                    # Replan lock: don't flip executing intent too rapidly.
+                    # Still allow forced replans when the current intent is invalid.
+                    if force_replan or live_action_age[idx] >= REPLAN_LOCK_TICKS:
+                        live_actions[idx] = int(new_act)
+                        ally_wq[idx]      = _build_wq(idx)
+                        live_action_age[idx] = 0
 
             # Save positions before movement for push calculation
             ally_prev = [self.field.allies[i].position.copy()     for i in range(self.num_allies)]
@@ -1172,6 +1227,30 @@ class VexAIEnv(gym.Env):
                     _wrap_angle(cur_h - prev_tick_headings[idx])
                 )
                 prev_tick_headings[idx] = cur_h
+
+                # Start (or refresh) scoring dwell once the scoring pose is achieved.
+                # This is intentionally stricter than the generic "near" check: we
+                # only dwell after arrival AND heading alignment are both satisfied.
+                act_i = Action(live_actions[idx])
+                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) \
+                        and robot.balls_held > 0:
+                    if act_i == Action.SCORE_LONG_GOAL:
+                        score_pos, _, required_heading, _ = _nearest_long_goal_target(robot)
+                    elif act_i == Action.SCORE_CENTER_MID:
+                        score_pos, _, required_heading, _ = _nearest_center_tip(robot, lower=False)
+                    else:
+                        score_pos, _, required_heading, _ = _nearest_center_tip(robot, lower=True)
+
+                    dist = float(np.linalg.norm(robot.position - score_pos))
+                    aligned = abs(_wrap_angle(required_heading - robot.heading)) < _SCORE_HDG_TOL
+                    if dist < _SCORE_ARRIVAL_DIST and aligned:
+                        scoring_dwell_left[idx] = max(scoring_dwell_left[idx], SCORING_DWELL_TICKS)
+
+            # Age the replanning lock timers (cap to avoid unbounded growth)
+            for idx in range(self.num_allies):
+                live_action_age[idx] = min(live_action_age[idx] + 1, REPLAN_LOCK_TICKS * 10 + 1)
+                if scoring_dwell_left[idx] > 0:
+                    scoring_dwell_left[idx] -= 1
 
             for oi in range(self.num_opponents):
                 if self.opp_targets[oi] is not None:
@@ -1317,8 +1396,11 @@ class VexAIEnv(gym.Env):
                 robot.actions_succeeded += 1
 
         elif action == Action.EJECT_WRONG_COLOR:
-            # Only fires on first tick of the decision so we don't spam-eject.
-            if self.decision_tick == 0:
+            # One-shot per decision. Important: the action-change pause can
+            # suppress effects on tick 0, so gate by a flag rather than
+            # decision_tick==0.
+            if not self._eject_fired_this_decision[idx]:
+                self._eject_fired_this_decision[idx] = True
                 ejected = self._eject_wrong_color_balls(robot)
                 if ejected > 0:
                     self.eject_events[idx] += ejected
@@ -1495,7 +1577,9 @@ class VexAIEnv(gym.Env):
             *_relative_goal_features(CENTER_LOW_GOAL,  robot),
         ], dtype=np.float32)
 
-        heatmap = self.field.get_heatmap()
+        heatmap = None
+        if INCLUDE_HEATMAP:
+            heatmap = self.field.get_heatmap()
 
         # Current quadrant control snapshot (normalised — 4 quadrants total).
         ctrl_now = self.field.goal_state.compute_quadrant_control()
@@ -1507,7 +1591,7 @@ class VexAIEnv(gym.Env):
             if self.field.objects[oid].color != BALL_BLUE
         )
 
-        obs = np.concatenate([
+        parts = [
             np.array([
                 float(role_id),
                 self.alliance_color,                  # 1.0 = blue, 0.0 = red
@@ -1527,13 +1611,20 @@ class VexAIEnv(gym.Env):
             blue_flat,         # 8 × 5 = 40
             red_flat,          # 4 × 5 = 20
             goal_rel,          # 4 × 2 = 8
-            heatmap.flatten(), # 12 × 12 = 144 — kept for global spatial awareness
+        ]
+
+        if INCLUDE_HEATMAP and heatmap is not None:
+            parts.append(heatmap.flatten().astype(np.float32, copy=False))
+
+        parts.append(
             np.array([
                 self.expected_state_delta[role_id] / 10.0,
                 robot.success_ratio(),
                 float(wrong_color_held) / MAX_CARRY,  # how many red balls held
             ], dtype=np.float32),
-        ])
+        )
+
+        obs = np.concatenate(parts)
         # Guard against silent obs-shape drift — catches missing fields immediately.
         assert obs.shape == (STATE_DIM,), (
             f"obs shape {obs.shape}, expected ({STATE_DIM},)"

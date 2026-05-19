@@ -235,8 +235,8 @@ def cmd_eval(args):
         if "Observation spaces do not match" in str(e):
             print(f"\n[!] Observation-space mismatch loading {model_path}.")
             print(f"    Current env expects shape={env.observation_space.shape}.")
-            print(f"    This model was likely trained before the alliance-color")
-            print(f"    flag was added (STATE_DIM 331 → 332). Retrain from scratch:")
+            print(f"    This model was trained with a different STATE_DIM (e.g. heatmap")
+            print(f"    on/off or other observation changes). Retrain from scratch:")
             print(f"      python offsim/main.py train --timesteps 200000")
             raise SystemExit(1)
         raise
@@ -330,7 +330,7 @@ def main():
     p.add_argument("--output-dir", default="models")
     p.add_argument("--resume", default=None, help="Resume from checkpoint path")
     p.add_argument("--render", action="store_true",
-                   help="Show the pygame window while training (forces n_envs=1).")
+                   help="Show the pygame window while training. If n_envs>1, each SubprocVecEnv worker opens its own window.")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                    help="PyTorch device for PPO. 'auto' uses CUDA if available "
                         "(default: auto). Note: for this workload, env stepping "

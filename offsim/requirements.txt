@@ -1,3 +1,7 @@
+# NOTE: For GPU training, install a CUDA-enabled PyTorch build.
+# `pip install torch` may install a CPU-only build depending on your Python
+# version and platform. Use the official PyTorch install selector to get the
+# correct CUDA wheel for Windows + your NVIDIA driver.
 torch
 gymnasium
 stable-baselines3
