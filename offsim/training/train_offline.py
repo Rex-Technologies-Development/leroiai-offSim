@@ -1,14 +1,137 @@
-"""Phase 3: CQL/IQL offline RL on recorded match data via d3rlpy."""
+"""Phase 3: CQL/IQL offline RL on recorded match data via d3rlpy.
+
+Dataset metadata
+----------------
+Every .npz produced by a data-collection run must have a sibling .meta.json
+written by `save_dataset()`. The metadata pins the data to a specific
+action enum, state dimension, and reward function — loading raises if the
+current env doesn't match, so we never silently train on stale rollouts
+from before a refactor.
+"""
 
 from __future__ import annotations
+import json
 import os
 import sys
+from datetime import datetime, timezone
+
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import d3rlpy
 
+
+# ---------------------------------------------------------------------------
+# Dataset metadata — pin every recorded dataset to the env that produced it
+# ---------------------------------------------------------------------------
+
+# Bump these when their respective contracts change.
+ACTION_ENUM_VERSION   = "v2"           # bumped when Action enum members or order change
+REWARD_VERSION        = "winning_v1"   # bumped when REWARD_WEIGHTS / components change
+FIELD_CONFIG_VERSION  = "push_back_v1" # bumped when field geometry / shared_config.yaml changes
+
+
+def _meta_path(npz_path: str) -> str:
+    """Sibling metadata path for a given .npz dataset."""
+    base, _ = os.path.splitext(npz_path)
+    return base + ".meta.json"
+
+
+def build_dataset_metadata(n_transitions: int) -> dict:
+    """Build the metadata dict for a dataset produced by the *current* env.
+
+    Captures everything needed to detect drift between the recorded dataset
+    and the env at training time.
+    """
+    from sim.config import Action, NUM_ACTIONS, STATE_DIM
+    return {
+        "action_enum_version":  ACTION_ENUM_VERSION,
+        "reward_version":       REWARD_VERSION,
+        "field_config_version": FIELD_CONFIG_VERSION,
+        "state_dim":            int(STATE_DIM),
+        "num_actions":          int(NUM_ACTIONS),
+        "action_names":         [a.name for a in Action],
+        "n_transitions":        int(n_transitions),
+        "created_at":           datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def save_dataset(
+    npz_path: str,
+    observations: np.ndarray,
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    terminals: np.ndarray,
+) -> None:
+    """Save a transitions .npz with a sibling .meta.json snapshot.
+
+    Use this from any data-collection script — never bypass it, or downstream
+    training won't know whether the data is still valid for the current env.
+    """
+    os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
+    np.savez(
+        npz_path,
+        observations=observations.astype(np.float32),
+        actions=actions.astype(np.int64),
+        rewards=rewards.astype(np.float32),
+        terminals=terminals.astype(np.float32),
+    )
+    meta = build_dataset_metadata(n_transitions=len(observations))
+    with open(_meta_path(npz_path), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[save_dataset] wrote {npz_path}  ({meta['n_transitions']} transitions)")
+    print(f"[save_dataset] wrote {_meta_path(npz_path)}")
+
+
+def verify_dataset_compatibility(npz_path: str, strict: bool = True) -> dict:
+    """Load and validate the .meta.json sidecar for an .npz dataset.
+
+    Returns the metadata dict on success.  Raises ValueError on mismatch
+    when strict=True; prints a warning otherwise.
+    """
+    from sim.config import Action, NUM_ACTIONS, STATE_DIM
+
+    meta_path = _meta_path(npz_path)
+    if not os.path.exists(meta_path):
+        msg = f"No metadata at {meta_path} — dataset predates the metadata scheme."
+        if strict:
+            raise ValueError(
+                msg + "\nRe-record with save_dataset() or pass --no-strict to bypass."
+            )
+        print(f"[verify_dataset] WARN: {msg}")
+        return {}
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    expected = {
+        "action_enum_version":  ACTION_ENUM_VERSION,
+        "reward_version":       REWARD_VERSION,
+        "field_config_version": FIELD_CONFIG_VERSION,
+        "state_dim":            int(STATE_DIM),
+        "num_actions":          int(NUM_ACTIONS),
+        "action_names":         [a.name for a in Action],
+    }
+    mismatches = [
+        f"  {k}: dataset={meta.get(k)!r}  current={v!r}"
+        for k, v in expected.items()
+        if meta.get(k) != v
+    ]
+    if mismatches:
+        msg = (
+            f"Dataset {npz_path} is incompatible with the current env:\n"
+            + "\n".join(mismatches)
+        )
+        if strict:
+            raise ValueError(msg + "\nRe-record the dataset or pass --no-strict to bypass.")
+        print(f"[verify_dataset] WARN:\n{msg}")
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
 
 def collect_data_paths(inputs: list[str]) -> list[str]:
     paths = []
@@ -22,10 +145,12 @@ def collect_data_paths(inputs: list[str]) -> list[str]:
     return paths
 
 
-def load_npz_files(paths: list[str]):
+def load_npz_files(paths: list[str], strict_metadata: bool = True):
+    """Load and concatenate .npz datasets, verifying metadata for each."""
     all_obs, all_act, all_rew, all_term = [], [], [], []
     for p in paths:
         print(f"Loading {p}...")
+        verify_dataset_compatibility(p, strict=strict_metadata)
         data = np.load(p)
         all_obs.append(data["observations"])
         all_act.append(data["actions"])
@@ -49,6 +174,7 @@ def train(
     save_interval: int = 10,
     device: str = "cuda:0",
     output_dir: str = "models",
+    strict_metadata: bool = True,
 ):
     data_paths = collect_data_paths(data)
     if not data_paths:
@@ -63,7 +189,7 @@ def train(
         for p in h5_paths:
             datasets.append(d3rlpy.dataset.MDPDataset.load(p))
     if npz_paths:
-        obs, act, rew, term = load_npz_files(npz_paths)
+        obs, act, rew, term = load_npz_files(npz_paths, strict_metadata=strict_metadata)
         datasets.append(d3rlpy.dataset.MDPDataset(
             observations=obs, actions=act, rewards=rew, terminals=term,
         ))

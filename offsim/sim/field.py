@@ -18,13 +18,74 @@ from sim.config import (
     COLLECT_RANGE, SCORE_RANGE, MAX_CARRY, ROBOT_W,
     BALL_RED, BALL_BLUE,
     MATCHLOAD_TUBES, MATCHLOAD_TUBE_RADIUS,
+    LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX, LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH,
+    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W,
 )
+from sim.game_object import BALL_RADIUS
+
+# ---------------------------------------------------------------------------
+# Ball-position randomisation
+# ---------------------------------------------------------------------------
+# Per-episode jitter so each match is a slightly different scenario — keeps
+# the policy from overfitting to the 44 fixed INITIAL_OBJECTS coordinates.
+_JITTER_RADIUS = 12.0  # inches — max offset from anchor position
+_JITTER_ATTEMPTS = 6   # if jittered pos lands on a goal, try again N times
+_BALL_WALL_MARGIN = 4.0
+
+# Pre-computed goal bounding boxes for collision testing during jitter.
+# Long goals = two vertical bars near the side walls.
+_R_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH
+_R_GOAL_X_HI = FIELD_W - LONG_GOAL_WALL_GAP
+_L_GOAL_X_LO = LONG_GOAL_WALL_GAP
+_L_GOAL_X_HI = LONG_GOAL_WALL_GAP + LONG_GOAL_WIDTH
+_GOAL_PAD    = BALL_RADIUS + 2.0
+
+
+def _ball_pos_clear(x: float, y: float) -> bool:
+    """True if (x, y) is safely on the field — not inside a goal body."""
+    # Walls
+    if x < _BALL_WALL_MARGIN or x > FIELD_W - _BALL_WALL_MARGIN:
+        return False
+    if y < _BALL_WALL_MARGIN or y > FIELD_H - _BALL_WALL_MARGIN:
+        return False
+    # Long goal bodies
+    if (_R_GOAL_X_LO - _GOAL_PAD <= x <= _R_GOAL_X_HI + _GOAL_PAD
+            and LONG_GOAL_Y_MIN - _GOAL_PAD <= y <= LONG_GOAL_Y_MAX + _GOAL_PAD):
+        return False
+    if (_L_GOAL_X_LO - _GOAL_PAD <= x <= _L_GOAL_X_HI + _GOAL_PAD
+            and LONG_GOAL_Y_MIN - _GOAL_PAD <= y <= LONG_GOAL_Y_MAX + _GOAL_PAD):
+        return False
+    # Center X arms — rotated rectangle test, expanded by ball radius
+    dx, dy = x - 72.0, y - 72.0
+    half_w = CENTER_GOAL_ARM_W / 2 + _GOAL_PAD
+    for angle in (math.pi / 4.0, -math.pi / 4.0):
+        ca, sa = math.cos(angle), math.sin(angle)
+        along = dx * ca + dy * sa
+        perp  = dx * (-sa) + dy * ca
+        if abs(along) <= CENTER_GOAL_ARM_LEN + _GOAL_PAD and abs(perp) <= half_w:
+            return False
+    return True
+
+
+def _jitter_position(anchor_x: float, anchor_y: float,
+                     rng: np.random.Generator) -> tuple[float, float]:
+    """Return a randomly jittered position near (anchor_x, anchor_y).
+
+    Falls back to the anchor if every jitter attempt lands on a goal body.
+    """
+    for _ in range(_JITTER_ATTEMPTS):
+        dx = float(rng.uniform(-_JITTER_RADIUS, _JITTER_RADIUS))
+        dy = float(rng.uniform(-_JITTER_RADIUS, _JITTER_RADIUS))
+        x = anchor_x + dx
+        y = anchor_y + dy
+        if _ball_pos_clear(x, y):
+            return round(x, 2), round(y, 2)
+    return anchor_x, anchor_y
 
 # How close a ball must be to a tube to be considered "at the tube"
 _TUBE_SNAP_DIST = MATCHLOAD_TUBE_RADIUS * 3.0
 # Heading tolerance for facing a matchload tube (radians)
 _TUBE_FACE_TOL  = math.radians(30.0)
-from sim.game_object import BALL_RADIUS
 
 # Robot push / intake constants
 _PUSH_RADIUS  = ROBOT_W / 2 + BALL_RADIUS + 1.0   # 11.0" — radial trigger for side/back push
@@ -205,14 +266,17 @@ class Field:
         self.opponents[0].reset(24.00, 126.00, heading=0.0)
         self.opponents[1].reset(24.00,  18.00, heading=0.0)
 
-        # Rebuild from INITIAL_OBJECTS with randomized position+color assignment
+        # Rebuild from INITIAL_OBJECTS with randomized position+color assignment.
+        # Each ball is jittered ±_JITTER_RADIUS from its anchor — keeps the
+        # general spread but gives every episode a slightly different layout.
         all_pos    = [(float(row[0]), float(row[1])) for row in INITIAL_OBJECTS]
         all_colors = [int(row[2]) for row in INITIAL_OBJECTS]
         pos_perm   = rng.permutation(len(all_pos))
         col_perm   = rng.permutation(len(all_colors))
         self.objects = []
         for i, (pi, ci) in enumerate(zip(pos_perm, col_perm)):
-            x, y  = all_pos[pi]
+            anchor_x, anchor_y = all_pos[pi]
+            x, y  = _jitter_position(anchor_x, anchor_y, rng)
             color = all_colors[ci]
             self.objects.append(GameObject(i, x, y, color))
 
@@ -311,11 +375,16 @@ class Field:
         return diff <= _TUBE_FACE_TOL
 
     def try_collect(self, robot: Robot) -> bool:
-        """Pick up the nearest ball inside the front-face intake zone.
+        """Pick up the nearest ball (any color) inside the front-face intake zone.
+
+        Intake is colorblind — the *policy* learns to avoid red balls through
+        the collect_red / holding_wrong_color penalties, and the route planner
+        only targets blue balls so the robot rarely drives toward reds in the
+        first place. If a red ball ends up in the intake (e.g. opp pushed it
+        in front of us), EJECT_WRONG_COLOR clears it.
 
         Only the front face of the robot (full width, _INTAKE_DEPTH reach) can
-        collect. The other three sides only push. Tube balls still require the
-        robot to be facing the tube within 30°.
+        collect. Tube balls still require the robot to face the tube within 30°.
         """
         if robot.balls_held >= MAX_CARRY:
             return False
@@ -397,24 +466,41 @@ class Field:
         return points, ejected
 
     def try_descore(self, robot: Robot, goal_pos: np.ndarray, rng: np.random.Generator) -> int:
-        """Remove an opponent-scored ball from goal. Returns points removed."""
+        """Remove an opponent-scored ball from the SPECIFIC targeted goal.
+
+        Returns points removed (0 if out of range or no opp ball in that goal).
+        Only removes balls whose .scored_in_goal matches the goal_pos —
+        the previous version removed any opp-scored ball anywhere on the field,
+        which made the cause-effect chain meaningless for the policy.
+        """
         if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
             return 0
 
-        opp_scored = self.scored_by_opp_indices()
-        if len(opp_scored) == 0:
+        target_gname = _goal_name(goal_pos)
+        # Only consider opp-scored balls actually sitting in the targeted goal
+        candidates = [
+            i for i, obj in enumerate(self.objects)
+            if obj.status == OBJ_SCORED_OPP and obj.scored_in_goal == target_gname
+        ]
+        if not candidates:
             return 0
 
-        idx = opp_scored[0]
-        gname_remove = self.objects[idx].scored_in_goal
+        idx = candidates[0]
         self.objects[idx].status = OBJ_ON_FIELD
         self.objects[idx].scored_in_goal = ""
-        self.goal_state.remove_ball(gname_remove, idx)
+        self.goal_state.remove_ball(target_gname, idx)
         drop_pos = goal_pos + rng.uniform(-8.0, 8.0, size=2)
         drop_pos = np.clip(drop_pos, [0.0, 0.0], [FIELD_W, FIELD_H])
         self.objects[idx].position = drop_pos
-        self.opponent_score = max(0, self.opponent_score - CENTER_GOAL_POINTS)
-        return CENTER_GOAL_POINTS
+
+        # Point value matches the goal type — long goals are worth different
+        # points than center goals.
+        if target_gname in ("our_long", "opp_long"):
+            pts = LONG_GOAL_POINTS
+        else:
+            pts = CENTER_GOAL_POINTS
+        self.opponent_score = max(0, self.opponent_score - pts)
+        return pts
 
     def nearest_on_field_target(self, pos: np.ndarray) -> np.ndarray | None:
         """Return position of nearest on-field ball, or None (no obstacle check)."""

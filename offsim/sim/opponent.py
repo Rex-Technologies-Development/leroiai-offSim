@@ -31,8 +31,10 @@ class GreedyOpponent:
             best   = min(d_long, d_mid, d_low)
             if best == d_long:
                 return Action.SCORE_LONG_GOAL
+            elif best == d_mid:
+                return Action.SCORE_CENTER_MID
             else:
-                return Action.SCORE_CENTER_GOAL
+                return Action.SCORE_CENTER_LOW
         return Action.COLLECT_NEAREST_BALL
 
 

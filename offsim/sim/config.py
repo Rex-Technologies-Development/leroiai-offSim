@@ -46,15 +46,19 @@ BALL_BLUE = 1   # blue alliance balls (our team)
 class Action(enum.IntEnum):
     COLLECT_NEAREST_BALL = 0
     SCORE_LONG_GOAL      = 1   # score in our long goal (right wall)
-    SCORE_CENTER_GOAL    = 2   # score in nearest center goal
-    DESCORE_OPP_LONG     = 3   # descore from opponent long goal (left wall)
-    DESCORE_CENTER       = 4   # descore from center goals
-    DEFEND_ZONE          = 5
-    MOVE_TO_REGION_A     = 6
-    MOVE_TO_REGION_B     = 7
+    SCORE_CENTER_MID     = 2   # score in upper-diagonal center goal (NE–SW bar)
+    SCORE_CENTER_LOW     = 3   # score in lower-diagonal center goal (NW–SE bar)
+    DESCORE_OPP_LONG     = 4   # descore from opponent long goal (left wall)
+    DESCORE_CENTER       = 5   # descore from center goals
+    DEFEND_ZONE          = 6
+    EJECT_WRONG_COLOR    = 7   # dump held red (wrong-color) balls out the back
     IDLE                 = 8
 
 NUM_ACTIONS = len(Action)
+# Catch comment/code drift before training silently samples a broken index
+assert NUM_ACTIONS == len(Action), (
+    f"NUM_ACTIONS={NUM_ACTIONS} but len(Action)={len(Action)} — action enum drift"
+)
 
 # ---------------------------------------------------------------------------
 # Field (inches, origin bottom-left, 2 decimal precision)
@@ -106,9 +110,10 @@ VISION_HALF_ANGLE = np.radians(34.5)   # ±34.5° → 69° total HFOV (OAK-D Lit
 VISION_RANGE      = 72.0               # max depth in inches
 
 # Named zones
-REGION_A_CENTER  = np.array([108.00, 108.00])  # upper-right
-REGION_B_CENTER  = np.array([ 36.00,  36.00])  # lower-left
-DEFEND_ZONE_POS  = np.array([108.00,  72.00])  # in front of our long goal
+# DEFEND_ZONE_POS sits in front of our long goal but back far enough that the
+# robot's corners (half-diagonal ≈ 10.6" when rotated 45°) don't clip the goal
+# inner face at x=118.375. Pushed back from 108 → 102 for a ~6" buffer.
+DEFEND_ZONE_POS  = np.array([102.00,  72.00])
 
 # ---------------------------------------------------------------------------
 # Game rules
@@ -191,14 +196,23 @@ HEATMAP_H: int = SHARED_CFG["state"]["heatmap_grid_h"]  # 12
 
 # ---------------------------------------------------------------------------
 # State vector dimension (flat)
-# role_id(1) + time(1) + my_score(1) + opp_score(1)
-# + x(1) + y(1) + heading(1) + balls_held(1) + balls_nearby(1) = 9
-# + game_objects(44 * 4) = 176
-# + heatmap(12 * 12) = 144
-# + extra(2) = 2
-# Total = 331
+# Base scalar features = 13:
+#   role_id(1) + alliance_color(1) + time(1) + my_score(1) + opp_score(1)
+#   + x(1) + y(1) + sin_heading(1) + cos_heading(1) + balls_held(1) + balls_nearby(1)
+#   + ctrl_us_quadrants(1) + ctrl_opp_quadrants(1)
+# Relative nearest-object features = 68:
+#   8 nearest BLUE balls × 5 features (dx, dy, dist, bearing_sin, bearing_cos) = 40
+#   4 nearest RED  balls × 5 features                                          = 20
+#   4 goals × 2 features (relative dx, dy)                                     = 8
+# Heatmap = 144  (kept for global spatial density awareness)
+# Extras = 3     (expected_state_delta, success_ratio, wrong_color_held)
+# Total = 13 + 68 + 144 + 3 = 228
 # ---------------------------------------------------------------------------
-STATE_DIM = 9 + (MAX_GAME_OBJECTS * OBJ_FEATURES) + (HEATMAP_W * HEATMAP_H) + 2
+N_NEAREST_BLUE   = 8
+N_NEAREST_RED    = 4
+OBJ_REL_FEATURES = 5
+_REL_OBJ_TOTAL = (N_NEAREST_BLUE + N_NEAREST_RED) * OBJ_REL_FEATURES + 4 * 2  # = 68
+STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H) + 3
 
 # ---------------------------------------------------------------------------
 # Robot physics

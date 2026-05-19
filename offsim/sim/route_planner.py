@@ -27,9 +27,12 @@ from sim.config import (
     ROBOT_W,
 )
 
-# Half of the robot's physical width — used to expand obstacles so the path
-# planner routes the robot's CENTRE along a path that keeps the whole body clear.
-_NAV_MARGIN: float = ROBOT_W / 2   # 7.5"
+# Margin used to expand obstacles so the path planner routes the robot's
+# CENTRE along a path that keeps the whole body clear. Uses the half-diagonal
+# (ROBOT_W * √2 / 2) instead of the half-width because when the robot rotates,
+# its corners extend further out than its sides — half-width was clipping
+# goal bodies on diagonal headings.
+_NAV_MARGIN: float = (ROBOT_W * math.sqrt(2) / 2) + 1.0   # ≈ 11.6"
 
 # ---- Goal obstacle definitions for line-of-sight occlusion ----------------
 # Long goal AABBs [x_lo, x_hi, y_lo, y_hi]
@@ -205,7 +208,14 @@ def _score_ball(obj, on_field_objs: list) -> float:
 
     Returns -1.0 if the ball should be skipped entirely.
     Higher score = higher priority.
+
+    Blue-alliance allies never route to red balls — the intake refuses
+    them anyway, so targeting them just wastes a decision.
     """
+    # Rule 0: reject wrong-color balls — allies (blue) only collect blue
+    if obj.color != BALL_BLUE:
+        return -1.0
+
     x, y = obj.x, obj.y
     nw = _near_wall_count(x, y)
 
@@ -219,28 +229,19 @@ def _score_ball(obj, on_field_objs: list) -> float:
 
     same, opp = _cluster_counts(obj, on_field_objs)
 
-    # Rule 2: our-color (blue) clusters
-    if obj.color == BALL_BLUE:
-        if same >= 3:
-            base = 12.0 + same     # big cluster — top priority
-        elif same >= 1:
-            base = 8.0 + same      # small cluster
-        else:
-            # Rule 4: single ball
-            if opp == 0:
-                base = 5.0         # isolated
-            elif opp == 1:
-                base = 3.5         # one opponent ball nearby
-            else:
-                base = 0.5         # surrounded — low value
+    # Rule 2: blue clusters
+    if same >= 3:
+        base = 12.0 + same     # big cluster — top priority
+    elif same >= 1:
+        base = 8.0 + same      # small cluster
     else:
-        # Red ball scoring
-        if same >= 2:
-            base = 4.0
-        elif opp <= 1:
-            base = 2.0
+        # Rule 4: single ball
+        if opp == 0:
+            base = 5.0         # isolated
+        elif opp == 1:
+            base = 3.5         # one opponent ball nearby
         else:
-            base = 0.5
+            base = 0.5         # surrounded — low value
 
     # Rule 3: reduce priority for balls against one wall
     if nw == 1:

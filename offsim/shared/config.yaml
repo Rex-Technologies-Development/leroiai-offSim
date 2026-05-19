@@ -5,12 +5,12 @@
 actions:
   0: COLLECT_NEAREST_BALL
   1: SCORE_LONG_GOAL
-  2: SCORE_CENTER_GOAL
-  3: DESCORE_OPP_LONG
-  4: DESCORE_CENTER
-  5: DEFEND_ZONE
-  6: MOVE_TO_REGION_A
-  7: MOVE_TO_REGION_B
+  2: SCORE_CENTER_MID
+  3: SCORE_CENTER_LOW
+  4: DESCORE_OPP_LONG
+  5: DESCORE_CENTER
+  6: DEFEND_ZONE
+  7: EJECT_WRONG_COLOR
   8: IDLE
 
 num_actions: 9
@@ -35,7 +35,7 @@ state:
 robot:
   width: 15.00       # inches (top-down square footprint)
   height: 15.00      # inches
-  max_speed: 30.00   # inches per second
+  max_speed: 16.00   # inches per second
   turn_rate: 3.14    # radians per second (~180 deg/s)
   collect_range: 8.00   # inches — how close to pick up a ball
-  score_range: 10.00    # inches — how close to a goal to score
+  score_range: 12.00    # inches — how close to a goal to score (bumped from 10 to accommodate wider center approach gap)

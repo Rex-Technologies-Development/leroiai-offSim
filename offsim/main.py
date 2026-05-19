@@ -112,7 +112,8 @@ def cmd_demo(args):
             ])
         else:
             demo_actions = [int(Action.COLLECT_NEAREST_BALL), int(Action.SCORE_LONG_GOAL),
-                            int(Action.SCORE_CENTER_GOAL), int(Action.IDLE)]
+                            int(Action.SCORE_CENTER_MID), int(Action.SCORE_CENTER_LOW),
+                            int(Action.IDLE)]
             actions = np.array([rng.choice(demo_actions) for _ in range(2)])
 
         obs, rewards, done, _, _ = env.step(actions)
@@ -141,6 +142,8 @@ def cmd_train(args):
         eval_freq=args.eval_freq,
         output_dir=args.output_dir,
         resume=args.resume,
+        render=args.render,
+        device=args.device,
     )
 
 
@@ -160,13 +163,52 @@ def cmd_train_offline(args):
     )
 
 
+def _resolve_model_path(arg: str, output_dir: str = "models") -> str:
+    """Resolve --model arg. If 'latest', pick the freshest known model.
+
+    Search order (newest first):
+      1. models/interrupted_model.zip   (Ctrl+C save)
+      2. models/final_model.zip         (completed training)
+      3. models/checkpoints/*.zip       (most recent checkpoint by mtime)
+      4. models/best/best_model.zip     (best by eval reward)
+    """
+    import glob
+    if arg != "latest":
+        return arg
+
+    candidates = []
+    for path in [
+        os.path.join(output_dir, "interrupted_model.zip"),
+        os.path.join(output_dir, "final_model.zip"),
+    ]:
+        if os.path.exists(path):
+            candidates.append((os.path.getmtime(path), path))
+    ckpts = sorted(
+        glob.glob(os.path.join(output_dir, "checkpoints", "*.zip")),
+        key=os.path.getmtime, reverse=True,
+    )
+    if ckpts:
+        candidates.append((os.path.getmtime(ckpts[0]), ckpts[0]))
+    best = os.path.join(output_dir, "best", "best_model.zip")
+    if os.path.exists(best):
+        candidates.append((os.path.getmtime(best), best))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No models found under {output_dir}/. Train a model first with "
+            f"`python offsim/main.py train` or pass an explicit --model path."
+        )
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 def cmd_eval(args):
-    """Evaluate a trained policy."""
+    """Evaluate a trained single-agent policy."""
     from stable_baselines3 import PPO
-    from sim.env import VexAIEnv
-    from sim.config import NUM_ACTIONS
+    from sim.env import SingleAgentWrapper
     from sim.failure import FailureConfig
 
+    model_path = _resolve_model_path(args.model)
     failure_config = FailureConfig(
         teammate_fail_rate=args.failure_rate,
         object_stolen_rate=args.failure_rate * 0.5,
@@ -175,14 +217,29 @@ def cmd_eval(args):
     )
 
     render_mode = "human" if args.render else None
-    env = VexAIEnv(
+    env = SingleAgentWrapper(
         render_mode=render_mode,
         failure_config=failure_config,
         opponent_type=args.opponent,
+        num_allies=1,
+        num_opponents=0,
+        use_timer=True,
     )
+    if render_mode:
+        env.render()
 
-    print(f"Loading model from {args.model}...")
-    model = PPO.load(args.model)
+    print(f"Loading model from {model_path}...")
+    try:
+        model = PPO.load(model_path)
+    except ValueError as e:
+        if "Observation spaces do not match" in str(e):
+            print(f"\n[!] Observation-space mismatch loading {model_path}.")
+            print(f"    Current env expects shape={env.observation_space.shape}.")
+            print(f"    This model was likely trained before the alliance-color")
+            print(f"    flag was added (STATE_DIM 331 → 332). Retrain from scratch:")
+            print(f"      python offsim/main.py train --timesteps 200000")
+            raise SystemExit(1)
+        raise
 
     wins, losses, ties = 0, 0, 0
     all_rewards, all_scores, all_opp = [], [], []
@@ -193,30 +250,30 @@ def cmd_eval(args):
         ep_reward = 0.0
 
         while not done:
-            flat_obs = np.concatenate([obs["robot_0"], obs["robot_1"]])
-            action, _ = model.predict(flat_obs, deterministic=True)
-            a0, a1 = action // NUM_ACTIONS, action % NUM_ACTIONS
-            obs, rewards, done, _, _ = env.step(np.array([a0, a1]))
-            ep_reward += rewards[0] + rewards[1]
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, _, _ = env.step(int(action))
+            ep_reward += float(reward)
 
             if render_mode:
                 env.render()
-                if env._renderer and env._renderer.paused:
-                    while env._renderer.paused and not env._renderer.step_once:
-                        env._renderer.handle_events()
-                    env._renderer.step_once = False
+                renderer = env.env._renderer
+                if renderer and renderer.paused:
+                    while renderer.paused and not renderer.step_once:
+                        renderer.handle_events()
+                    renderer.step_once = False
 
-        diff = env.field.my_score - env.field.opponent_score
+        inner_field = env.env.field
+        diff = inner_field.my_score - inner_field.opponent_score
         result = "WIN" if diff > 0 else ("LOSS" if diff < 0 else "TIE")
         if diff > 0: wins += 1
         elif diff < 0: losses += 1
         else: ties += 1
 
         all_rewards.append(ep_reward)
-        all_scores.append(env.field.my_score)
-        all_opp.append(env.field.opponent_score)
+        all_scores.append(inner_field.my_score)
+        all_opp.append(inner_field.opponent_score)
 
-        print(f"  Ep {ep+1:3d}: Us={env.field.my_score:3d} Opp={env.field.opponent_score:3d} "
+        print(f"  Ep {ep+1:3d}: Us={inner_field.my_score:3d} Opp={inner_field.opponent_score:3d} "
               f"Reward={ep_reward:7.1f} {result}")
 
     print(f"\n{'='*50}")
@@ -263,14 +320,21 @@ def main():
     p.set_defaults(func=cmd_demo)
 
     # --- train ---
-    p = sub.add_parser("train", help="PPO training in sim")
-    p.add_argument("--timesteps", type=int, default=2_000_000)
+    p = sub.add_parser("train", help="PPO training — 1 robot, 60s episodes")
+    p.add_argument("--timesteps", type=int, default=1_000_000)
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--checkpoint-freq", type=int, default=50_000)
+    p.add_argument("--checkpoint-freq", type=int, default=10_000,
+                   help="Save a checkpoint every N timesteps (default: 10000)")
     p.add_argument("--eval-freq", type=int, default=25_000)
     p.add_argument("--output-dir", default="models")
     p.add_argument("--resume", default=None, help="Resume from checkpoint path")
+    p.add_argument("--render", action="store_true",
+                   help="Show the pygame window while training (forces n_envs=1).")
+    p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
+                   help="PyTorch device for PPO. 'auto' uses CUDA if available "
+                        "(default: auto). Note: for this workload, env stepping "
+                        "is the bottleneck so CUDA only gives a modest speedup.")
     p.set_defaults(func=cmd_train)
 
     # --- train-offline ---
@@ -289,12 +353,17 @@ def main():
 
     # --- eval ---
     p = sub.add_parser("eval", help="Evaluate trained policy")
-    p.add_argument("--model", required=True, help="SB3 model path")
-    p.add_argument("--episodes", type=int, default=100)
-    p.add_argument("--render", action="store_true")
-    p.add_argument("--failure-rate", type=float, default=0.2)
+    p.add_argument("--model", default="latest",
+                   help="SB3 model path, or 'latest' to auto-pick the freshest "
+                        "from models/ (default: latest)")
+    p.add_argument("--episodes", type=int, default=1,
+                   help="Number of matches to play (default: 1)")
+    p.add_argument("--render", action="store_true",
+                   help="Show the match in the pygame window")
+    p.add_argument("--failure-rate", type=float, default=0.0,
+                   help="Failure-injection rate during eval (default: 0.0)")
     p.add_argument("--teammate-offline", type=float, default=0.0)
-    p.add_argument("--opponent", default="mixed",
+    p.add_argument("--opponent", default="random",
                    choices=["random", "greedy", "defensive", "mixed"])
     p.set_defaults(func=cmd_eval)
 

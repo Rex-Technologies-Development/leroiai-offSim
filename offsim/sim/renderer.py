@@ -57,7 +57,7 @@ FIELD_PY = int(FIELD_H * SCALE)   # 864
 HUD_H    = 60
 PANEL_W  = 420
 SCREEN_W = FIELD_PX + PANEL_W     # 1284
-SCREEN_H = FIELD_PY + HUD_H       # 924
+SCREEN_H = FIELD_PY + HUD_H + 376 # 1300 — tall enough for full training panel
 
 BTN_W = 144
 BTN_H = 28
@@ -156,6 +156,8 @@ class PygameRenderer:
 
         self.render_every       = render_every
         self.paused             = True        # start paused — press Space or click STEP
+        # Set by training callbacks; if non-empty, shows TRAINING panel section.
+        self.training_stats: dict = {}
         self.show_heatmap       = False
         self.highlight_robot    = -1
         self.sim_speed          = 1.0
@@ -166,12 +168,13 @@ class PygameRenderer:
         self._click_this_frame  = None    # set once per frame from MOUSEBUTTONDOWN event
 
         # WASD manual control
-        self.wasd_mode      = False
-        self.wasd_robot_idx = 0       # which robot is driven (0 or 1)
-        self.wasd_fwd       = 0       # -1=reverse, 0=stop, +1=forward
-        self.wasd_turn      = 0       # -1=left(A), 0=none, +1=right(D)
-        self.wasd_intake_on = False   # I toggles intake on/off
-        self.wasd_score_on  = False   # F toggles scoring on/off
+        self.wasd_mode           = False
+        self.wasd_robot_idx      = 0       # which robot is driven (0 or 1)
+        self.wasd_fwd            = 0       # -1=reverse, 0=stop, +1=forward
+        self.wasd_turn           = 0       # -1=left(A), 0=none, +1=right(D)
+        self.wasd_intake_on      = False   # I toggles intake on/off
+        self.wasd_score_on       = False   # F toggles scoring on/off
+        self.queued_manual_action: int | None = None  # set by clicking an action button
 
         # State editor
         self.selected_ball = -1           # index into field.objects, -1 = none
@@ -1051,6 +1054,19 @@ class PygameRenderer:
 
         if self.setup_mode:
             self._draw_panel_setup(env, mouse)
+        elif self.training_stats:
+            # Training mode: compact info — no step/tool buttons
+            y = self._draw_panel_timer(env, y_start=8)
+            y = self._draw_panel_section("TRAINING", y + 8)
+            y = self._draw_panel_training(env, y)
+            y = self._draw_panel_section("PPO STATS", y + 8)
+            y = self._draw_panel_ppo_stats(y)
+            y = self._draw_panel_section("SCOREBOARD", y + 8)
+            y = self._draw_panel_scoreboard(env, y)
+            y = self._draw_panel_section("ROBOTS", y + 8)
+            y = self._draw_panel_robots(env, y)
+            y = self._draw_panel_section("GOALS", y + 8)
+            self._draw_panel_goals(env, y)
         else:
             y = self._draw_panel_step_btn(env, y_start=8, mouse=mouse)
             y = self._draw_panel_timer(env, y + 6)
@@ -1060,10 +1076,148 @@ class PygameRenderer:
             y = self._draw_panel_robots(env, y)
             y = self._draw_panel_section("GOALS", y + 8)
             y = self._draw_panel_goals(env, y)
+            if self.wasd_mode:
+                y = self._draw_panel_section("ACTIONS", y + 8)
+                y = self._draw_panel_wasd_actions(env, y, mouse)
             y = self._draw_panel_section("TOOLS", y + 8)
             y = self._draw_panel_editor(env, y, mouse)
             y = self._draw_panel_section("KEYS", y + 8)
             self._draw_panel_controls(y)
+
+    def _draw_panel_training(self, env, y_start: int) -> int:
+        """Compact training-status block — shown when renderer.training_stats is set."""
+        y  = y_start
+        px = FIELD_PX + 10
+        bw = PANEL_W - 20
+        s  = self.training_stats
+
+        t_rem = max(0.0, env.field.time_remaining)
+        lines = [
+            ("Steps",    f"{s.get('total_steps', 0):,}"),
+            ("Episode",  str(s.get("n_episodes", 0))),
+            ("Time left", f"{t_rem:.1f}s"),
+            ("Ep reward",f"{s.get('ep_reward', 0.0):+.1f}"),
+            ("Ep score", f"Us {s.get('ep_blue', 0):.0f}  Opp {s.get('ep_red', 0):.0f}"),
+            ("Last act", s.get("last_action", "—")),
+        ]
+
+        for key, val in lines:
+            k_surf = self.font_sm.render(f"{key}:", True, LIGHT_GRAY)
+            v_surf = self.font_sm.render(val,       True, WHITE)
+            self.screen.blit(k_surf, (px, y))
+            self.screen.blit(v_surf, (px + 80, y))
+            y += 14
+
+        # Mini reward bar (last ep reward normalised to ±20)
+        ep_r   = float(s.get("ep_reward", 0.0))
+        bar_w  = bw - 4
+        bar_bg = pygame.Rect(px, y + 2, bar_w, 8)
+        pygame.draw.rect(self.screen, (35, 35, 50), bar_bg, border_radius=2)
+        fill = int(bar_w * max(0.0, min(1.0, (ep_r + 20.0) / 40.0)))
+        col  = GREEN if ep_r >= 0 else LIGHT_RED
+        if fill > 0:
+            pygame.draw.rect(self.screen, col,
+                             pygame.Rect(px, y + 2, fill, 8), border_radius=2)
+        pygame.draw.rect(self.screen, LIGHT_GRAY, bar_bg, 1, border_radius=2)
+        self.screen.blit(self.font_sm.render("−20", True, (70, 70, 80)), (px,        y + 12))
+        self.screen.blit(self.font_sm.render("0",   True, (70, 70, 80)), (px + bar_w//2 - 4, y + 12))
+        self.screen.blit(self.font_sm.render("+20", True, (70, 70, 80)), (px + bar_w - 24, y + 12))
+        y += 26
+
+        # ── Reward breakdown for the most recent decision ──
+        breakdown = s.get("reward_breakdown") or {}
+        if breakdown:
+            y += 4
+            hdr = self.font_sm.render("Reward components (last step):", True, ACCENT)
+            self.screen.blit(hdr, (px, y))
+            y += 14
+            # Sort: non-zero first by absolute value descending, then zeros at the bottom
+            items = sorted(breakdown.items(),
+                           key=lambda kv: (kv[1] == 0.0, -abs(kv[1])))
+            for key, val in items:
+                col = WHITE if val == 0.0 else (GREEN if val > 0 else LIGHT_RED)
+                k_surf = self.font_sm.render(f"  {key}", True, LIGHT_GRAY)
+                v_surf = self.font_sm.render(f"{val:+.2f}", True, col)
+                self.screen.blit(k_surf, (px, y))
+                self.screen.blit(v_surf, (px + bw - v_surf.get_width(), y))
+                y += 12
+            total = sum(breakdown.values())
+            total_col = GREEN if total >= 0 else LIGHT_RED
+            t_surf = self.font_sm.render(f"  total", True, ACCENT)
+            v_surf = self.font_sm.render(f"{total:+.2f}", True, total_col)
+            self.screen.blit(t_surf, (px, y + 2))
+            self.screen.blit(v_surf, (px + bw - v_surf.get_width(), y + 2))
+            y += 16
+
+        # ── Static reward weights (formula constants) ──
+        weights = s.get("reward_weights") or {}
+        if weights:
+            y += 4
+            hdr = self.font_sm.render("Reward weights (formula):", True, ACCENT)
+            self.screen.blit(hdr, (px, y))
+            y += 14
+            for key, val in weights.items():
+                col = GREEN if val > 0 else (LIGHT_RED if val < 0 else WHITE)
+                k_surf = self.font_sm.render(f"  {key}", True, LIGHT_GRAY)
+                v_surf = self.font_sm.render(f"{val:+.3f}", True, col)
+                self.screen.blit(k_surf, (px, y))
+                self.screen.blit(v_surf, (px + bw - v_surf.get_width(), y))
+                y += 12
+            y += 4
+
+        return y
+
+    def _draw_panel_ppo_stats(self, y_start: int) -> int:
+        """Dedicated PPO training-stats section — shown only during training."""
+        ppo = (self.training_stats or {}).get("ppo_stats") or {}
+        px  = FIELD_PX + 10
+        bw  = PANEL_W - 20
+        y   = y_start
+
+        def _fmt(v, fmt):
+            if v is None:
+                return "—"
+            try:
+                if math.isnan(v):
+                    return "—"
+            except TypeError:
+                pass
+            return f"{v:{fmt}}"
+
+        def _row(label, key, fmt, *, warn_hi=None, warn_lo=None):
+            nonlocal y
+            raw = ppo.get(key)
+            txt = _fmt(raw, fmt)
+            if raw is not None and not (isinstance(raw, float) and math.isnan(raw)):
+                if   warn_hi is not None and raw > warn_hi: col = ORANGE
+                elif warn_lo is not None and raw < warn_lo: col = LIGHT_RED
+                else:                                        col = WHITE
+            else:
+                col = LIGHT_GRAY
+            self.screen.blit(self.font_sm.render(f"  {label}", True, LIGHT_GRAY), (px, y))
+            v_surf = self.font_sm.render(txt, True, col)
+            self.screen.blit(v_surf, (px + bw - v_surf.get_width(), y))
+            y += 13
+
+        if not ppo:
+            self.screen.blit(
+                self.font_sm.render("  (waiting for first rollout...)", True, LIGHT_GRAY),
+                (px, y),
+            )
+            return y + 14
+
+        _row("approx_kl",     "approx_kl",     ".5f", warn_hi=0.03)
+        _row("clip_fraction", "clip_fraction",  ".4f", warn_hi=0.4)
+        _row("clip_range",    "clip_range",     ".3f")
+        _row("entropy_loss",  "entropy_loss",   ".4f")
+        _row("expl_variance", "expl_variance",  ".4f", warn_lo=0.3)
+        _row("learning_rate", "learning_rate",  ".6f")
+        _row("loss",          "loss",           ".4f")
+        _row("pg_loss",       "pg_loss",        ".5f")
+        _row("value_loss",    "value_loss",     ".3f")
+        _row("fps",           "fps",            ".0f", warn_lo=10)
+        _row("n_updates",     "n_updates",      ".0f")
+        return y + 4
 
     def _draw_panel_setup(self, env, mouse) -> None:
         """Full-panel UI for setup mode: place robots + balls, then Confirm."""
@@ -1790,6 +1944,50 @@ class PygameRenderer:
         brush_col = LIGHT_RED if self.brush_color == BALL_RED else LIGHT_BLUE
         self.screen.blit(self.font_sm.render("RClick on field to add ball", True, brush_col), (px, y))
         y += 14
+
+        return y
+
+    def _draw_panel_wasd_actions(self, env, y_start: int, mouse) -> int:
+        """Clickable RL action buttons for WASD manual testing mode."""
+        from sim.config import Action as _Action
+        px = FIELD_PX + 10
+        bw = PANEL_W - 20
+        y  = y_start
+
+        running_act = getattr(env, "_manual_rl_action", None)
+
+        _ACTIONS = [
+            (_Action.COLLECT_NEAREST_BALL, "COLLECT NEAREST BLUE"),
+            (_Action.SCORE_LONG_GOAL,      "SCORE LONG GOAL"),
+            (_Action.SCORE_CENTER_MID,     "SCORE CENTER MID"),
+            (_Action.SCORE_CENTER_LOW,     "SCORE CENTER LOW"),
+            (_Action.DESCORE_OPP_LONG,     "DESCORE OPP LONG"),
+            (_Action.DESCORE_CENTER,       "DESCORE CENTER"),
+            (_Action.DEFEND_ZONE,          "DEFEND ZONE"),
+            (_Action.EJECT_WRONG_COLOR,    "EJECT WRONG COLOR"),
+            (_Action.IDLE,                 "IDLE"),
+        ]
+
+        for act, label in _ACTIONS:
+            rect = pygame.Rect(px, y, bw, 22)
+            is_running = (running_act == int(act))
+            col = GREEN if is_running else None
+            self._draw_btn(rect, label, active=True, color_override=col, mouse=mouse)
+            if self._click_this_frame and rect.collidepoint(self._click_this_frame):
+                self.queued_manual_action = int(act)
+                self._click_this_frame = None   # consume the click
+            y += 26
+
+        # Status line: show remaining ticks if an action is running
+        ticks_left = getattr(env, "_manual_rl_ticks_left", 0)
+        if running_act is not None:
+            status = f"Running... {ticks_left} ticks left"
+            col = GREEN
+        else:
+            status = "Click an action to test it"
+            col = LIGHT_GRAY
+        self.screen.blit(self.font_sm.render(status, True, col), (px, y))
+        y += 16
 
         return y
 
