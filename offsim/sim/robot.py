@@ -23,6 +23,11 @@ from sim.config import (
 ACCEL = 150.0   # in/s² — ramp-up rate
 DECEL = 280.0   # in/s² — braking rate (stronger so stops feel snappy)
 
+# Treat a target as reached when we're within this distance (inches).
+# 0.5" was too strict for the arc + rounding model and could cause orbiting
+# around waypoints (never popping the waypoint queue).
+ARRIVAL_DIST = 2.0
+
 
 class Robot:
     """A single robot on the field."""
@@ -78,13 +83,13 @@ class Robot:
           3. Ramp self.speed toward target speed at ACCEL / DECEL rates.
           4. Move forward at self.speed.
 
-        Returns True when within 0.5 in of target.
+        Returns True when within ARRIVAL_DIST inches of target.
         """
         self.target = target.copy()
         diff = target - self.position
         dist = float(np.linalg.norm(diff))
 
-        if dist < 0.50:
+        if dist < ARRIVAL_DIST:
             self.moving = False
             self.speed  = 0.0
             return True
@@ -129,7 +134,7 @@ class Robot:
             self.position = self.position + forward * max_move
 
         self._clamp_to_field()
-        return float(np.linalg.norm(target - self.position)) < 0.50
+        return float(np.linalg.norm(target - self.position)) < ARRIVAL_DIST
 
     def _clamp_to_field(self):
         half = self.half_w

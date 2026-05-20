@@ -66,8 +66,11 @@ REWARD_WEIGHTS: dict[str, float] = {
     "margin_milestone_20":  +10.0,   # one-time at margin ≥ 20 with > 25% time left
     # ── Episode end — DOMINANT signal so the outcome matters ────────────
     "episode_end_win":      +20.0,
-    "episode_end_tie":      +0.0,
+    # Penalize ties so the agent learns it must *score* (and not settle).
+    "episode_end_tie":      -5.0,
     "episode_end_loss":     -15.0,
+    # Extra penalty when we ended with *zero* scoring points.
+    "episode_end_zero":     -10.0,
     "margin_curve":         +15.0,   # sigmoid amplitude on top of win/loss base
 }
 
@@ -251,8 +254,12 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
                 (abs(diff) - _MARGIN_CURVE_CENTER) / _MARGIN_CURVE_SLOPE
             )
             comps["episode_end"] = w["episode_end_loss"] - margin_pen
+
+        # If we never scored any points, add an extra penalty.
+        comps["episode_end_zero"] = w["episode_end_zero"] if env.field.my_score <= 0 else 0.0
     else:
         comps["episode_end"] = 0.0
+        comps["episode_end_zero"] = 0.0
 
     return comps
 

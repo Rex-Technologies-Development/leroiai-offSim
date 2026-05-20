@@ -144,6 +144,7 @@ def cmd_train(args):
         lr=args.lr,
         checkpoint_freq=args.checkpoint_freq,
         eval_freq=args.eval_freq,
+        eval_episodes=args.eval_episodes,
         output_dir=args.output_dir,
         resume=resume_path,
         render=args.render,
@@ -357,6 +358,8 @@ def main():
     p.add_argument("--checkpoint-freq", type=int, default=10_000,
                    help="Save a checkpoint every N timesteps (default: 10000)")
     p.add_argument("--eval-freq", type=int, default=25_000)
+    p.add_argument("--eval-episodes", type=int, default=10,
+                   help="Number of episodes per evaluation run (default: 10)")
     p.add_argument("--output-dir", default="models")
     p.add_argument("--resume", default=None, help="Resume from checkpoint path")
     # Quality-of-life: allow continuing from the freshest known model.

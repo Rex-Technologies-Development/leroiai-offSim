@@ -29,6 +29,7 @@ from sim.config import (
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
+    SCORE_RANGE,
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
     CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE, MAX_SPEED,
     BALL_BLUE, BALL_RED,
@@ -61,12 +62,13 @@ _ARM_HW   = CENTER_GOAL_ARM_W / 2  # half-width across arm
 # ---------------------------------------------------------------------------
 # Scoring geometry — robot backs into each goal end so the BACK feeds the goal.
 # ---------------------------------------------------------------------------
-# Distance from goal opening to robot center when scoring (half robot + clearance)
-_SCORE_APPROACH_GAP = ROBOT_W / 2 + 2.0   # ≈ 9.5" — long goals
-# Center arms use a wider gap because the arm bumper margin (_CENTER_GOAL_MARGIN
-# = 10") would push the robot away from a tighter approach. Bumped to 11" so
-# the approach sits just outside the bumper.
-_CENTER_APPROACH_GAP = ROBOT_W / 2 + 3.5  # ≈ 11.0" — center arms
+# Distance from goal opening to robot center when scoring.
+# NOTE: This MUST remain < SCORE_RANGE, or scoring will never fire.
+# We keep a small safety margin so collision resolution jitter doesn't
+# kick the robot out of scoring range right at the threshold.
+_APPROACH_SAFETY = 0.75
+_SCORE_APPROACH_GAP = min(ROBOT_W / 2 + 4.0, SCORE_RANGE - _APPROACH_SAFETY)   # long goals
+_CENTER_APPROACH_GAP = min(ROBOT_W / 2 + 4.5, SCORE_RANGE - _APPROACH_SAFETY)  # center X arms
 
 # Long goal scoring positions (top end and bottom end of each vertical goal).
 # Robot center sits beyond the open end; back faces into the goal.
@@ -204,14 +206,35 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
     if float(np.linalg.norm(final - start)) < 0.75:
         return [final]
 
-    # ── Long-goal scoring approach: force an intermediate waypoint ──────────
-    # Approaching the long-goal score point diagonally often causes the robot
-    # to clip the long-goal collision AABB and get pushed away, never reaching
-    # the precise scoring pose.  For SCORE_LONG_GOAL, the `final` point is the
-    # approach/score position just outside the long goal end.  We insert a
-    # staging point at the SAME y as `final`, but at a safe x inside the field
-    # (right/left corridor). The last leg becomes horizontal, staying outside
-    # the goal AABB in y, so the robot doesn't get bumped while closing.
+    # ── Center-goal scoring approach: force 2 intermediate waypoints ───────
+    # The generic LOS planner treats the center X arms as hard obstacles (with
+    # a large navigation margin). For scoring, we *must* be able to approach a
+    # tip even though the segment naturally intersects that geometry.
+    # We therefore route via two safe corridor points, then allow a final leg
+    # into the score pose.
+    center_score_targets = (_MID_NE_POS, _MID_NW_POS, _LOW_SE_POS, _LOW_SW_POS)
+    if min(float(np.linalg.norm(final - t)) for t in center_score_targets) < 2.0:
+        pre = _NAV_ABOVE_X if float(final[1]) >= _CY else _NAV_BELOW_X
+        if float(final[0]) >= _CX:
+            corridor = _NAV_RIGHT_HIGH if float(final[1]) >= _CY else _NAV_RIGHT_LOW
+        else:
+            corridor = _NAV_LEFT_HIGH if float(final[1]) >= _CY else _NAV_LEFT_LOW
+
+        legs: list[np.ndarray] = []
+        for p in (pre, corridor, final):
+            if not legs or float(np.linalg.norm(p - legs[-1])) > 0.75:
+                # Skip if we're already basically at this waypoint
+                if float(np.linalg.norm(p - start)) > 0.75:
+                    legs.append(p.copy())
+        if not legs:
+            return [final]
+        # Always end exactly at final
+        if float(np.linalg.norm(legs[-1] - final)) > 1e-6:
+            legs.append(final)
+        return legs
+
+    # ── Long-goal scoring approach: force 2 intermediate waypoints ──────────
+    # Layout: start → (optional center) → corridor → stage → final
     is_right_long = abs(float(final[0] - _RIGHT_GOAL_CX)) < 6.0 and (
         float(final[1]) > LONG_GOAL_Y_MAX or float(final[1]) < LONG_GOAL_Y_MIN
     )
@@ -219,53 +242,37 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
         float(final[1]) > LONG_GOAL_Y_MAX or float(final[1]) < LONG_GOAL_Y_MIN
     )
     if is_right_long or is_left_long:
-        corridor_x = 95.0 if is_right_long else 49.0
-        stage = np.array([corridor_x, float(final[1])], dtype=np.float64)
+        is_top = float(final[1]) > LONG_GOAL_Y_MAX
+        corridor = (_NAV_RIGHT_HIGH if is_top else _NAV_RIGHT_LOW).copy() \
+            if is_right_long else \
+            (_NAV_LEFT_HIGH if is_top else _NAV_LEFT_LOW).copy()
+        # If the direct path to this corridor is blocked by the center X,
+        # route via the OTHER corridor on the same side (high↔low) to go
+        # around the X rather than trying to cut through its expanded margin.
+        go_around = (_NAV_RIGHT_LOW if is_top else _NAV_RIGHT_HIGH).copy() \
+            if is_right_long else \
+            (_NAV_LEFT_LOW if is_top else _NAV_LEFT_HIGH).copy()
+        stage = np.array([float(corridor[0]), float(final[1])], dtype=np.float64)
 
-        # If start → stage is blocked (usually by the center X arms), route via
-        # the standard corridor points (and center if needed).
-        if _los_blocked(start[0], start[1], stage[0], stage[1], margin=_NAV_MARGIN):
-            use_low = (start[1] + stage[1]) / 2.0 <= 72.0
-            corridor = (_NAV_RIGHT_LOW if use_low else _NAV_RIGHT_HIGH).copy() \
-                if is_right_long else \
-                (_NAV_LEFT_LOW if use_low else _NAV_LEFT_HIGH).copy()
-            legs: list[np.ndarray] = []
-            if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
-                center = _NAV_BELOW_X if start[1] <= 72.0 else _NAV_ABOVE_X
-                legs.append(center.copy())
-            legs.append(corridor.copy())
-            legs.append(stage)
-            legs.append(final)
-            return legs
-
-        return [stage, final]
+        legs: list[np.ndarray] = []
+        if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
+            legs.append(go_around)
+        legs.append(corridor)
+        legs.append(stage)
+        legs.append(final)
+        # Compact duplicates / near-zero legs
+        compact: list[np.ndarray] = []
+        for p in legs:
+            if not compact or float(np.linalg.norm(p - compact[-1])) > 0.75:
+                compact.append(p)
+        return compact
 
     # Direct path (most common for collect actions)
     if not _los_blocked(start[0], start[1], final[0], final[1], margin=_NAV_MARGIN):
         return [final]
 
-    # ── Long-goal end approach: two-stage path via staging point ──────────────
-    # The staging point is on the same x-axis as the goal centre (column approach)
-    # so the robot lines up heading before the last short leg into the approach pos.
-    for stage, corridor, goal_cx in [
-        (_STAGE_R_TOP, _NAV_RIGHT_HIGH, _RIGHT_GOAL_CX),  # right goal, top
-        (_STAGE_R_BOT, _NAV_RIGHT_LOW,  _RIGHT_GOAL_CX),  # right goal, bottom
-        (_STAGE_L_TOP, _NAV_LEFT_HIGH,  _LEFT_GOAL_CX),   # left goal,  top
-        (_STAGE_L_BOT, _NAV_LEFT_LOW,   _LEFT_GOAL_CX),   # left goal,  bottom
-    ]:
-        # Is `final` the approach position for this goal end?
-        if abs(final[0] - goal_cx) < 6.0 and abs(final[1] - stage[1]) < 25.0:
-            # Build: start → corridor → staging → final
-            # Drop corridor if start is already on the right side
-            legs = []
-            if _los_blocked(start[0], start[1], stage[0], stage[1], margin=_NAV_MARGIN):
-                if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
-                    center = _NAV_BELOW_X if start[1] <= 72.0 else _NAV_ABOVE_X
-                    legs.append(center.copy())
-                legs.append(corridor.copy())
-            legs.append(stage.copy())
-            legs.append(final)
-            return legs
+    # NOTE: Long-goal scoring is handled by the block above. For non-scoring
+    # targets we keep using the generic LOS/detour planner below.
 
     # ── Generic corridor detour ────────────────────────────────────────────────
     use_low = (start[1] + final[1]) / 2.0 <= 72.0
@@ -566,6 +573,15 @@ class VexAIEnv(gym.Env):
         self.red_collected_this_step = np.zeros(2, dtype=np.int32)
         self.current_actions       = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
 
+        # Scoring target cache (per robot): locks the chosen goal END while a
+        # SCORE_* action is active, so the robot doesn't thrash between ends as
+        # its position changes (e.g., long-goal top vs bottom).
+        # Each entry: (action_int, score_pos, goal_pos, required_heading, gname)
+        self._score_target_cache: list[tuple[int, np.ndarray, np.ndarray, float, str] | None] = [None, None]
+        # Extra route hints used to build deterministic approach waypoints while scoring.
+        # For long-goal scoring: {"route_low": bool} selected when the score target is first chosen.
+        self._score_route_hint: list[dict[str, object] | None] = [None, None]
+
         # Scoring commitment: when the agent chooses a SCORE_* action, we hold it
         # for a couple of decisions so it can align + complete scoring instead
         # of thrashing to a different goal next decision.
@@ -634,6 +650,8 @@ class VexAIEnv(gym.Env):
         self.current_actions[:]      = Action.IDLE
         self._score_commit_left[:]   = 0
         self._score_committed_action[:] = Action.IDLE
+        self._score_target_cache = [None, None]
+        self._score_route_hint   = [None, None]
         self.expected_state_delta[:] = 0
         self.prev_predicted_score[:] = 0
         self.goal_bump_ticks[:]      = 0
@@ -690,6 +708,8 @@ class VexAIEnv(gym.Env):
         self.collected_this_step[:]     = 0
         self.red_collected_this_step[:] = 0
         self.current_actions[:]         = Action.IDLE
+        self._score_target_cache = [None, None]
+        self._score_route_hint   = [None, None]
         self.expected_state_delta[:]    = 0
         self.prev_predicted_score[:]    = 0
         self.goal_bump_ticks[:]         = 0
@@ -1092,6 +1112,15 @@ class VexAIEnv(gym.Env):
 
         self.current_actions = np.array([a0, a1], dtype=np.int32)
 
+        # Prime/clear scoring target caches for this decision.
+        for ridx in range(self.num_allies):
+            act_i = Action(self.current_actions[ridx])
+            robot = self.field.allies[ridx]
+            if act_i in SCORE_INTENTS and robot.balls_held > 0:
+                self._get_scoring_target(ridx, act_i)
+            else:
+                self._score_target_cache[ridx] = None
+
         # (Re)start scoring commitment when a score action is chosen.
         # Two modes:
         #  - until_empty: keep scoring intent until balls are emptied, with a timeout
@@ -1194,7 +1223,10 @@ class VexAIEnv(gym.Env):
             """
             robot  = self.field.allies[idx]
             act    = Action(live_actions[idx])
-            final  = _action_to_target(act, self.field, robot)
+            if act in SCORE_INTENTS and robot.balls_held > 0:
+                return self._build_scoring_waypoints(idx, act)
+            else:
+                final  = _action_to_target(act, self.field, robot)
             if final is None:
                 return []
             return _build_nav_waypoints(robot.position, final)
@@ -1236,12 +1268,7 @@ class VexAIEnv(gym.Env):
                     if scoring_dwell_left[i] > 0:
                         return True
                     if act_i in SCORE_INTENTS and robot.balls_held > 0:
-                        if act_i == Action.SCORE_LONG_GOAL:
-                            score_pos, *_ = _nearest_long_goal_target(robot)
-                        elif act_i == Action.SCORE_CENTER_MID:
-                            score_pos, *_ = _nearest_center_tip(robot, lower=False)
-                        else:  # Action.SCORE_CENTER_LOW
-                            score_pos, *_ = _nearest_center_tip(robot, lower=True)
+                        score_pos, *_ = self._get_scoring_target(i, act_i)
                         dist = float(np.linalg.norm(robot.position - score_pos))
                         # Keep sim running while we are close enough to be aligning/scoring.
                         return dist < (_SCORE_ARRIVAL_DIST * 2.0)
@@ -1322,9 +1349,35 @@ class VexAIEnv(gym.Env):
                 if self.action_pause_ticks[idx] > 0:
                     self.field.allies[idx].moving = False
                     continue
-                target = _current_target(idx)
+                robot = self.field.allies[idx]
+
+                # If we're close enough to a scoring pose, stop driving and let
+                # the scoring routine rotate-in-place + score. Without this,
+                # move_toward_point() keeps steering toward score_pos while the
+                # scoring code simultaneously steers toward required_heading,
+                # producing an orbiting/circling failure mode.
+                act_i = Action(live_actions[idx])
+                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) and robot.balls_held > 0:
+                    score_pos, goal_pos, *_ = self._get_scoring_target(idx, act_i)
+                    dist_to_score = float(np.linalg.norm(robot.position - score_pos))
+                    dist_to_goal  = float(np.linalg.norm(robot.position - goal_pos))
+
+                    # Blocking scoring behavior:
+                    # - Keep following the fixed scoring waypoint sequence until we're
+                    #   truly within scoring range of the goal reference point.
+                    # - Only then stop driving and let _do_back_in_scoring() rotate + score.
+                    if dist_to_score < _SCORE_ARRIVAL_DIST and dist_to_goal < (SCORE_RANGE - 0.25):
+                        ally_wq[idx].clear()
+                        robot.moving = False
+                        robot.speed = 0.0
+                        robot.target = None
+                        target = None
+                    else:
+                        target = _current_target(idx)
+                else:
+                    target = _current_target(idx)
                 if target is not None:
-                    arrived = self.field.allies[idx].move_toward_point(target)
+                    arrived = robot.move_toward_point(target)
                     if arrived and len(ally_wq[idx]) > 1:
                         ally_wq[idx].pop(0)      # advance to next waypoint
                     elif arrived:
@@ -1347,15 +1400,10 @@ class VexAIEnv(gym.Env):
                 # Start (or refresh) scoring dwell once the scoring pose is achieved.
                 # This is intentionally stricter than the generic "near" check: we
                 # only dwell after arrival AND heading alignment are both satisfied.
-                act_i = Action(live_actions[idx])
-                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) \
-                        and robot.balls_held > 0:
-                    if act_i == Action.SCORE_LONG_GOAL:
-                        score_pos, _, required_heading, _ = _nearest_long_goal_target(robot)
-                    elif act_i == Action.SCORE_CENTER_MID:
-                        score_pos, _, required_heading, _ = _nearest_center_tip(robot, lower=False)
-                    else:
-                        score_pos, _, required_heading, _ = _nearest_center_tip(robot, lower=True)
+                # Start (or refresh) scoring dwell once the scoring pose is achieved.
+                # Note: `robot` is the per-idx robot defined above.
+                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) and robot.balls_held > 0:
+                    score_pos, _, required_heading, _ = self._get_scoring_target(idx, act_i)
 
                     dist = float(np.linalg.norm(robot.position - score_pos))
                     aligned = abs(_wrap_angle(required_heading - robot.heading)) < _SCORE_HDG_TOL
@@ -1462,6 +1510,97 @@ class VexAIEnv(gym.Env):
     # ------------------------------------------------------------------
     # Effect checks (called each tick)
     # ------------------------------------------------------------------
+    def _get_scoring_target(
+        self,
+        idx: int,
+        action: Action,
+    ) -> tuple[np.ndarray, np.ndarray, float, str]:
+        """Return (score_pos, goal_pos, required_heading, gname) for a SCORE_* action.
+
+        The target is cached per robot while the scoring action is active so the
+        robot doesn't thrash between goal ends across decisions (e.g. long-goal
+        top vs bottom) as its position changes.
+        """
+        if idx >= self.num_allies:
+            raise IndexError(f"robot idx {idx} out of range")
+
+        robot = self.field.allies[idx]
+        if robot.balls_held <= 0:
+            self._score_target_cache[idx] = None
+
+        cached = self._score_target_cache[idx]
+        if cached is not None and cached[0] == int(action):
+            _, score_pos, goal_pos, required_heading, gname = cached
+            return score_pos, goal_pos, float(required_heading), gname
+
+        if action == Action.SCORE_LONG_GOAL:
+            score_pos, goal_pos, required_heading, gname = _nearest_long_goal_target(robot)
+            # Stable detour choice: route via the corridor that matches the
+            # chosen long-goal END. Top end → high corridor, bottom end → low.
+            self._score_route_hint[idx] = {"route_low": float(score_pos[1]) < _CY}
+        elif action == Action.SCORE_CENTER_MID:
+            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=False)
+            self._score_route_hint[idx] = None
+        elif action == Action.SCORE_CENTER_LOW:
+            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=True)
+            self._score_route_hint[idx] = None
+        else:
+            raise ValueError(f"Unsupported scoring action: {action}")
+
+        self._score_target_cache[idx] = (
+            int(action),
+            score_pos.copy(),
+            goal_pos.copy(),
+            float(required_heading),
+            str(gname),
+        )
+        return score_pos, goal_pos, float(required_heading), str(gname)
+
+    def _build_scoring_waypoints(self, idx: int, action: Action) -> list[np.ndarray]:
+        """Deterministic scoring approach waypoints.
+
+        We avoid dynamic LOS-based replanning for scoring because it can flip
+        between corridor variants as the robot moves, creating a stable orbit
+        and preventing scoring.
+
+        Returns an ordered waypoint list ending at score_pos.
+        """
+        robot = self.field.allies[idx]
+        score_pos, _, _, _ = self._get_scoring_target(idx, action)
+
+        def _compact(pts: list[np.ndarray]) -> list[np.ndarray]:
+            out: list[np.ndarray] = []
+            prev = robot.position
+            for p in pts:
+                if float(np.linalg.norm(p - prev)) <= 0.75:
+                    continue
+                if out and float(np.linalg.norm(p - out[-1])) <= 0.75:
+                    continue
+                out.append(p.copy())
+            return out
+
+        if action == Action.SCORE_LONG_GOAL:
+            hint = self._score_route_hint[idx] or {"route_low": float(robot.y) <= 72.0}
+            route_low = bool(hint.get("route_low", True))
+
+            is_right = float(score_pos[0]) > _CX
+            corridor = (_NAV_RIGHT_LOW if route_low else _NAV_RIGHT_HIGH).copy() \
+                if is_right else \
+                (_NAV_LEFT_LOW if route_low else _NAV_LEFT_HIGH).copy()
+            stage = np.array([float(corridor[0]), float(score_pos[1])], dtype=np.float64)
+            return _compact([corridor, stage, score_pos])
+
+        if action in (Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW):
+            pre = _NAV_ABOVE_X if float(score_pos[1]) >= _CY else _NAV_BELOW_X
+            if float(score_pos[0]) >= _CX:
+                corridor = _NAV_RIGHT_HIGH if float(score_pos[1]) >= _CY else _NAV_RIGHT_LOW
+            else:
+                corridor = _NAV_LEFT_HIGH if float(score_pos[1]) >= _CY else _NAV_LEFT_LOW
+            return _compact([pre.copy(), corridor.copy(), score_pos])
+
+        # Fallback (shouldn't happen)
+        return [score_pos]
+
     def _check_ally_effects(self, idx: int, action: Action):
         robot = self.field.allies[idx]
 
@@ -1477,7 +1616,7 @@ class VexAIEnv(gym.Env):
             if robot.balls_held <= 0:
                 robot.score_timer = 0.0
                 return
-            score_pos, goal_pos, required_heading, gname = _nearest_long_goal_target(robot)
+            score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
             self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
                                      required_heading, LONG_GOAL_POINTS)
 
@@ -1485,7 +1624,7 @@ class VexAIEnv(gym.Env):
             if robot.balls_held <= 0:
                 robot.score_timer = 0.0
                 return
-            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=False)
+            score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
             self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
                                      required_heading, CENTER_GOAL_POINTS)
 
@@ -1493,7 +1632,7 @@ class VexAIEnv(gym.Env):
             if robot.balls_held <= 0:
                 robot.score_timer = 0.0
                 return
-            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=True)
+            score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
             self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
                                      required_heading, CENTER_GOAL_POINTS)
 
@@ -1530,8 +1669,14 @@ class VexAIEnv(gym.Env):
         Robot arrives at score_pos, turns to required_heading (back faces goal),
         then scores one ball at a time on a timer.
         """
-        dist = float(np.linalg.norm(robot.position - score_pos))
-        if dist >= _SCORE_ARRIVAL_DIST:
+        dist_to_score = float(np.linalg.norm(robot.position - score_pos))
+        if dist_to_score >= _SCORE_ARRIVAL_DIST:
+            robot.score_timer = 0.0
+            return
+
+        # Even if we're near score_pos, scoring can only occur when we're within
+        # SCORE_RANGE of the goal reference point used by Field.try_score_one().
+        if float(np.linalg.norm(robot.position - goal_pos)) >= SCORE_RANGE:
             robot.score_timer = 0.0
             return
 

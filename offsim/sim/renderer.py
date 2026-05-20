@@ -23,6 +23,9 @@ Controls:
 
 from __future__ import annotations
 import math
+import subprocess
+import sys
+from pathlib import Path
 import numpy as np
 
 try:
@@ -167,6 +170,21 @@ class PygameRenderer:
         self.demo_score         = False   # when True: give robots balls, force SCORE actions
         self._click_this_frame  = None    # set once per frame from MOUSEBUTTONDOWN event
 
+        # Training launcher (spawns a separate `main.py train` process)
+        self.train_n_envs         = 1
+        self.train_timesteps      = 200_000
+        self.train_eval_episodes  = 10
+        self.train_render         = True
+        self._train_timesteps_opts = [
+            20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000, 2_000_000,
+        ]
+        self.train_proc: subprocess.Popen | None = None
+
+        # Simple numeric text input (used by TRAIN panel for timesteps)
+        self._input_focus: str | None = None          # e.g. "train_timesteps"
+        self._input_buffer: str = ""
+        self._train_timesteps_rect = pygame.Rect(0, 0, 1, 1)
+
         # WASD manual control
         self.wasd_mode           = False
         self.wasd_robot_idx      = 0       # which robot is driven (0 or 1)
@@ -231,6 +249,29 @@ class PygameRenderer:
                 raise SystemExit
 
             if event.type == pygame.KEYDOWN:
+                # If a panel text input is focused, handle it first and don't
+                # let global hotkeys (Space/S/etc.) interfere.
+                if self._input_focus == "train_timesteps":
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        digits = "".join(ch for ch in self._input_buffer if ch.isdigit())
+                        if digits:
+                            self.train_timesteps = max(1, int(digits))
+                        self._input_focus = None
+                        self._input_buffer = ""
+                        continue
+                    if event.key == pygame.K_ESCAPE:
+                        self._input_focus = None
+                        self._input_buffer = ""
+                        continue
+                    if event.key == pygame.K_BACKSPACE:
+                        self._input_buffer = self._input_buffer[:-1]
+                        continue
+
+                    # Accept digits and common separators.
+                    if event.unicode and (event.unicode.isdigit() or event.unicode in {",", "_", " "}):
+                        self._input_buffer += event.unicode
+                        continue
+
                 if event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                 elif event.key == pygame.K_s:
@@ -1070,6 +1111,8 @@ class PygameRenderer:
         else:
             y = self._draw_panel_step_btn(env, y_start=8, mouse=mouse)
             y = self._draw_panel_timer(env, y + 6)
+            y = self._draw_panel_section("TRAIN", y + 8)
+            y = self._draw_panel_train_launcher(y, mouse)
             y = self._draw_panel_section("SCOREBOARD", y + 8)
             y = self._draw_panel_scoreboard(env, y)
             y = self._draw_panel_section("ROBOTS", y + 8)
@@ -1083,6 +1126,215 @@ class PygameRenderer:
             y = self._draw_panel_editor(env, y, mouse)
             y = self._draw_panel_section("KEYS", y + 8)
             self._draw_panel_controls(y)
+
+    def _train_main_path(self) -> Path:
+        # renderer.py is offsim/sim/renderer.py → parents[1] is offsim/
+        return Path(__file__).resolve().parents[1] / "main.py"
+
+    def _repo_root_path(self) -> Path:
+        # renderer.py is offsim/sim/renderer.py → parents[2] is repo root
+        return Path(__file__).resolve().parents[2]
+
+    def _train_cmd(self) -> list[str]:
+        cmd = [
+            "py", "-3.10",
+            str(self._train_main_path()),
+            "train",
+            "--device", "cuda",
+            "--n-envs", str(int(self.train_n_envs)),
+            "--timesteps", str(int(self.train_timesteps)),
+            "--eval-episodes", str(int(self.train_eval_episodes)),
+        ]
+        if self.train_render:
+            cmd.append("--render")
+        return cmd
+
+    def _is_training_running(self) -> bool:
+        return self.train_proc is not None and self.train_proc.poll() is None
+
+    def _start_training(self) -> None:
+        if self._is_training_running():
+            return
+        cmd = self._train_cmd()
+        creationflags = 0
+        if sys.platform.startswith("win") and hasattr(subprocess, "CREATE_NEW_CONSOLE"):
+            creationflags = subprocess.CREATE_NEW_CONSOLE
+        self.train_proc = subprocess.Popen(
+            cmd,
+            cwd=str(self._repo_root_path()),
+            creationflags=creationflags,
+        )
+
+    def _stop_training(self) -> None:
+        if not self._is_training_running():
+            self.train_proc = None
+            return
+        try:
+            self.train_proc.terminate()
+        except Exception:
+            pass
+
+    def _draw_panel_train_launcher(self, y_start: int, mouse) -> int:
+        px = FIELD_PX + 10
+        bw = PANEL_W - 20
+        y = y_start
+
+        # Update state if a prior training process exited.
+        if self.train_proc is not None and self.train_proc.poll() is not None:
+            self.train_proc = None
+
+        def _pm_row(label: str, value: str, *, on_minus, on_plus, value_rect_out: list | None = None) -> None:
+            nonlocal y
+            self.screen.blit(self.font_sm.render(f"{label}:", True, LIGHT_GRAY), (px, y + 6))
+
+            minus = pygame.Rect(px + 150, y, 28, BTN_H)
+            plus  = pygame.Rect(px + 150 + 28 + 6, y, 28, BTN_H)
+            vrect = pygame.Rect(px + 150 + (28 + 6) * 2, y, bw - (150 + (28 + 6) * 2), BTN_H)
+            if value_rect_out is not None:
+                value_rect_out[:] = [vrect]
+
+            for rect, txt in [(minus, "-") , (plus, "+")]:
+                hover = rect.collidepoint(mouse)
+                bg = (45, 45, 60) if hover else (35, 35, 50)
+                pygame.draw.rect(self.screen, bg, rect, border_radius=3)
+                pygame.draw.rect(self.screen, LIGHT_GRAY, rect, 1, border_radius=3)
+                surf = self.font_sm.render(txt, True, WHITE)
+                self.screen.blit(surf, (rect.centerx - surf.get_width() // 2,
+                                        rect.centery - surf.get_height() // 2))
+
+            pygame.draw.rect(self.screen, (22, 22, 32), vrect, border_radius=3)
+            focused = (self._input_focus == "train_timesteps" and label == "timesteps")
+            border_col = ACCENT if focused else (70, 70, 90)
+            pygame.draw.rect(self.screen, border_col, vrect, 2 if focused else 1, border_radius=3)
+            vs = self.font_sm.render(value, True, WHITE)
+            self.screen.blit(vs, (vrect.x + 8, vrect.y + (BTN_H - vs.get_height()) // 2))
+
+            # Caret when focused
+            if focused:
+                caret_x = vrect.x + 8 + vs.get_width() + 2
+                caret_y0 = vrect.y + 6
+                caret_y1 = vrect.y + BTN_H - 6
+                pygame.draw.line(self.screen, ACCENT, (caret_x, caret_y0), (caret_x, caret_y1), 2)
+
+            if self._click_this_frame is not None and minus.collidepoint(self._click_this_frame):
+                on_minus()
+            if self._click_this_frame is not None and plus.collidepoint(self._click_this_frame):
+                on_plus()
+
+            y += BTN_H + 6
+
+        def _timesteps_idx() -> int:
+            try:
+                return self._train_timesteps_opts.index(int(self.train_timesteps))
+            except ValueError:
+                return 0
+
+        _pm_row(
+            "n_envs",
+            str(int(self.train_n_envs)),
+            on_minus=lambda: setattr(self, "train_n_envs", max(1, int(self.train_n_envs) - 1)),
+            on_plus=lambda: setattr(self, "train_n_envs", min(16, int(self.train_n_envs) + 1)),
+        )
+
+        # Timesteps can be typed: click the value box, type digits, press Enter.
+        timesteps_rect_holder: list = []
+        timesteps_value = self._input_buffer if self._input_focus == "train_timesteps" else f"{int(self.train_timesteps):,}"
+        _pm_row(
+            "timesteps",
+            timesteps_value,
+            on_minus=lambda: setattr(
+                self,
+                "train_timesteps",
+                self._train_timesteps_opts[max(0, _timesteps_idx() - 1)],
+            ),
+            on_plus=lambda: setattr(
+                self,
+                "train_timesteps",
+                self._train_timesteps_opts[min(len(self._train_timesteps_opts) - 1, _timesteps_idx() + 1)],
+            ),
+            value_rect_out=timesteps_rect_holder,
+        )
+        if timesteps_rect_holder:
+            self._train_timesteps_rect = timesteps_rect_holder[0]
+            if self._click_this_frame is not None and self._train_timesteps_rect.collidepoint(self._click_this_frame):
+                self._input_focus = "train_timesteps"
+                self._input_buffer = f"{int(self.train_timesteps)}"
+
+        _pm_row(
+            "eval_eps",
+            str(int(self.train_eval_episodes)),
+            on_minus=lambda: setattr(self, "train_eval_episodes", max(1, int(self.train_eval_episodes) - 1)),
+            on_plus=lambda: setattr(self, "train_eval_episodes", min(50, int(self.train_eval_episodes) + 1)),
+        )
+
+        if self._input_focus == "train_timesteps":
+            tip = self.font_sm.render("Type digits, Enter=apply, Esc=cancel", True, (110, 110, 130))
+            self.screen.blit(tip, (px, y - 2))
+            y += 14
+
+        # Render toggle
+        rrect = pygame.Rect(px, y, bw, BTN_H)
+        hover_r = rrect.collidepoint(mouse)
+        on = bool(self.train_render)
+        bg = (20, 90, 50) if on else (35, 35, 50)
+        fg = GREEN if on else LIGHT_GRAY
+        if hover_r:
+            bg = tuple(min(255, c + 15) for c in bg)
+        pygame.draw.rect(self.screen, bg, rrect, border_radius=3)
+        pygame.draw.rect(self.screen, fg, rrect, 1, border_radius=3)
+        lbl = "Rendered env(s): ON" if on else "Rendered env(s): OFF"
+        surf = self.font_sm.render(lbl, True, fg)
+        self.screen.blit(surf, (rrect.centerx - surf.get_width() // 2,
+                                rrect.centery - surf.get_height() // 2))
+        if self._click_this_frame is not None and rrect.collidepoint(self._click_this_frame):
+            self.train_render = not self.train_render
+        y += BTN_H + 8
+
+        # Start / Stop buttons
+        running = self._is_training_running()
+        start_rect = pygame.Rect(px, y, bw, 34)
+        stop_rect  = pygame.Rect(px, y + 38, bw, BTN_H)
+
+        hover_s = start_rect.collidepoint(mouse)
+        sbg = (30, 130, 60) if hover_s else (20, 100, 40)
+        if running:
+            sbg = (45, 45, 60)
+        pygame.draw.rect(self.screen, sbg, start_rect, border_radius=4)
+        pygame.draw.rect(self.screen, GREEN if not running else LIGHT_GRAY, start_rect, 1, border_radius=4)
+        st = "START TRAINING (CUDA)" if not running else f"TRAINING RUNNING (pid {self.train_proc.pid})"
+        ss = self.font_lg.render(st, True, WHITE)
+        self.screen.blit(ss, (start_rect.centerx - ss.get_width() // 2,
+                              start_rect.centery - ss.get_height() // 2))
+        if (not running) and self._click_this_frame is not None and start_rect.collidepoint(self._click_this_frame):
+            self._start_training()
+
+        hover_t = stop_rect.collidepoint(mouse)
+        tbg = (140, 60, 60) if hover_t else (110, 45, 45)
+        if not running:
+            tbg = (45, 45, 60)
+        pygame.draw.rect(self.screen, tbg, stop_rect, border_radius=3)
+        pygame.draw.rect(self.screen, LIGHT_RED if running else LIGHT_GRAY, stop_rect, 1, border_radius=3)
+        tsl = self.font_sm.render("STOP TRAINING", True, WHITE)
+        self.screen.blit(tsl, (stop_rect.centerx - tsl.get_width() // 2,
+                               stop_rect.centery - tsl.get_height() // 2))
+        if running and self._click_this_frame is not None and stop_rect.collidepoint(self._click_this_frame):
+            self._stop_training()
+
+        y += 34 + 38 + BTN_H
+
+        # Command preview (useful to copy/paste)
+        cmd = " ".join(self._train_cmd())
+        hint = self.font_sm.render("cmd:", True, (90, 90, 110))
+        self.screen.blit(hint, (px, y + 6))
+        # Truncate to fit panel width
+        cmd_txt = cmd
+        while self.font_sm.size(cmd_txt)[0] > bw - 40 and len(cmd_txt) > 10:
+            cmd_txt = cmd_txt[:-4] + "..."
+        cs = self.font_sm.render(cmd_txt, True, (120, 120, 140))
+        self.screen.blit(cs, (px + 36, y + 6))
+        y += 22
+
+        return y
 
     def _draw_panel_training(self, env, y_start: int) -> int:
         """Compact training-status block — shown when renderer.training_stats is set."""
