@@ -407,33 +407,6 @@ class Field:
             return True
         return False
 
-    def try_score(self, robot: Robot, goal_pos: np.ndarray, points: int) -> int:
-        """Score held balls at goal. Ball color determines which team scores.
-
-        Blue balls → my_score, Red balls → opponent_score.
-        Returns total points added across both teams.
-        """
-        if robot.balls_held <= 0:
-            return 0
-        if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
-            return 0
-
-        gname = _goal_name(goal_pos)
-        total = 0
-        for idx in robot.held_object_ids:
-            self.objects[idx].status       = OBJ_SCORED_US
-            self.objects[idx].scored_in_goal = gname
-            color = self.objects[idx].color
-            self.goal_state.score_ball(gname, idx, color)
-            if color == BALL_BLUE:
-                self.my_score += points
-            else:
-                self.opponent_score += points
-            total += points
-        robot.held_object_ids.clear()
-        robot.balls_held = 0
-        return total
-
     def try_score_one(self, robot: Robot, goal_pos: np.ndarray, points: int,
                        gname: str | None = None,
                        prepend: bool = False) -> tuple[int, tuple | None]:

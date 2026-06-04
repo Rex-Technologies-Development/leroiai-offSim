@@ -191,7 +191,7 @@ _STAGE_L_BOT = np.array([_LEFT_GOAL_CX,   LONG_GOAL_Y_MIN - 22.0])  # below left
 def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarray]:
     """Build waypoint list from `start` to `final` avoiding all goal obstacles.
 
-    Strategy (inspired by continuous_detour_path_planner.py):
+    Strategy:
       1. Direct LOS clear → single-leg path.
       2. Final is a long-goal end approach → use a fixed two-step staging path
          (corridor → staging → final) that guarantees correct heading alignment.
