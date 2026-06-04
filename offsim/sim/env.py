@@ -254,6 +254,22 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
             (_NAV_LEFT_LOW if is_top else _NAV_LEFT_HIGH).copy()
         stage = np.array([float(corridor[0]), float(final[1])], dtype=np.float64)
 
+        # If the robot has already passed the corridor toward the goal (its x is
+        # between the corridor and the goal), skip the corridor (and go-around)
+        # entirely so the robot doesn't get sent backward on subsequent steps.
+        start_x = float(start[0])
+        corr_x  = float(corridor[0])
+        past_corridor = (
+            (is_right_long and start_x >= corr_x) or
+            (is_left_long  and start_x <= corr_x)
+        )
+        if past_corridor:
+            compact: list[np.ndarray] = []
+            for p in [final]:
+                if not compact or float(np.linalg.norm(p - compact[-1])) > 0.75:
+                    compact.append(p.copy())
+            return compact
+
         legs: list[np.ndarray] = []
         if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
             legs.append(go_around)
@@ -289,7 +305,8 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
     return [corridor, final]
 
 
-def _resolve_goal_collisions(robot, skip_center: bool = False) -> bool:
+def _resolve_goal_collisions(robot, skip_center: bool = False,
+                              skip_long: bool = False) -> bool:
     """Push robot out of goal bounding boxes.
 
     Long goals use AABB. Center X arms are checked simultaneously so that
@@ -297,9 +314,9 @@ def _resolve_goal_collisions(robot, skip_center: bool = False) -> bool:
     pushing to the nearest cardinal clear position instead of bouncing
     between both arms indefinitely.
 
-    skip_center: when True, the center X arm push is suppressed. Used while
-    the robot is actively scoring/descoring at the center so it can settle
-    into the tight approach without being shoved away. Long-goal push stays.
+    skip_center: suppress center X arm push (used while scoring at a center tip).
+    skip_long: suppress long-goal push (used while the robot is at a long-goal
+               scoring position so the goal margin can't eject it mid-shot).
 
     Returns True if the robot was actually pushed (i.e. was inside a goal margin).
     """
@@ -307,19 +324,22 @@ def _resolve_goal_collisions(robot, skip_center: bool = False) -> bool:
     m = _GOAL_MARGIN
 
     # --- Long goals (axis-aligned rectangles) — re-read position each time ---
-    for gx_lo, gx_hi in ((_RIGHT_GOAL_X_LO, _RIGHT_GOAL_X_HI),
-                          (_LEFT_GOAL_X_LO,  _LEFT_GOAL_X_HI)):
-        rx, ry = robot.x, robot.y
-        ex_lo = gx_lo - m;  ex_hi = gx_hi + m
-        ey_lo = LONG_GOAL_Y_MIN - m;  ey_hi = LONG_GOAL_Y_MAX + m
-        if ex_lo < rx < ex_hi and ey_lo < ry < ey_hi:
-            d_lo = rx - ex_lo;  d_hi = ex_hi - rx
-            d_yd = ry - ey_lo;  d_yu = ey_hi - ry
-            s = min(d_lo, d_hi, d_yd, d_yu)
-            if   s == d_lo: robot.x = ex_lo
-            elif s == d_hi: robot.x = ex_hi
-            elif s == d_yd: robot.y = ey_lo
-            else:           robot.y = ey_hi
+    # skip_long=True when the robot is at a long-goal scoring position so the
+    # collision margin does not eject it mid-shot.
+    if not skip_long:
+        for gx_lo, gx_hi in ((_RIGHT_GOAL_X_LO, _RIGHT_GOAL_X_HI),
+                              (_LEFT_GOAL_X_LO,  _LEFT_GOAL_X_HI)):
+            rx, ry = robot.x, robot.y
+            ex_lo = gx_lo - m;  ex_hi = gx_hi + m
+            ey_lo = LONG_GOAL_Y_MIN - m;  ey_hi = LONG_GOAL_Y_MAX + m
+            if ex_lo < rx < ex_hi and ey_lo < ry < ey_hi:
+                d_lo = rx - ex_lo;  d_hi = ex_hi - rx
+                d_yd = ry - ey_lo;  d_yu = ey_hi - ry
+                s = min(d_lo, d_hi, d_yd, d_yu)
+                if   s == d_lo: robot.x = ex_lo
+                elif s == d_hi: robot.x = ex_hi
+                elif s == d_yd: robot.y = ey_lo
+                else:           robot.y = ey_hi
 
     # --- Center goal arms — use wider margin for visible clearance ---
     # When skip_center is set, the robot is mid-score at a center tip and we
@@ -1382,13 +1402,22 @@ class VexAIEnv(gym.Env):
                         ally_wq[idx].pop(0)      # advance to next waypoint
                     elif arrived:
                         ally_wq[idx].clear()     # reached final destination
-                # Suppress center-arm push when the robot is mid-score/descore
-                # at a center tip — lets it settle into the tight approach.
+                # Suppress center-arm push when scoring/descoring at a center tip.
+                # Suppress long-goal push when the robot has reached the long-goal
+                # scoring position so the collision margin can't kick it out mid-shot.
                 skip_center = Action(live_actions[idx]) in (
                     Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW, Action.DESCORE_CENTER
                 )
+                _act_i_now = Action(live_actions[idx])
+                skip_long = False
+                if _act_i_now == Action.SCORE_LONG_GOAL and robot.balls_held > 0:
+                    _cache_i = self._score_target_cache[idx]
+                    if _cache_i is not None:
+                        _sp = _cache_i[1]
+                        skip_long = float(np.linalg.norm(robot.position - _sp)) < (_SCORE_ARRIVAL_DIST * 2.0)
                 if _resolve_goal_collisions(self.field.allies[idx],
-                                            skip_center=skip_center):
+                                            skip_center=skip_center,
+                                            skip_long=skip_long):
                     self.goal_bump_ticks[idx] += 1
                 # Accumulate per-tick |heading delta| for jitter penalty
                 cur_h = self.field.allies[idx].heading
@@ -1588,6 +1617,15 @@ class VexAIEnv(gym.Env):
                 if is_right else \
                 (_NAV_LEFT_LOW if route_low else _NAV_LEFT_HIGH).copy()
             stage = np.array([float(corridor[0]), float(score_pos[1])], dtype=np.float64)
+
+            # If the robot has already passed the corridor on its way to the goal
+            # (x-position is between the corridor and the goal), skip the corridor
+            # waypoint so the robot doesn't get sent backward on subsequent decisions.
+            rx = float(robot.x)
+            corr_x = float(corridor[0])
+            already_past = (is_right and rx >= corr_x) or (not is_right and rx <= corr_x)
+            if already_past:
+                return _compact([score_pos])
             return _compact([corridor, stage, score_pos])
 
         if action in (Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW):
