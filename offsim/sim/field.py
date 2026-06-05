@@ -28,8 +28,8 @@ from sim.game_object import BALL_RADIUS
 # ---------------------------------------------------------------------------
 # Per-episode jitter so each match is a slightly different scenario — keeps
 # the policy from overfitting to the 44 fixed INITIAL_OBJECTS coordinates.
-_JITTER_RADIUS = 12.0  # inches — max offset from anchor position
-_JITTER_ATTEMPTS = 6   # if jittered pos lands on a goal, try again N times
+_JITTER_RADIUS = 20.0  # inches — max offset from anchor position
+_JITTER_ATTEMPTS = 12  # if jittered pos lands on a goal, try again N times
 _BALL_WALL_MARGIN = 4.0
 
 # Pre-computed goal bounding boxes for collision testing during jitter.
@@ -485,17 +485,22 @@ class Field:
         return positions[np.argmin(dists)].copy()
 
     def nearest_navigable_target(self, pos: np.ndarray) -> np.ndarray | None:
-        """Return nearest on-field ball whose direct path is NOT blocked by a goal.
+        """Return nearest BLUE on-field ball whose direct path is NOT blocked by a goal.
 
-        Uses the route planner's LOS check to skip balls behind goal structures.
-        Falls back to nearest_on_field_target if every ball is behind a goal (rare).
+        Only considers BALL_BLUE (allied robot only collects its own color).
+        Uses the route planner's LOS+margin check to skip balls behind/inside goal
+        structures. Returns None if all blue balls are blocked — the caller's
+        exploration fallback handles that case.
         """
-        from sim.route_planner import _los_blocked, _NAV_MARGIN
+        from sim.route_planner import _los_blocked, _NAV_MARGIN, _near_any_goal
+        from sim.config import BALL_BLUE
         rx, ry = float(pos[0]), float(pos[1])
         best_pos: np.ndarray | None = None
         best_dist = float("inf")
         for obj in self.objects:
-            if obj.status != OBJ_ON_FIELD:
+            if obj.status != OBJ_ON_FIELD or obj.color != BALL_BLUE:
+                continue
+            if _near_any_goal(obj.x, obj.y):
                 continue
             if _los_blocked(rx, ry, obj.x, obj.y, margin=_NAV_MARGIN):
                 continue
@@ -503,7 +508,7 @@ class Field:
             if d < best_dist:
                 best_dist = d
                 best_pos = obj.position.copy()
-        return best_pos if best_pos is not None else self.nearest_on_field_target(pos)
+        return best_pos
 
     # ------------------------------------------------------------------
     # Opponent action effects

@@ -32,7 +32,7 @@ from sim.config import (
 # (ROBOT_W * √2 / 2) instead of the half-width because when the robot rotates,
 # its corners extend further out than its sides — half-width was clipping
 # goal bodies on diagonal headings.
-_NAV_MARGIN: float = (ROBOT_W * math.sqrt(2) / 2) + 1.0   # ≈ 11.6"
+_NAV_MARGIN: float = ROBOT_W / 2.0 + 1.0   # ≈ 8.5" (half-width + buffer)
 
 # ---- Goal obstacle definitions for line-of-sight occlusion ----------------
 # Long goal AABBs [x_lo, x_hi, y_lo, y_hi]
@@ -150,8 +150,11 @@ def _near_any_goal(x: float, y: float) -> bool:
         if np.linalg.norm(pos - g) < _GOAL_MARGIN:
             return True
 
-    # Long goal body bounding boxes (with small margin)
-    pad = 4.0
+    # Long goal body bounding boxes — pad must match env's _GOAL_MARGIN (13.5") so
+    # that balls inside the physical exclusion zone are never added as targets.
+    # A robot approaching such a ball would be pushed back by _resolve_goal_collisions
+    # every tick and oscillate against the goal face.
+    pad = 14.0
     if (_R_X_LO - pad <= x <= _R_X_HI + pad and _G_Y_LO - pad <= y <= _G_Y_HI + pad):
         return True
     if (_L_X_LO - pad <= x <= _L_X_HI + pad and _G_Y_LO - pad <= y <= _G_Y_HI + pad):

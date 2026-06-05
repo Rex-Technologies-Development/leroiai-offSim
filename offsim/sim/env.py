@@ -43,10 +43,10 @@ from sim.opponent import get_opponent
 # ---------------------------------------------------------------------------
 # Goal collision resolution
 # ---------------------------------------------------------------------------
-# Margin for long goals — keeps robot body ~4" clear of the goal face
-_GOAL_MARGIN = ROBOT_W / 2 + 4.0   # 11.5"
-# Wider margin for center X arms — keeps robot body ~5" clear of each arm face
-_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 5.0   # 12.5"
+# Margin for long goals — keeps robot body ~6" clear of the goal face
+_GOAL_MARGIN = ROBOT_W / 2 + 6.0   # 13.5"
+# Wider margin for center X arms — keeps robot body ~7" clear of each arm face
+_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 7.0   # 14.5"
 
 # Long goal X extents (precomputed from config)
 _RIGHT_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH  # inner face
@@ -335,7 +335,10 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
                     best_dist = d
                     best_path = [c1.copy(), c2.copy(), final.copy()]
 
-    return best_path if best_path else [final]
+    # If no corridor path was found, return [] rather than routing through the
+    # obstacle. The caller treats [] as "robot stays put" for this decision,
+    # which is correct — driving through a goal face causes oscillation.
+    return best_path
 
 
 def _resolve_goal_collisions(robot, skip_center: bool = False,
@@ -499,30 +502,110 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
         if nav is not None:
             return nav
 
-        # Priority 3 — no accessible target in the vision cone.  Look beyond
-        # the cone: head toward the centroid of all remaining blue balls on
-        # the field (even ones behind obstacles — the detour planner will
-        # route around them). This is the "we don't see anything good
-        # nearby, go to where the blue balls actually are" fallback.
-        blue_positions = [
-            obj.position for obj in field.objects
-            if obj.status == OBJ_ON_FIELD and obj.color == BALL_BLUE
+        # Priority 3 — no accessible target in vision cone or via LOS.
+        # Explore: go to the scan position in the field quadrant that has the
+        # most remaining blue balls AND that the robot can actually route to.
+        #
+        # The expanded center X arm (_NAV_MARGIN ≈ 11.6") can block paths to
+        # some quadrant scan positions depending on the robot's location (e.g.
+        # the NE arm tip with margin reaches x≈100", blocking paths from the
+        # right side to the upper-left/right scan positions). We verify each
+        # candidate has a non-empty nav path before committing.
+        _SCAN_POS = {
+            "SE": np.array([ 95.0,  36.0]),
+            "NE": np.array([ 95.0, 108.0]),
+            "NW": np.array([ 49.0, 108.0]),
+            "SW": np.array([ 49.0,  36.0]),
+        }
+        on_blue = [obj for obj in field.objects
+                   if obj.status == OBJ_ON_FIELD and obj.color == BALL_BLUE]
+        if not on_blue:
+            # No blue balls at all — stay near center so policy sees goals.
+            return np.array([FIELD_W * 0.5, FIELD_H * 0.5])
+
+        # Priority 2.5 — rotate-to-look before committing to a long scan drive.
+        # Check 8 evenly-spaced candidate headings; whichever puts the most
+        # on-field blue balls in the vision cone (camera LOS, no nav margin)
+        # wins.  Return a nearby look-point in that direction so the robot
+        # turns in place; Priority 1 will catch the newly-visible balls on the
+        # very next RL decision without the robot having to drive anywhere far.
+        from sim.route_planner import _los_blocked as _cam_los, _near_any_goal as _rtl_near
+        _best_look_angle: float | None = None
+        _best_look_cnt   = 0
+        for _k in range(8):
+            _theta = _k * (math.pi / 4)
+            _cnt = 0
+            for _obj in on_blue:
+                _dx, _dy = _obj.x - robot.x, _obj.y - robot.y
+                _dist = math.sqrt(_dx * _dx + _dy * _dy)
+                if _dist < 3.0 or _dist > VISION_RANGE:
+                    continue
+                if _rtl_near(_obj.x, _obj.y):
+                    continue
+                _ang_to = math.atan2(_dy, _dx)
+                _diff   = abs(((_theta - _ang_to + math.pi) % (2 * math.pi)) - math.pi)
+                if _diff > VISION_HALF_ANGLE:
+                    continue
+                if _cam_los(robot.x, robot.y, _obj.x, _obj.y):  # blocked by goal / arm
+                    continue
+                _cnt += 1
+            if _cnt > _best_look_cnt:
+                _best_look_cnt   = _cnt
+                _best_look_angle = _theta
+        if _best_look_angle is not None:
+            _lx = float(np.clip(robot.x + 30.0 * math.cos(_best_look_angle),
+                                7.5, FIELD_W - 7.5))
+            _ly = float(np.clip(robot.y + 30.0 * math.sin(_best_look_angle),
+                                7.5, FIELD_H - 7.5))
+            return np.array([_lx, _ly])
+
+        counts = {q: 0 for q in _SCAN_POS}
+        for obj in on_blue:
+            q = ("N" if obj.y >= FIELD_H * 0.5 else "S") + \
+                ("E" if obj.x >= FIELD_W * 0.5 else "W")
+            counts[q] += 1
+
+        robot_q = ("N" if robot.y >= FIELD_H * 0.5 else "S") + \
+                  ("E" if robot.x >= FIELD_W * 0.5 else "W")
+        robot_near_scan = (
+            float(np.linalg.norm(robot.position - _SCAN_POS[robot_q])) < 30.0
+        )
+
+        # Pick the richest reachable quadrant; skip the one the robot is
+        # already scanning, and skip any whose nav path would be empty
+        # (corridor search failed — robot would freeze with no waypoints).
+        for q in sorted(counts, key=counts.__getitem__, reverse=True):
+            if q == robot_q and robot_near_scan:
+                continue
+            target = _SCAN_POS[q].copy()
+            if _build_nav_waypoints(robot.position, target):
+                return target
+
+        # No quadrant scan position is routable — fall back to the nearest
+        # corridor point that IS reachable and meaningfully far from the robot.
+        # Corridor points are the pre-verified safe waypoints used by the path
+        # planner itself, so at least one will always be reachable.
+        _CORRIDOR_FALLBACKS = [
+            _NAV_RIGHT_LOW, _NAV_RIGHT_HIGH,
+            _NAV_LEFT_LOW,  _NAV_LEFT_HIGH,
+            _NAV_BELOW_X,   _NAV_ABOVE_X,
         ]
-        if blue_positions:
-            centroid = np.mean(blue_positions, axis=0)
-            # Don't return a target right next to us — if centroid is too close,
-            # we're already there; push it 24" past the robot in centroid's direction.
-            vec = centroid - robot.position
-            dist = float(np.linalg.norm(vec))
-            if dist < 24.0 and dist > 1e-3:
-                centroid = robot.position + (vec / dist) * 24.0
-            return np.array([
-                float(np.clip(centroid[0], ROBOT_W, FIELD_W - ROBOT_W)),
-                float(np.clip(centroid[1], ROBOT_W, FIELD_H - ROBOT_W)),
-            ])
-        # No blue balls left on field at all — drift toward field center
-        # (where the goal X is) so the policy gets a fresh observation.
-        return np.array([FIELD_W * 0.5, FIELD_H * 0.5])
+        best_corr: np.ndarray | None = None
+        best_dist = float("inf")
+        for c in _CORRIDOR_FALLBACKS:
+            d = float(np.linalg.norm(c - robot.position))
+            if d < 12.0:          # already here — skip
+                continue
+            if not _build_nav_waypoints(robot.position, c):
+                continue          # not routable
+            if d < best_dist:
+                best_dist = d
+                best_corr = c
+        if best_corr is not None:
+            return best_corr.copy()
+
+        # Absolute last resort: idle (caller treats None as no waypoints).
+        return None
     elif action == Action.SCORE_LONG_GOAL:
         approach, _, _, _ = _nearest_long_goal_target(robot)
         return approach.copy()
@@ -590,6 +673,8 @@ class VexAIEnv(gym.Env):
         num_opponents: int = 0,
         use_timer: bool = False,
         alliance: str = "blue",
+        log_decisions: bool = False,
+        log_dir: str = "logs",
     ):
         super().__init__()
         self.render_mode    = render_mode
@@ -600,6 +685,13 @@ class VexAIEnv(gym.Env):
         # Alliance color: 1.0 = blue (we score blue balls), 0.0 = red.
         # Currently always blue — kwarg reserved for future symmetric training.
         self.alliance_color = 1.0 if alliance == "blue" else 0.0
+
+        # Decision logger — disabled during training, enable in demo/eval via
+        # env.enable_logging() or log_decisions=True constructor arg.
+        self._decision_logger = None
+        if log_decisions:
+            from sim.decision_logger import DecisionLogger
+            self._decision_logger = DecisionLogger(log_dir)
 
         self.action_space = spaces.MultiDiscrete([NUM_ACTIONS, NUM_ACTIONS])
         self.observation_space = spaces.Dict({
@@ -725,6 +817,9 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = False
         self.opp_targets: list[np.ndarray | None] = [None, None]
+
+        if self._decision_logger is not None:
+            self._decision_logger.new_episode()
 
         return self._get_obs(), {}
 
@@ -1092,6 +1187,13 @@ class VexAIEnv(gym.Env):
                 obj.vx += float(rng.uniform(-4, 4))
                 obj.vy += float(rng.uniform(-4, 4))
 
+    def enable_logging(self, log_dir: str = "logs") -> None:
+        """Activate the decision logger (call after reset, before stepping)."""
+        from sim.decision_logger import DecisionLogger
+        if self._decision_logger is not None:
+            self._decision_logger.close()
+        self._decision_logger = DecisionLogger(log_dir)
+
     def action_masks(self, robot_id: int = 0) -> np.ndarray:
         """Boolean mask of shape (NUM_ACTIONS,) — True = action valid this decision.
 
@@ -1132,6 +1234,9 @@ class VexAIEnv(gym.Env):
 
     def step(self, actions: np.ndarray):
         """One RL decision cycle = TICKS_PER_DECISION sim ticks."""
+        if self._decision_logger is not None:
+            self._decision_logger.mark_step_start()
+
         raw_a0, raw_a1 = int(actions[0]), int(actions[1])
         a0, a1 = raw_a0, raw_a1
 
@@ -1158,10 +1263,17 @@ class VexAIEnv(gym.Env):
         # Safety remap: if the chosen action is currently masked, fall back to
         # COLLECT_NEAREST_BALL. MaskablePPO won't ever send a masked action, but
         # this protects eval runs with old models and manual action-button clicks.
+        # Track action source for the logger BEFORE masking overrides
+        _src = ["policy", "policy"]
+        for _i, (_r, _a) in enumerate(((raw_a0, a0), (raw_a1, a1))):
+            if _r != _a:
+                _src[_i] = "committed"
         if not self.action_masks(robot_id=0)[a0]:
             a0 = int(Action.COLLECT_NEAREST_BALL)
+            _src[0] = "mask_fallback"
         if not self.action_masks(robot_id=1)[a1]:
             a1 = int(Action.COLLECT_NEAREST_BALL)
+            _src[1] = "mask_fallback"
 
         self.current_actions = np.array([a0, a1], dtype=np.int32)
 
@@ -1278,13 +1390,30 @@ class VexAIEnv(gym.Env):
             act    = Action(live_actions[idx])
             if act in SCORE_INTENTS and robot.balls_held > 0:
                 return self._build_scoring_waypoints(idx, act)
+            elif act in SCORE_INTENTS and robot.balls_held == 0:
+                # SCORE chosen but nothing to score — navigate to collect instead
+                # so the robot finds balls rather than running empty to a goal.
+                final = _action_to_target(Action.COLLECT_NEAREST_BALL, self.field, robot)
             else:
-                final  = _action_to_target(act, self.field, robot)
+                final = _action_to_target(act, self.field, robot)
             if final is None:
                 return []
-            return _build_nav_waypoints(robot.position, final)
+            wq = _build_nav_waypoints(robot.position, final)
+            # If the target is geometrically unreachable (arm / goal body blocks
+            # every corridor), fall back to COLLECT so the robot explores instead
+            # of freezing. Applies to DESCORE and DEFEND — not COLLECT itself
+            # (would loop) or IDLE/EJECT (those have no nav target anyway).
+            if not wq and act not in (Action.COLLECT_NEAREST_BALL,
+                                      Action.IDLE, Action.EJECT_WRONG_COLOR):
+                live_actions[idx] = int(Action.COLLECT_NEAREST_BALL)
+                fb = _action_to_target(Action.COLLECT_NEAREST_BALL, self.field, robot)
+                if fb is not None:
+                    wq = _build_nav_waypoints(robot.position, fb)
+            return wq
 
         ally_wq: list[list] = [_build_wq(0), _build_wq(1)]
+        # Capture first waypoint as the decision-level "target" for logging
+        _log_targets = [ally_wq[i][0] if ally_wq[i] else None for i in range(2)]
 
         def _current_target(idx: int):
             return ally_wq[idx][0] if ally_wq[idx] else None
@@ -1307,6 +1436,18 @@ class VexAIEnv(gym.Env):
         # Post-arrival scoring dwell: once in scoring pose (arrived + aligned),
         # keep the decision alive for a minimum duration so scoring timers can fire.
         scoring_dwell_left = [0, 0]
+
+        # Stall detection: if a robot hasn't moved STALL_MIN_DIST inches in
+        # STALL_CHECK_INTERVAL ticks, that's one "strike". After STALL_MAX_STRIKES
+        # consecutive strikes the waypoint queue is cleared so the robot gives up
+        # on the current target and idles until the next decision.
+        # At 60 Hz: 30 ticks = 1.5 s, 2 strikes = 3 s total stall.
+        _STALL_CHECK_INTERVAL = 30    # ticks between progress samples
+        _STALL_MIN_DIST       = 4.0   # inches required per interval (not stalled)
+        _STALL_MAX_STRIKES    = 2     # consecutive missed intervals before clearing
+        stall_pos_snap   = [r.position.copy() for r in self.field.allies]
+        stall_tick_count = [0, 0]
+        stall_strikes    = [0, 0]
 
         for tick in range(MAX_STEP_TICKS):
             if tick >= TICKS_PER_DECISION:
@@ -1390,6 +1531,11 @@ class VexAIEnv(gym.Env):
                         live_actions[idx] = int(new_act)
                         ally_wq[idx]      = _build_wq(idx)
                         live_action_age[idx] = 0
+                        # New nav target — reset stall tracking so the robot gets
+                        # a fresh 3-second window to reach the new destination.
+                        stall_strikes[idx]    = 0
+                        stall_tick_count[idx] = 0
+                        stall_pos_snap[idx]   = self.field.allies[idx].position.copy()
 
             # Save positions before movement for push calculation
             ally_prev = [self.field.allies[i].position.copy()     for i in range(self.num_allies)]
@@ -1477,6 +1623,38 @@ class VexAIEnv(gym.Env):
                 live_action_age[idx] = min(live_action_age[idx] + 1, REPLAN_LOCK_TICKS * 10 + 1)
                 if scoring_dwell_left[idx] > 0:
                     scoring_dwell_left[idx] -= 1
+
+            # ── Stall detection ───────────────────────────────────────────────
+            # Skip counting during intentional pauses (action lock-in, scoring
+            # dwell). Accumulated movement is sampled every _STALL_CHECK_INTERVAL
+            # ticks; if the robot covered < _STALL_MIN_DIST twice in a row its
+            # waypoint queue is cleared so it stops fighting an unreachable target.
+            for idx in range(self.num_allies):
+                # Intentional pauses: reset snapshot so pause ticks aren't counted.
+                if self.action_pause_ticks[idx] > 0 or scoring_dwell_left[idx] > 0:
+                    stall_pos_snap[idx]   = self.field.allies[idx].position.copy()
+                    stall_tick_count[idx] = 0
+                    continue
+                # No waypoints → nothing to stall on.
+                if not ally_wq[idx]:
+                    stall_strikes[idx]    = 0
+                    stall_tick_count[idx] = 0
+                    stall_pos_snap[idx]   = self.field.allies[idx].position.copy()
+                    continue
+                stall_tick_count[idx] += 1
+                if stall_tick_count[idx] >= _STALL_CHECK_INTERVAL:
+                    moved = float(np.linalg.norm(
+                        self.field.allies[idx].position - stall_pos_snap[idx]
+                    ))
+                    stall_pos_snap[idx]   = self.field.allies[idx].position.copy()
+                    stall_tick_count[idx] = 0
+                    if moved < _STALL_MIN_DIST:
+                        stall_strikes[idx] += 1
+                        if stall_strikes[idx] >= _STALL_MAX_STRIKES:
+                            ally_wq[idx].clear()
+                            stall_strikes[idx] = 0
+                    else:
+                        stall_strikes[idx] = 0
 
             for oi in range(self.num_opponents):
                 if self.opp_targets[oi] is not None:
@@ -1566,6 +1744,23 @@ class VexAIEnv(gym.Env):
         # Snapshot scores AFTER reward computation so next step can compute delta
         self.prev_my_score  = float(self.field.my_score)
         self.prev_opp_score = float(self.field.opponent_score)
+
+        # Decision logging (no-op when logger is None)
+        if self._decision_logger is not None:
+            for _li in range(self.num_allies):
+                _travelled = float(np.linalg.norm(
+                    self.field.allies[_li].position - step_start_pos[_li]
+                ))
+                self._decision_logger.log(
+                    env=self,
+                    robot_id=_li,
+                    policy_action=raw_a0 if _li == 0 else raw_a1,
+                    executed_action=int(self.current_actions[_li]),
+                    action_source=_src[_li],
+                    target=_log_targets[_li] if _li < len(_log_targets) else None,
+                    reward=r0 if _li == 0 else r1,
+                    travelled_in=_travelled,
+                )
 
         return self._get_obs(), (r0, r1), self.done, False, {}
 

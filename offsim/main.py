@@ -60,6 +60,7 @@ def cmd_demo(args):
         opponent_type=args.opponent,
         num_allies=args.num_robots,
     )
+    env.enable_logging(args.log_dir)
     obs, _ = env.reset(seed=42)
     rng = np.random.default_rng(42)
     episode = 1
@@ -67,12 +68,19 @@ def cmd_demo(args):
 
     print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
     print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
-    print("          Tab=WASD mode  (W/S=fwd/rev  A/D=turn  I=intake  F=score)")
-    print("          Panel: RUN to run, AUTO PLAY for smart greedy policy")
+    print("          Panel: AUTO PLAY = greedy policy  SCORE = force scoring")
 
     while True:
         env.render()
         renderer = env._renderer
+
+        # On the very first tick, start running in greedy (auto-collect) mode so
+        # the demo uses the same env.step() → _build_wq → _action_to_target code
+        # path as training — features, nav logic, and logging all work identically.
+        if renderer and not getattr(renderer, "_demo_init_done", False):
+            renderer.auto_collect = True
+            renderer.paused       = False
+            renderer._demo_init_done = True
 
         # Reset always takes priority
         if renderer and renderer.should_reset:
@@ -80,13 +88,6 @@ def cmd_demo(args):
             obs, _ = env.reset()
             total_reward = 0.0
             episode += 1
-            continue
-
-        # WASD manual mode: one physics tick per render frame, no RL step
-        if renderer and renderer.wasd_mode:
-            if not renderer.paused or renderer.step_once:
-                renderer.step_once = False
-                env.manual_tick(renderer)
             continue
 
         if renderer and renderer.paused and not renderer.step_once:
@@ -348,6 +349,8 @@ def main():
                    choices=["random", "greedy", "defensive", "mixed"])
     p.add_argument("--num-robots", type=int, default=1, choices=[1, 2],
                    help="Number of allied robots (default: 1)")
+    p.add_argument("--log-dir", default="logs",
+                   help="Directory for decision log CSV (default: logs/)")
     p.set_defaults(func=cmd_demo)
 
     # --- train ---

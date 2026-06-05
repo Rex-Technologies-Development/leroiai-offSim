@@ -1,0 +1,2 @@
+decision,sim_time_s,robot_id,policy_action,executed_action,action_source,pos_x,pos_y,heading_deg,balls_held,target_x,target_y,us_score,opp_score,margin,reward,top_component,travelled_in,low_progress,balls_on_field,wall_ms
+,,,,,,,,,,,,,,,,,,,,

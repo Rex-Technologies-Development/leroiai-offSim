@@ -61,6 +61,10 @@ REWARD_WEIGHTS: dict[str, float] = {
     "wasted_action":        -0.10,
     "holding_urgency":      -0.02,   # per ball held (any color)
     "heading_jitter":       -0.02,   # per radian of turn beyond normal travel
+    # ── Scoring volume — keep pressure to score ≥8 blue balls ─────────────
+    "scoring_volume":       +0.06,   # per ball relative to 8-ball target (negative below 8)
+    # ── Goal spread — reward diversifying into multiple goal areas ──────────
+    "goal_diversity":       +0.30,   # per extra distinct goal zone with ≥1 blue ball
     # ── Opponent goal threat — continuous pressure to descore proactively ──
     "opp_goal_threat":      -0.20,   # per decision: -(opp_balls_opp_long + opp_balls_center)
     # ── Phase objectives — "win early and decisively" ───────────────────
@@ -152,6 +156,25 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     opp_in_center = sum(1 for _, c in gs.center_mid + gs.center_low if c == BALL_RED)
     threat = opp_in_long / 14.0 + opp_in_center / 14.0   # 0..2
     comps["opp_goal_threat"] = threat * w["opp_goal_threat"]
+
+    # Scoring volume — linear ramp: negative below 8 blue balls in goals, positive above.
+    # Gives per-decision pressure to keep scoring rather than stopping at a thin lead.
+    blue_in_goals = (
+        sum(1 for _, c in gs.our_long   if c == BALL_BLUE) +
+        sum(1 for _, c in gs.center_mid if c == BALL_BLUE) +
+        sum(1 for _, c in gs.center_low if c == BALL_BLUE)
+    )
+    comps["scoring_volume"] = (blue_in_goals - 8) * w["scoring_volume"]
+
+    # Goal diversity — extra reward for having blue balls in multiple distinct goal areas.
+    # Spreading across our_long / center_mid / center_low populates the outer-end tips
+    # that determine control-zone ownership, so this directly incentivises zone control.
+    zones_with_blue = (
+        (1 if any(c == BALL_BLUE for _, c in gs.our_long)    else 0) +
+        (1 if any(c == BALL_BLUE for _, c in gs.center_mid)  else 0) +
+        (1 if any(c == BALL_BLUE for _, c in gs.center_low)  else 0)
+    )
+    comps["goal_diversity"] = max(0, zones_with_blue - 1) * w["goal_diversity"]
 
     # Context-aware idle penalty
     action = env.current_actions[robot_id]
