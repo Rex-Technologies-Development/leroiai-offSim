@@ -224,14 +224,16 @@ INCLUDE_HEATMAP: bool = bool(SHARED_CFG["state"].get("include_heatmap", False))
 #   4 nearest RED  balls × 5 features                                          = 20
 #   4 goals × 2 features (relative dx, dy)                                     = 8
 # Heatmap = 144  (kept for global spatial density awareness)
+# Goal state = 6 (fill level + opp-color count for opp long, our long, center)
 # Extras = 3     (expected_state_delta, success_ratio, wrong_color_held)
-# Total = 13 + 68 + 144 + 3 = 228
+# Total = 13 + 68 + 144 + 6 + 3 = 234
 # ---------------------------------------------------------------------------
 N_NEAREST_BLUE   = 8
 N_NEAREST_RED    = 4
 OBJ_REL_FEATURES = 5
 _REL_OBJ_TOTAL = (N_NEAREST_BLUE + N_NEAREST_RED) * OBJ_REL_FEATURES + 4 * 2  # = 68
-STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H if INCLUDE_HEATMAP else 0) + 3
+_GOAL_STATE_FEATURES = 6   # fill + opp-ball-count for opp_long, our_long, center
+STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H if INCLUDE_HEATMAP else 0) + _GOAL_STATE_FEATURES + 3
 
 # ---------------------------------------------------------------------------
 # Robot physics

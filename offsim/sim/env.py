@@ -43,10 +43,10 @@ from sim.opponent import get_opponent
 # ---------------------------------------------------------------------------
 # Goal collision resolution
 # ---------------------------------------------------------------------------
-# Margin for long goals = half robot width + 0.25" ghost boundary
-_GOAL_MARGIN = ROBOT_W / 2 + 0.25   # 7.75"
-# Wider margin for center X arms — gives a visually clear gap between robot body and arm body
-_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 2.5   # 10.0"
+# Margin for long goals — keeps robot body ~4" clear of the goal face
+_GOAL_MARGIN = ROBOT_W / 2 + 4.0   # 11.5"
+# Wider margin for center X arms — keeps robot body ~5" clear of each arm face
+_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 5.0   # 12.5"
 
 # Long goal X extents (precomputed from config)
 _RIGHT_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH  # inner face
@@ -290,19 +290,52 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
     # NOTE: Long-goal scoring is handled by the block above. For non-scoring
     # targets we keep using the generic LOS/detour planner below.
 
-    # ── Generic corridor detour ────────────────────────────────────────────────
-    use_low = (start[1] + final[1]) / 2.0 <= 72.0
-    corridor = (_NAV_RIGHT_LOW if use_low else _NAV_RIGHT_HIGH).copy() \
-               if final[0] > 72.0 else \
-               (_NAV_LEFT_LOW  if use_low else _NAV_LEFT_HIGH).copy()
+    # ── Generic corridor detour ─────────────────────────────────────────────
+    # Search all safe corridor points for the shortest clear 1-stop or 2-stop
+    # path. The old single-heuristic approach could leave one leg still blocked,
+    # causing the robot to be collision-resolved sideways and appear to orbit.
+    _pool = [
+        _NAV_RIGHT_LOW, _NAV_RIGHT_HIGH,
+        _NAV_LEFT_LOW,  _NAV_LEFT_HIGH,
+        _NAV_BELOW_X,   _NAV_ABOVE_X,
+    ]
+    sx, sy, fx, fy = float(start[0]), float(start[1]), float(final[0]), float(final[1])
 
-    if _los_blocked(corridor[0], corridor[1], final[0], final[1], margin=_NAV_MARGIN):
-        center = _NAV_BELOW_X.copy() if start[1] <= 72.0 else _NAV_ABOVE_X.copy()
-        return [center, corridor, final]
-    if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
-        center = _NAV_BELOW_X.copy() if start[1] <= 72.0 else _NAV_ABOVE_X.copy()
-        return [center, corridor, final]
-    return [corridor, final]
+    best_dist = 1e9
+    best_path: list = []
+
+    # 1-stop search
+    for c in _pool:
+        cx, cy = float(c[0]), float(c[1])
+        if (not _los_blocked(sx, sy, cx, cy, margin=_NAV_MARGIN) and
+                not _los_blocked(cx, cy, fx, fy, margin=_NAV_MARGIN)):
+            d = math.hypot(cx - sx, cy - sy) + math.hypot(fx - cx, fy - cy)
+            if d < best_dist:
+                best_dist = d
+                best_path = [c.copy(), final.copy()]
+
+    if best_path:
+        return best_path
+
+    # 2-stop search
+    for c1 in _pool:
+        c1x, c1y = float(c1[0]), float(c1[1])
+        if _los_blocked(sx, sy, c1x, c1y, margin=_NAV_MARGIN):
+            continue
+        for c2 in _pool:
+            if c2 is c1:
+                continue
+            c2x, c2y = float(c2[0]), float(c2[1])
+            if (not _los_blocked(c1x, c1y, c2x, c2y, margin=_NAV_MARGIN) and
+                    not _los_blocked(c2x, c2y, fx, fy, margin=_NAV_MARGIN)):
+                d = (math.hypot(c1x - sx, c1y - sy) +
+                     math.hypot(c2x - c1x, c2y - c1y) +
+                     math.hypot(fx - c2x, fy - c2y))
+                if d < best_dist:
+                    best_dist = d
+                    best_path = [c1.copy(), c2.copy(), final.copy()]
+
+    return best_path if best_path else [final]
 
 
 def _resolve_goal_collisions(robot, skip_center: bool = False,
@@ -1914,6 +1947,30 @@ class VexAIEnv(gym.Env):
 
         if INCLUDE_HEATMAP and heatmap is not None:
             parts.append(heatmap.flatten().astype(np.float32, copy=False))
+
+        # Goal-state features — give the policy direct visibility into how full
+        # each goal is and how many opponent-colored balls are in each.
+        # Without these, the policy can only infer goal fill indirectly from
+        # the score value, which is too late for proactive descoring decisions.
+        _LONG_CAP   = 14.0
+        _CTR_CAP    = 14.0  # center_mid (7) + center_low (7)
+        gs = self.field.goal_state
+        opp_long_fill      = len(gs.opp_long) / _LONG_CAP
+        opp_balls_opp_long = sum(1 for _, c in gs.opp_long if c == BALL_RED) / _LONG_CAP
+        our_long_fill      = len(gs.our_long) / _LONG_CAP
+        our_balls_our_long = sum(1 for _, c in gs.our_long if c == BALL_BLUE) / _LONG_CAP
+        center_fill        = (len(gs.center_mid) + len(gs.center_low)) / _CTR_CAP
+        opp_balls_center   = sum(
+            1 for _, c in gs.center_mid + gs.center_low if c == BALL_RED
+        ) / _CTR_CAP
+        parts.append(np.array([
+            opp_long_fill,       # how full is the opponent's long goal?
+            opp_balls_opp_long,  # how many of those are the opponent's color? (threat)
+            our_long_fill,       # how full is our long goal?
+            our_balls_our_long,  # how many of ours are in our goal? (progress)
+            center_fill,         # combined center goal fill
+            opp_balls_center,    # opp-colored balls in center goals (threat)
+        ], dtype=np.float32))
 
         parts.append(
             np.array([

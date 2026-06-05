@@ -149,6 +149,20 @@ class PygameRenderer:
         if pygame is None:
             raise ImportError("pygame required: pip install pygame-ce")
         pygame.init()
+
+        # Auto-scale to fit the current display (caps at SCALE=6 on large monitors)
+        global SCALE, FIELD_PX, FIELD_PY, SCREEN_W, SCREEN_H
+        _info = pygame.display.Info()
+        _avail_w = _info.current_w
+        _avail_h = _info.current_h - 48          # leave room for taskbar
+        _scale_w = (_avail_w - PANEL_W) / FIELD_W
+        _scale_h = (_avail_h - HUD_H - 376) / FIELD_H
+        SCALE    = max(3.0, min(6.0, _scale_w, _scale_h))
+        FIELD_PX = int(FIELD_W * SCALE)
+        FIELD_PY = int(FIELD_H * SCALE)
+        SCREEN_W = FIELD_PX + PANEL_W
+        SCREEN_H = FIELD_PY + HUD_H + 376
+
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
         pygame.display.set_caption("VEX Push Back 2025-26 — offsim")
         self.clock   = pygame.time.Clock()

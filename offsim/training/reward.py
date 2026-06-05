@@ -61,6 +61,8 @@ REWARD_WEIGHTS: dict[str, float] = {
     "wasted_action":        -0.10,
     "holding_urgency":      -0.02,   # per ball held (any color)
     "heading_jitter":       -0.02,   # per radian of turn beyond normal travel
+    # ── Opponent goal threat — continuous pressure to descore proactively ──
+    "opp_goal_threat":      -0.20,   # per decision: -(opp_balls_opp_long + opp_balls_center)
     # ── Phase objectives — "win early and decisively" ───────────────────
     "margin_milestone_10":  +5.0,    # one-time at margin ≥ 10 with > 50% time left
     "margin_milestone_20":  +10.0,   # one-time at margin ≥ 20 with > 25% time left
@@ -142,6 +144,14 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     # All-quadrants bonus — strong incentive to dominate control
     our_quadrants = our_ctrl // CONTROL_BONUS_PTS    # 0..4
     comps["all_quadrants"] = w["all_quadrants"] if our_quadrants == 4 else 0.0
+
+    # Opponent goal threat — continuous penalty while the opponent has their colored
+    # balls sitting in goals. Encourages proactive descoring, not just reactive.
+    gs = env.field.goal_state
+    opp_in_long   = sum(1 for _, c in gs.opp_long if c == BALL_RED)
+    opp_in_center = sum(1 for _, c in gs.center_mid + gs.center_low if c == BALL_RED)
+    threat = opp_in_long / 14.0 + opp_in_center / 14.0   # 0..2
+    comps["opp_goal_threat"] = threat * w["opp_goal_threat"]
 
     # Context-aware idle penalty
     action = env.current_actions[robot_id]
