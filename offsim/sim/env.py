@@ -29,7 +29,7 @@ from sim.config import (
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     DEFEND_ZONE_POS,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
-    SCORE_RANGE,
+    SCORE_RANGE, VISION_RANGE, VISION_HALF_ANGLE,
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
     CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE, MAX_SPEED,
     BALL_BLUE, BALL_RED,
@@ -43,10 +43,10 @@ from sim.opponent import get_opponent
 # ---------------------------------------------------------------------------
 # Goal collision resolution
 # ---------------------------------------------------------------------------
-# Margin for long goals — keeps robot body ~6" clear of the goal face
-_GOAL_MARGIN = ROBOT_W / 2 + 6.0   # 13.5"
-# Wider margin for center X arms — keeps robot body ~7" clear of each arm face
-_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 7.0   # 14.5"
+# Margin for long goals — keeps robot body ~1" clear of the goal face
+_GOAL_MARGIN = ROBOT_W / 2 + 1.0   # 8.5"
+# Wider margin for center X arms — keeps robot body ~2" clear of each arm face
+_CENTER_GOAL_MARGIN = ROBOT_W / 2 + 2.0   # 9.5"
 
 # Long goal X extents (precomputed from config)
 _RIGHT_GOAL_X_LO = FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH  # inner face
@@ -107,6 +107,12 @@ _HDG_SW = -3.0 * math.pi / 4.0
 _SCORE_HDG_TOL      = math.pi / 6.0   # 30° tolerance
 _SCORE_ARRIVAL_DIST = 6.0
 _SCORE_INTERVAL     = 1.5
+# Final-approach stop tolerance for the scoring leg. The default move tolerance
+# (ARRIVAL_DIST, 2") is wider than the standoff's margin inside SCORE_RANGE, so a
+# robot stopping on the default tolerance lands short of scoring range and can't
+# fire _do_back_in_scoring(). Nose in to within that margin instead. Derived from
+# geometry (floored) so it tracks SCORE_RANGE / robot size changes.
+_SCORE_FINAL_ARRIVAL = max(0.3, (SCORE_RANGE - _SCORE_APPROACH_GAP) - 0.25)
 
 # Action-change lock-in: when the policy picks a different action than last
 # decision, the robot freezes for this many sim ticks before executing the new
@@ -178,6 +184,35 @@ _NAV_RIGHT_LOW   = np.array([ 95.0,  40.0])  # right-goal approach, below X
 _NAV_RIGHT_HIGH  = np.array([ 95.0, 104.0])  # right-goal approach, above X
 _NAV_LEFT_LOW    = np.array([ 49.0,  40.0])  # left-goal approach,  below X
 _NAV_LEFT_HIGH   = np.array([ 49.0, 104.0])  # left-goal approach,  above X
+# Side-lane bridges: the LOW/HIGH corridors above sit inside the center-X arm
+# margin for a straight vertical run, so bottom↔top traversal needs a midpoint in
+# the clear lane between each long goal's nav margin and the X-arm margin. Verified
+# clear end-to-end (y=40↔104): x≈35 on the left (goal margin ends ~34.1, arm margin
+# starts ~44) and x≈109 on the right (arm margin ends ~100, goal margin starts
+# ~109.9). Without these the planner can't route a robot from one half to the other.
+_NAV_LEFT_LANE   = np.array([ 35.0,  72.0])  # left  side-lane (goal↔X gap)
+_NAV_RIGHT_LANE  = np.array([109.0,  72.0])  # right side-lane (X↔goal gap)
+
+# ── Creeping exploration ────────────────────────────────────────────────────
+# When a robot keeps choosing COLLECT but finds no reachable ball, it has cleaned
+# out its area. Robot.explore_barren counts those consecutive "blind" decisions;
+# the scan frontier (explore_y) then creeps from the bottom band toward the top so
+# the robot expands into unexplored territory (notably the top half) instead of
+# oscillating in the picked-clean bottom. Resets the moment it collects / sees a
+# reachable ball (see the barren update at the end of step()).
+_EXPLORE_Y_LO        = 36.0   # bottom scan band y
+_EXPLORE_Y_HI        = 108.0  # top scan band y
+_EXPLORE_BARREN_FULL = 6      # barren decisions for the frontier to reach the top
+_EXPLORE_CREEP_AT    = 2      # barren decisions before creep overrides a known quadrant
+# Reachable explore anchors spanning the field bottom→top (used by the creep to
+# pick the point nearest the rising frontier). Mid-field side lanes are included
+# so the robot has a routable stepping stone between halves.
+_EXPLORE_POOL = [
+    np.array([95.0,  36.0]), np.array([49.0,  36.0]),   # SE, SW   (bottom)
+    _NAV_LEFT_LANE.copy(),   _NAV_RIGHT_LANE.copy(),     # side lanes (mid)
+    np.array([72.0, 103.0]),                             # above center X
+    np.array([95.0, 108.0]), np.array([49.0, 108.0]),   # NE, NW   (top)
+]
 
 # Staging waypoints — one per goal end, placed 12" beyond the approach position
 # so the robot arrives already aligned on the correct axis before the last leg.
@@ -252,11 +287,19 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
         go_around = (_NAV_RIGHT_LOW if is_top else _NAV_RIGHT_HIGH).copy() \
             if is_right_long else \
             (_NAV_LEFT_LOW if is_top else _NAV_LEFT_HIGH).copy()
-        stage = np.array([float(corridor[0]), float(final[1])], dtype=np.float64)
+        # Staging point: directly below (bottom end) or above (top end) the goal
+        # at the goal's centre x. The final leg is therefore a straight N/S drive
+        # so the robot's heading aligns with the goal opening before arrival.
+        # Path layout: start → corridor → stage → final (approach).
+        if is_right_long:
+            stage = (_STAGE_R_TOP if is_top else _STAGE_R_BOT).copy()
+        else:
+            stage = (_STAGE_L_TOP if is_top else _STAGE_L_BOT).copy()
 
         # If the robot has already passed the corridor toward the goal (its x is
         # between the corridor and the goal), skip the corridor (and go-around)
-        # entirely so the robot doesn't get sent backward on subsequent steps.
+        # but still route via the stage unless the robot is already in the goal's
+        # x-column (where only a short vertical drive remains).
         start_x = float(start[0])
         corr_x  = float(corridor[0])
         past_corridor = (
@@ -264,11 +307,17 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
             (is_left_long  and start_x <= corr_x)
         )
         if past_corridor:
+            goal_cx_approx = float(stage[0])
+            in_goal_column = abs(float(start[0]) - goal_cx_approx) < 3.0
+            pts = [final] if in_goal_column else [stage, final]
             compact: list[np.ndarray] = []
-            for p in [final]:
-                if not compact or float(np.linalg.norm(p - compact[-1])) > 0.75:
+            for p in pts:
+                if not compact:
+                    if float(np.linalg.norm(p - start)) > 0.75:
+                        compact.append(p.copy())
+                elif float(np.linalg.norm(p - compact[-1])) > 0.75:
                     compact.append(p.copy())
-            return compact
+            return compact if compact else [final.copy()]
 
         legs: list[np.ndarray] = []
         if _los_blocked(start[0], start[1], corridor[0], corridor[1], margin=_NAV_MARGIN):
@@ -298,6 +347,7 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
         _NAV_RIGHT_LOW, _NAV_RIGHT_HIGH,
         _NAV_LEFT_LOW,  _NAV_LEFT_HIGH,
         _NAV_BELOW_X,   _NAV_ABOVE_X,
+        _NAV_LEFT_LANE, _NAV_RIGHT_LANE,   # side-lane bridges for bottom↔top
     ]
     sx, sy, fx, fy = float(start[0]), float(start[1]), float(final[0]), float(final[1])
 
@@ -524,14 +574,18 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
             return np.array([FIELD_W * 0.5, FIELD_H * 0.5])
 
         # Priority 2.5 — rotate-to-look before committing to a long scan drive.
-        # Check 8 evenly-spaced candidate headings; whichever puts the most
-        # on-field blue balls in the vision cone (camera LOS, no nav margin)
-        # wins.  Return a nearby look-point in that direction so the robot
-        # turns in place; Priority 1 will catch the newly-visible balls on the
-        # very next RL decision without the robot having to drive anywhere far.
+        # For each of 8 evenly-spaced candidate headings, count how many on-field
+        # blue balls would fall in the vision cone from the robot's current position
+        # if it were facing that direction (uses bare goal LOS, no nav margin).
+        # The look-point is 30" in the winning direction, but ONLY returned if it
+        # is actually navigable — if the nav planner returns [] (e.g. the robot is
+        # pressed against a goal wall and every northward look-point is inside the
+        # expanded obstacle zone), we fall through to P3 which routes to a verified
+        # scan position rather than leaving the wq empty and freezing the robot.
         from sim.route_planner import _los_blocked as _cam_los, _near_any_goal as _rtl_near
-        _best_look_angle: float | None = None
         _best_look_cnt   = 0
+        _best_look_lx: float | None = None
+        _best_look_ly: float | None = None
         for _k in range(8):
             _theta = _k * (math.pi / 4)
             _cnt = 0
@@ -546,18 +600,20 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
                 _diff   = abs(((_theta - _ang_to + math.pi) % (2 * math.pi)) - math.pi)
                 if _diff > VISION_HALF_ANGLE:
                     continue
-                if _cam_los(robot.x, robot.y, _obj.x, _obj.y):  # blocked by goal / arm
+                if _cam_los(robot.x, robot.y, _obj.x, _obj.y):
                     continue
                 _cnt += 1
             if _cnt > _best_look_cnt:
-                _best_look_cnt   = _cnt
-                _best_look_angle = _theta
-        if _best_look_angle is not None:
-            _lx = float(np.clip(robot.x + 30.0 * math.cos(_best_look_angle),
-                                7.5, FIELD_W - 7.5))
-            _ly = float(np.clip(robot.y + 30.0 * math.sin(_best_look_angle),
-                                7.5, FIELD_H - 7.5))
-            return np.array([_lx, _ly])
+                _lx = float(np.clip(robot.x + 30.0 * math.cos(_theta),
+                                    7.5, FIELD_W - 7.5))
+                _ly = float(np.clip(robot.y + 30.0 * math.sin(_theta),
+                                    7.5, FIELD_H - 7.5))
+                if _build_nav_waypoints(robot.position, np.array([_lx, _ly])):
+                    _best_look_cnt = _cnt
+                    _best_look_lx  = _lx
+                    _best_look_ly  = _ly
+        if _best_look_lx is not None:
+            return np.array([_best_look_lx, _best_look_ly])
 
         counts = {q: 0 for q in _SCAN_POS}
         for obj in on_blue:
@@ -571,15 +627,48 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
             float(np.linalg.norm(robot.position - _SCAN_POS[robot_q])) < 30.0
         )
 
-        # Pick the richest reachable quadrant; skip the one the robot is
-        # already scanning, and skip any whose nav path would be empty
-        # (corridor search failed — robot would freeze with no waypoints).
+        # Richest reachable quadrant that has KNOWN balls; skip the one the robot
+        # is already scanning, and any whose nav path would be empty (unreachable).
+        known_target: np.ndarray | None = None
         for q in sorted(counts, key=counts.__getitem__, reverse=True):
+            if counts[q] == 0:
+                break                       # no more known balls anywhere
             if q == robot_q and robot_near_scan:
                 continue
-            target = _SCAN_POS[q].copy()
-            if _build_nav_waypoints(robot.position, target):
-                return target
+            cand = _SCAN_POS[q].copy()
+            if _build_nav_waypoints(robot.position, cand):
+                known_target = cand
+                break
+
+        # Creeping exploration: once the robot has cycled several decisions without
+        # finding a reachable ball (explore_barren), or when no known quadrant is
+        # routable, push a frontier northward so it expands into new territory (the
+        # top half) instead of oscillating in the cleaned-out bottom. The frontier
+        # y creeps from the bottom band to the top as barren grows; we head for the
+        # reachable explore anchor nearest that frontier, preferring the opposite
+        # side and skipping anywhere we're already sitting.
+        barren = int(getattr(robot, "explore_barren", 0))
+        if known_target is None or barren >= _EXPLORE_CREEP_AT:
+            frontier  = min(1.0, barren / _EXPLORE_BARREN_FULL)
+            explore_y = _EXPLORE_Y_LO + frontier * (_EXPLORE_Y_HI - _EXPLORE_Y_LO)
+            robot_on_left = robot.x < FIELD_W * 0.5
+            best_pt: np.ndarray | None = None
+            best_key = float("inf")
+            for p in _EXPLORE_POOL:
+                if float(np.linalg.norm(robot.position - p)) < 16.0:
+                    continue                # already basically here — keep moving
+                if not _build_nav_waypoints(robot.position, p):
+                    continue                # not routable from here
+                same_side = (float(p[0]) < FIELD_W * 0.5) == robot_on_left
+                key = abs(float(p[1]) - explore_y) + (6.0 if same_side else 0.0)
+                if key < best_key:
+                    best_key = key
+                    best_pt  = p
+            if best_pt is not None:
+                return best_pt.copy()
+
+        if known_target is not None:
+            return known_target.copy()
 
         # No quadrant scan position is routable — fall back to the nearest
         # corridor point that IS reachable and meaningfully far from the robot.
@@ -589,6 +678,7 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
             _NAV_RIGHT_LOW, _NAV_RIGHT_HIGH,
             _NAV_LEFT_LOW,  _NAV_LEFT_HIGH,
             _NAV_BELOW_X,   _NAV_ABOVE_X,
+            _NAV_LEFT_LANE, _NAV_RIGHT_LANE,
         ]
         best_corr: np.ndarray | None = None
         best_dist = float("inf")
@@ -1437,6 +1527,12 @@ class VexAIEnv(gym.Env):
         # keep the decision alive for a minimum duration so scoring timers can fire.
         scoring_dwell_left = [0, 0]
 
+        # Set when a scoring approach is abandoned mid-decision (timeout, see the
+        # stall handler). Suppresses the chain-back replanner so the robot doesn't
+        # immediately re-commit to the same unreachable score for the rest of the
+        # decision after we've handed it off to COLLECT.
+        abandon_score = [False, False]
+
         # Stall detection: if a robot hasn't moved STALL_MIN_DIST inches in
         # STALL_CHECK_INTERVAL ticks, that's one "strike". After STALL_MAX_STRIKES
         # consecutive strikes the waypoint queue is cleared so the robot gives up
@@ -1501,9 +1597,11 @@ class VexAIEnv(gym.Env):
                 new_act  = None
                 force_replan = False
                 # Chain-back: SCORE intent paused for COLLECT, balls now held → resume SCORE
+                # (skipped once a score approach has been abandoned this decision).
                 if (act == Action.COLLECT_NEAREST_BALL
                         and original in SCORE_INTENTS
-                        and robot.balls_held > 0):
+                        and robot.balls_held > 0
+                        and not abandon_score[idx]):
                     new_act = original
                 # SCORE_* with no balls → auto-collect first
                 elif act in SCORE_INTENTS and robot.balls_held == 0:
@@ -1556,6 +1654,7 @@ class VexAIEnv(gym.Env):
                 # scoring code simultaneously steers toward required_heading,
                 # producing an orbiting/circling failure mode.
                 act_i = Action(live_actions[idx])
+                reverse_drive = False
                 if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) and robot.balls_held > 0:
                     score_pos, goal_pos, *_ = self._get_scoring_target(idx, act_i)
                     dist_to_score = float(np.linalg.norm(robot.position - score_pos))
@@ -1573,10 +1672,26 @@ class VexAIEnv(gym.Env):
                         target = None
                     else:
                         target = _current_target(idx)
+                        # Back-in approach: on the final leg to the scoring pose
+                        # (last waypoint, on the goal axis) drive REAR-first so the
+                        # robot's back leads into the goal mouth and it arrives
+                        # already aligned to score — no ~180° spin at the opening,
+                        # which is the failure mode where it freezes "facing the
+                        # intermediate point" instead of feeding the goal.
+                        if (target is not None and len(ally_wq[idx]) <= 1
+                                and float(np.linalg.norm(
+                                    np.asarray(target, dtype=np.float64) - score_pos)) < 1.5):
+                            reverse_drive = True
                 else:
                     target = _current_target(idx)
                 if target is not None:
-                    arrived = robot.move_toward_point(target)
+                    if reverse_drive:
+                        # Back in and nose fully onto the score pose (tight
+                        # tolerance) so we land within scoring range.
+                        arrived = robot.move_toward_point(
+                            target, reverse=True, arrival_dist=_SCORE_FINAL_ARRIVAL)
+                    else:
+                        arrived = robot.move_toward_point(target)
                     if arrived and len(ally_wq[idx]) > 1:
                         ally_wq[idx].pop(0)      # advance to next waypoint
                     elif arrived:
@@ -1653,6 +1768,25 @@ class VexAIEnv(gym.Env):
                         if stall_strikes[idx] >= _STALL_MAX_STRIKES:
                             ally_wq[idx].clear()
                             stall_strikes[idx] = 0
+                            # Timeout: no progress for _STALL_MAX_STRIKES intervals.
+                            # If we were scoring but never reached scoring range and
+                            # still have room to carry, abandon the approach and go
+                            # collect instead of idling out the rest of the decision.
+                            # Drop the cross-decision commit so it isn't re-imposed.
+                            act_to = Action(live_actions[idx])
+                            if act_to in SCORE_INTENTS:
+                                robot_to = self.field.allies[idx]
+                                _, goal_pos_to, *_ = self._get_scoring_target(idx, act_to)
+                                out_of_range = float(np.linalg.norm(
+                                    robot_to.position - goal_pos_to)) >= SCORE_RANGE
+                                if out_of_range and robot_to.balls_held < MAX_CARRY:
+                                    self._score_commit_left[idx] = 0
+                                    self._score_committed_action[idx] = int(Action.IDLE)
+                                    abandon_score[idx] = True
+                                    live_actions[idx]  = int(Action.COLLECT_NEAREST_BALL)
+                                    ally_wq[idx]       = _build_wq(idx)
+                                    live_action_age[idx] = 0
+                                    stall_pos_snap[idx] = self.field.allies[idx].position.copy()
                     else:
                         stall_strikes[idx] = 0
 
@@ -1719,6 +1853,36 @@ class VexAIEnv(gym.Env):
                 and travelled < 6.0
                 and not fi.is_stuck(idx)
             )
+
+        # Creeping-exploration barren counter. Grows each decision the robot is
+        # trying to collect but has no reachable ball (vision cone via P1, or
+        # navigable LOS via P2) — i.e. it's cycling without finding anything new.
+        # Resets the instant it collects or a reachable target reappears. Read by
+        # _action_to_target() to push the scan frontier north (explore the top).
+        from sim.route_planner import compute_collection_route
+        for idx in range(self.num_allies):
+            robot = self.field.allies[idx]
+            if self.collected_this_step[idx] > 0:
+                robot.explore_barren = 0
+                continue
+            collecting = (
+                Action(live_actions[idx]) == Action.COLLECT_NEAREST_BALL
+                or Action(self.current_actions[idx]) == Action.COLLECT_NEAREST_BALL
+            )
+            if not collecting:
+                continue
+            route = compute_collection_route(
+                robot.position, self.field,
+                already_held=robot.balls_held, max_volley=1, robot=robot,
+            )
+            has_target = bool(route) or (
+                self.field.nearest_navigable_target(robot.position) is not None
+            )
+            if has_target:
+                robot.explore_barren = 0
+            else:
+                robot.explore_barren = min(robot.explore_barren + 1,
+                                           _EXPLORE_BARREN_FULL)
 
         for idx in range(2):
             self.field.allies[idx].actions_attempted += 1

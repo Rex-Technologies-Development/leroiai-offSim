@@ -150,11 +150,11 @@ def _near_any_goal(x: float, y: float) -> bool:
         if np.linalg.norm(pos - g) < _GOAL_MARGIN:
             return True
 
-    # Long goal body bounding boxes — pad must match env's _GOAL_MARGIN (13.5") so
+    # Long goal body bounding boxes — pad matches env's _GOAL_MARGIN (8.5") so
     # that balls inside the physical exclusion zone are never added as targets.
     # A robot approaching such a ball would be pushed back by _resolve_goal_collisions
     # every tick and oscillate against the goal face.
-    pad = 14.0
+    pad = 8.5
     if (_R_X_LO - pad <= x <= _R_X_HI + pad and _G_Y_LO - pad <= y <= _G_Y_HI + pad):
         return True
     if (_L_X_LO - pad <= x <= _L_X_HI + pad and _G_Y_LO - pad <= y <= _G_Y_HI + pad):

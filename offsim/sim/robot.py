@@ -50,6 +50,11 @@ class Robot:
         self.speed: float = 0.0                  # current forward speed (in/s)
         self.score_timer: float = 0.0            # elapsed seconds in scoring sequence
         self.intake_active: bool = False         # True while intake is spinning (collecting)
+        # Creeping exploration: consecutive COLLECT decisions with no reachable
+        # ball found (the robot is cycling without seeing new blocks). Drives the
+        # scan frontier progressively north in env._action_to_target(). Reset to 0
+        # the moment a ball is collected or a reachable target reappears.
+        self.explore_barren: int = 0
 
     @property
     def position(self) -> np.ndarray:
@@ -72,24 +77,35 @@ class Robot:
     # ------------------------------------------------------------------
     # Tank-drive moveToPoint  (smooth arc model)
     # ------------------------------------------------------------------
-    def move_toward_point(self, target: np.ndarray) -> bool:
+    def move_toward_point(self, target: np.ndarray, reverse: bool = False,
+                          arrival_dist: float = ARRIVAL_DIST) -> bool:
         """Advance one tick (DT seconds) toward target with accel/decel.
 
         Motion model:
-          1. Turn proportionally toward target (P controller, capped by TURN_RATE).
+          1. Turn proportionally so the chosen drive axis points at the target
+             (front axis when reverse=False, rear axis when reverse=True).
           2. Compute target speed — full when aligned & far; reduced when:
                a) heading error is large (arc turning penalty)
                b) close enough that braking is needed to stop cleanly
           3. Ramp self.speed toward target speed at ACCEL / DECEL rates.
-          4. Move forward at self.speed.
+          4. Drive along the chosen axis (rear-first when reverse=True).
 
-        Returns True when within ARRIVAL_DIST inches of target.
+        reverse=True drives the robot rear-first toward the target, keeping its
+        BACK pointed at the destination. Used for backing into a goal so the
+        scoring face feeds the goal on arrival without a 180° spin at the mouth.
+
+        arrival_dist overrides the default ARRIVAL_DIST stop tolerance. The
+        scoring approach passes a tight value so the robot noses fully onto the
+        score pose (within scoring range of the goal) instead of stopping ~2"
+        short — the default tolerance is wider than the scoring-range margin.
+
+        Returns True when within arrival_dist inches of target.
         """
         self.target = target.copy()
         diff = target - self.position
         dist = float(np.linalg.norm(diff))
 
-        if dist < ARRIVAL_DIST:
+        if dist < arrival_dist:
             self.moving = False
             self.speed  = 0.0
             return True
@@ -97,7 +113,11 @@ class Robot:
         self.moving = True
 
         # --- Heading control ---
-        desired_heading = np.arctan2(diff[1], diff[0])
+        # travel_heading points from the robot toward the target. Forward driving
+        # aligns the front with it; reverse driving aligns the front with the
+        # OPPOSITE direction so the back leads into the target.
+        travel_heading  = np.arctan2(diff[1], diff[0])
+        desired_heading = _wrap_angle(travel_heading + np.pi) if reverse else travel_heading
         angle_err = _wrap_angle(desired_heading - self.heading)
         turn_delta = np.clip(angle_err * 4.0 * DT, -TURN_RATE * DT, TURN_RATE * DT)
         self.heading = _wrap_angle(self.heading + turn_delta)
@@ -125,16 +145,18 @@ class Robot:
         self.speed = float(np.clip(self.speed, 0.0, MAX_SPEED))
 
         # --- Move ---
+        # Drive along the rear axis when reversing, the front axis otherwise.
+        drive_heading = _wrap_angle(self.heading + np.pi) if reverse else self.heading
         max_move = self.speed * DT
         if dist <= max_move:
             self.position = target.copy()
             self.speed    = 0.0
         else:
-            forward = np.array([np.cos(self.heading), np.sin(self.heading)])
-            self.position = self.position + forward * max_move
+            drive = np.array([np.cos(drive_heading), np.sin(drive_heading)])
+            self.position = self.position + drive * max_move
 
         self._clamp_to_field()
-        return float(np.linalg.norm(target - self.position)) < ARRIVAL_DIST
+        return float(np.linalg.norm(target - self.position)) < arrival_dist
 
     def _clamp_to_field(self):
         half = self.half_w
@@ -154,6 +176,7 @@ class Robot:
         self.speed         = 0.0
         self.score_timer   = 0.0
         self.intake_active = False
+        self.explore_barren = 0
 
 
 def _wrap_angle(a: float) -> float:

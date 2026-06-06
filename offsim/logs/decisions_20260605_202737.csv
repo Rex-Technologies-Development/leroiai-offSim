@@ -1,0 +1,5 @@
+decision,sim_time_s,robot_id,policy_action,executed_action,action_source,pos_x,pos_y,heading_deg,balls_held,target_x,target_y,us_score,opp_score,margin,reward,top_component,travelled_in,low_progress,balls_on_field,wall_ms
+,,,,,,,,,,,,,,,,,,,,
+0,120.0,0,COLLECT_NEAREST_BALL,COLLECT_NEAREST_BALL,policy,71.5,36.0,152,4,70.1,36.7,0,0,0,-0.8600,collect_red=-0.500,40.7,0,40,1112.9
+1,120.0,0,SCORE_LONG_GOAL,SCORE_LONG_GOAL,policy,25.5,36.0,267,3,49.0,40.0,0,3,-3,-9.5907,score_red=-9.000,46.0,0,40,1654.3
+2,120.0,0,SCORE_LONG_GOAL,SCORE_LONG_GOAL,policy,19.0,39.2,285,3,23.6,36.4,9,3,6,16.9884,score_blue=+18.000,7.3,0,37,1656.3
