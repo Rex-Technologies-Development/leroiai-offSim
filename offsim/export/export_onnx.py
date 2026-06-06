@@ -9,12 +9,17 @@ import onnx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
 from sim.config import STATE_DIM
 
 
 class SB3PolicyWrapper(torch.nn.Module):
-    """Extracts just the actor forward pass for ONNX export."""
+    """Extracts just the actor forward pass for ONNX export.
+
+    Outputs raw, UNMASKED action logits. Action masking is applied outside the
+    graph at inference time (see validate_onnx.py / the deployment notes) — the
+    consumer sets invalid actions' logits to -inf before argmax.
+    """
 
     def __init__(self, sb3_policy):
         super().__init__()
@@ -30,11 +35,14 @@ class SB3PolicyWrapper(torch.nn.Module):
 
 def export_to_onnx(model_path: str, output_path: str):
     print(f"Loading model from {model_path}...")
-    model = PPO.load(model_path)
+    model = MaskablePPO.load(model_path)
     policy = model.policy
     policy.eval()
 
-    input_dim = STATE_DIM * 2  # concatenated obs for both robots
+    # Single-robot observation — matches SingleAgentWrapper used in training.
+    # (The policy controls one robot; an opponent affects the world but not the
+    # observation width.)
+    input_dim = STATE_DIM
     dummy = torch.randn(1, input_dim, dtype=torch.float32)
 
     wrapper = SB3PolicyWrapper(policy)

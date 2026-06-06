@@ -13,7 +13,7 @@ from sim.config import STATE_DIM
 def validate(onnx_path: str, model_path: str | None = None):
     import onnxruntime as ort
 
-    input_dim = STATE_DIM * 2
+    input_dim = STATE_DIM  # single-robot obs, matches the exported model
     test_input = np.random.randn(1, input_dim).astype(np.float32)
 
     print(f"Loading ONNX model: {onnx_path}")
@@ -24,10 +24,10 @@ def validate(onnx_path: str, model_path: str | None = None):
 
     if model_path:
         import torch
-        from stable_baselines3 import PPO
+        from sb3_contrib import MaskablePPO
         from export.export_onnx import SB3PolicyWrapper
 
-        model = PPO.load(model_path)
+        model = MaskablePPO.load(model_path)
         wrapper = SB3PolicyWrapper(model.policy)
         wrapper.eval()
 

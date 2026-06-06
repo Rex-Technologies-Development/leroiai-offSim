@@ -5,12 +5,14 @@
 torch
 gymnasium
 stable-baselines3
+sb3-contrib
 d3rlpy
 pygame-ce
 numpy
 scipy
 onnx
 onnxruntime
+onnxscript  # required by torch>=2.x torch.onnx.export (dynamo path)
 tensorboard
 pyyaml
 tqdm
