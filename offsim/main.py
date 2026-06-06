@@ -278,6 +278,11 @@ def cmd_eval(args):
     )
     if render_mode:
         env.render()
+        # The renderer starts paused by default; auto-run so the policy plays
+        # immediately instead of stopping after the first decision. (Space/RUN
+        # still toggles pause, S steps one decision.)
+        if getattr(env.env, "_renderer", None) is not None:
+            env.env._renderer.paused = False
 
     print(f"Loading model from {model_path}...")
 

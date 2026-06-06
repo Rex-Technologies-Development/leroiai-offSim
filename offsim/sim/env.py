@@ -1352,7 +1352,7 @@ class VexAIEnv(gym.Env):
         """Boolean mask of shape (NUM_ACTIONS,) — True = action valid this decision.
 
         Rules:
-          DESCORE_OPP_LONG  only when opp's long goal has balls
+          DESCORE_OPP_LONG  only when opp's long goal has opp-colored balls
           DESCORE_CENTER    only when center goals contain opp-colored balls
           EJECT_WRONG_COLOR only when robot holds wrong-color balls
           SCORE_*           always available — auto-chains to COLLECT first if empty
@@ -1369,8 +1369,13 @@ class VexAIEnv(gym.Env):
         # opponent score yet, descore stays unavailable until it looks.
         gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
 
-        # Descore opp long: only when their goal has balls to remove
-        if len(gs.opp_long) == 0:
+        # Descore opp long: only when their goal holds OPPONENT-colored balls.
+        # (try_descore only removes opp-scored balls, so descoring a goal full of
+        # our own balls is a no-op that just parks the robot at the wall — and
+        # with no opponents there's never anything to descore. Mirror the center
+        # rule, which already checks color.)
+        opp_in_long = any(color != BALL_BLUE for _, color in gs.opp_long)
+        if not opp_in_long:
             mask[int(Action.DESCORE_OPP_LONG)] = False
 
         # Descore center: only when center goals hold opponent-colored balls
