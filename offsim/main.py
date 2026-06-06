@@ -18,13 +18,52 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+def _greedy_score_action(robot, env) -> int:
+    """Pick the SCORE action for the NEAREST non-full goal (long / mid / low).
+
+    Greedy by approach distance so the demo naturally exercises all three goal
+    types — long when near a long goal, center mid/low when near the X — instead
+    of always driving back to a long goal. Full goals are skipped; if every goal
+    is full it falls back to the long goal.
+    """
+    import numpy as np
+    from sim.config import Action
+    from sim.env import _nearest_long_goal_target, _nearest_center_tip
+
+    # Decide on the robot's PERCEIVED goal state (camera belief) when available,
+    # so the demo reflects what it actually knows — not omniscient ground truth.
+    gs = getattr(env, "goal_belief", None) if getattr(env, "use_goal_belief", False) \
+        else None
+    if gs is None:
+        gs = env.field.goal_state
+    options: list[tuple[float, int]] = []   # (approach_dist, action)
+
+    long_app, _, _, long_gname = _nearest_long_goal_target(robot)
+    if len(getattr(gs, long_gname)) < 14:
+        options.append((float(np.linalg.norm(robot.position - long_app)),
+                        int(Action.SCORE_LONG_GOAL)))
+    mid_app, *_ = _nearest_center_tip(robot, lower=False)
+    if len(gs.center_mid) < 7:
+        options.append((float(np.linalg.norm(robot.position - mid_app)),
+                        int(Action.SCORE_CENTER_MID)))
+    low_app, *_ = _nearest_center_tip(robot, lower=True)
+    if len(gs.center_low) < 7:
+        options.append((float(np.linalg.norm(robot.position - low_app)),
+                        int(Action.SCORE_CENTER_LOW)))
+
+    if not options:
+        return int(Action.SCORE_LONG_GOAL)
+    options.sort(key=lambda o: o[0])
+    return options[0][1]
+
+
 def _greedy_demo_action(robot_idx: int, env) -> int:
-    """Greedy demo policy: collect until full, then score nearest long goal.
+    """Greedy demo policy: collect until full, then score the nearest goal.
 
     Priority:
-      1. Full (MAX_CARRY balls) → SCORE_LONG_GOAL
+      1. Full (MAX_CARRY balls) → score nearest non-full goal (long / mid / low)
       2. Accessible balls exist → COLLECT_NEAREST_BALL
-      3. Holding any balls but none accessible → SCORE_LONG_GOAL
+      3. Holding any balls but none accessible → score nearest non-full goal
       4. No balls anywhere → IDLE
     """
     from sim.route_planner import compute_collection_route
@@ -33,7 +72,7 @@ def _greedy_demo_action(robot_idx: int, env) -> int:
     robot = env.field.allies[robot_idx]
 
     if robot.balls_held >= MAX_CARRY:
-        return int(Action.SCORE_LONG_GOAL)
+        return _greedy_score_action(robot, env)
 
     route = compute_collection_route(
         robot.position, env.field,
@@ -44,7 +83,7 @@ def _greedy_demo_action(robot_idx: int, env) -> int:
     if route:
         return int(Action.COLLECT_NEAREST_BALL)
     if robot.balls_held > 0:
-        return int(Action.SCORE_LONG_GOAL)
+        return _greedy_score_action(robot, env)
     return int(Action.COLLECT_NEAREST_BALL)   # fallback: drive toward field to get LOS
 
 
@@ -61,8 +100,10 @@ def cmd_demo(args):
         num_allies=args.num_robots,
     )
     env.enable_logging(args.log_dir)
-    obs, _ = env.reset(seed=42)
-    rng = np.random.default_rng(42)
+    # No fixed seed → the ball layout (positions + colors) is randomized fresh on
+    # every run and on every reset, so no two demos start the same.
+    obs, _ = env.reset()
+    rng = np.random.default_rng()
     episode = 1
     total_reward = 0.0
 
@@ -96,9 +137,13 @@ def cmd_demo(args):
             renderer.step_once = False
 
         if renderer and renderer.demo_score:
-            # Demo scoring: force SCORE_LONG_GOAL until robots have emptied all balls.
+            # Demo scoring: force scoring (nearest non-full goal — long / mid / low)
+            # until robots have emptied all balls.
             from sim.config import Action
-            actions = np.array([int(Action.SCORE_LONG_GOAL)] * 2)
+            actions = np.array([
+                _greedy_score_action(env.field.allies[0], env),
+                _greedy_score_action(env.field.allies[min(1, env.num_allies - 1)], env),
+            ])
             # Auto-exit demo mode once all robots have finished scoring
             all_done = all(env.field.allies[i].balls_held == 0
                            for i in range(env.num_allies))

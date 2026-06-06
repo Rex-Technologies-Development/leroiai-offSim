@@ -5,11 +5,40 @@ overfitting to one strategy.
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 import numpy as np
 from sim.config import (
     Action, MAX_CARRY,
     OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL, OUR_LONG_GOAL,
 )
+
+
+# ---------------------------------------------------------------------------
+# Opponent physical profile (capabilities) — separate from the policy/strategy
+# above. The policy decides WHAT to do; the profile decides HOW capable the
+# robot is. More named profiles can be added later (e.g. "fast", "weak") and
+# selected per training stage.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class OpponentProfile:
+    name:           str   = "standard"
+    speed_scale:    float = 0.75    # top speed vs our robot (0.75 = 25% slower)
+    score_interval: float = 2.25    # dwell (s) to deposit a load — a bit slower than
+                                    # our ~1.5s back-in (env._SCORE_INTERVAL)
+    capacity:       int   = MAX_CARRY   # balls it can hold (same as us, for now)
+
+
+# Default profile applied to opponents until per-type profiles are introduced.
+DEFAULT_OPPONENT_PROFILE = OpponentProfile()
+
+# Registry for future opponent profiles (add entries as new types are designed).
+OPPONENT_PROFILES = {
+    "standard": DEFAULT_OPPONENT_PROFILE,
+}
+
+
+def get_opponent_profile(name: str = "standard") -> OpponentProfile:
+    return OPPONENT_PROFILES.get(name, DEFAULT_OPPONENT_PROFILE)
 
 
 class RandomOpponent:

@@ -42,6 +42,7 @@ from sim.env import SingleAgentWrapper
 from sim.config import Action
 from sim.failure import FailureConfig
 from training.curriculum import CurriculumCallback
+from training.callbacks import ScoreLoggingCallback
 
 
 # ---------------------------------------------------------------------------
@@ -107,21 +108,17 @@ class EpisodeStatsCallback(BaseCallback):
         self._cur_ep_rewards += np.asarray(rewards, dtype=np.float64)
 
         if len(dones) and any(dones):
-            # Score lookup: fetch all finished envs' scores in one call
             done_indices = [i for i, d in enumerate(dones) if d]
-            try:
-                all_scores = self.training_env.env_method(
-                    "_get_episode_scores", indices=done_indices
-                )
-            except Exception:
-                all_scores = [(0.0, 0.0)] * len(done_indices)
-
-            for i, scores in zip(done_indices, all_scores):
+            # Read the FINAL scores from info — the env stashes them there on the
+            # done step. (env_method("_get_episode_scores") would read 0 because
+            # SB3 auto-resets the finished env before this callback runs.)
+            infos = self.locals.get("infos", [])
+            for i in done_indices:
+                info = infos[i] if i < len(infos) else {}
                 self._n_episodes += 1
                 self._ep_rewards.append(float(self._cur_ep_rewards[i]))
-                b, red = float(scores[0]), float(scores[1])
-                self._ep_blue.append(b)
-                self._ep_red.append(red)
+                self._ep_blue.append(float(info.get("episode_score", 0.0)))
+                self._ep_red.append(float(info.get("episode_opp_score", 0.0)))
                 self._cur_ep_rewards[i] = 0.0   # reset only the env that finished
 
             if self.verbose and self._n_episodes % self._log_freq == 0:
@@ -274,6 +271,9 @@ def train(
             verbose=1,
         ),
         EpisodeStatsCallback(log_freq_episodes=100, rendered_env=rendered_env, verbose=1),
+        # TensorBoard game-score curves (game/avg_score, win_rate, avg_margin) so
+        # scoring progress is visible beyond the console readout.
+        ScoreLoggingCallback(verbose=1),
     ]
 
     # Resolve PyTorch device. SB3 accepts 'auto', 'cpu', 'cuda'.

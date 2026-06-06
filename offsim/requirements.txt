@@ -13,3 +13,5 @@ onnx
 onnxruntime
 tensorboard
 pyyaml
+tqdm
+rich

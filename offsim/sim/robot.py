@@ -50,6 +50,13 @@ class Robot:
         self.speed: float = 0.0                  # current forward speed (in/s)
         self.score_timer: float = 0.0            # elapsed seconds in scoring sequence
         self.intake_active: bool = False         # True while intake is spinning (collecting)
+
+        # Physical capabilities. Allies run at full spec; opponents may be set
+        # slower / weaker via an OpponentProfile (see sim/opponent.py). These are
+        # CAPABILITIES, not per-episode state, so reset() leaves them untouched.
+        self.speed_scale: float = 1.0           # multiplier on MAX_SPEED top speed
+        self.capacity:    int   = MAX_CARRY     # max balls this robot can hold
+        self.score_interval: float = 0.0        # opponents: dwell (s) to score a load
         # Creeping exploration: consecutive COLLECT decisions with no reachable
         # ball found (the robot is cycling without seeing new blocks). Drives the
         # scan frontier progressively north in env._action_to_target(). Reset to 0
@@ -124,6 +131,8 @@ class Robot:
         abs_err = abs(_wrap_angle(desired_heading - self.heading))
 
         # --- Speed target ---
+        # Per-robot top speed (opponents may be throttled via speed_scale).
+        max_speed = MAX_SPEED * self.speed_scale
         # Turning penalty: slow when pointing away, full speed when aligned
         heading_factor = max(0.08, 1.0 - abs_err / np.pi)
 
@@ -133,16 +142,16 @@ class Robot:
         if dist <= stop_dist + 1.0:
             # Inside braking window — scale down proportionally
             decel_factor = max(0.0, dist / (stop_dist + 1.0))
-            target_speed = MAX_SPEED * min(heading_factor, decel_factor)
+            target_speed = max_speed * min(heading_factor, decel_factor)
         else:
-            target_speed = MAX_SPEED * heading_factor
+            target_speed = max_speed * heading_factor
 
         # --- Ramp current speed toward target ---
         if self.speed < target_speed:
             self.speed = min(self.speed + ACCEL * DT, target_speed)
         else:
             self.speed = max(self.speed - DECEL * DT, target_speed)
-        self.speed = float(np.clip(self.speed, 0.0, MAX_SPEED))
+        self.speed = float(np.clip(self.speed, 0.0, max_speed))
 
         # --- Move ---
         # Drive along the rear axis when reversing, the front axis otherwise.

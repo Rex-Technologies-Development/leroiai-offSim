@@ -34,10 +34,10 @@ from sim.config import (
     CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE, MAX_SPEED,
     BALL_BLUE, BALL_RED,
 )
-from sim.field import Field
+from sim.field import Field, GoalState
 from sim.robot import Robot
 from sim.failure import FailureConfig, FailureInjector
-from sim.opponent import get_opponent
+from sim.opponent import get_opponent, DEFAULT_OPPONENT_PROFILE
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +231,14 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
       2. Final is a long-goal end approach → use a fixed two-step staging path
          (corridor → staging → final) that guarantees correct heading alignment.
       3. Otherwise: corridor detour, with a centre go-around if still blocked.
+
+    Park platforms are soft-avoided: a direct/detour leg that cuts through a park
+    zone is penalised so a park-free route wins when one exists, but the robot
+    still falls back to crossing (or to a target inside a park) rather than
+    stranding itself.
     """
-    from sim.route_planner import _los_blocked, _NAV_MARGIN
+    from sim.route_planner import (_los_blocked, _NAV_MARGIN,
+                                   seg_crosses_park, point_in_park, _PARK_AVOID)
 
     # If we're already at (or extremely close to) the final point, don't run the
     # LOS/detour planner. Some edge cases around zero-length segments can cause
@@ -332,8 +338,16 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
                 compact.append(p)
         return compact
 
-    # Direct path (most common for collect actions)
-    if not _los_blocked(start[0], start[1], final[0], final[1], margin=_NAV_MARGIN):
+    # Soft park avoidance applies unless the destination itself is in a park zone
+    # (then the robot must enter, so don't fight it).
+    avoid_park = _PARK_AVOID and not point_in_park(float(final[0]), float(final[1]))
+    direct_clear = not _los_blocked(start[0], start[1], final[0], final[1], margin=_NAV_MARGIN)
+
+    # Direct path (most common for collect actions) — take it when clear, and
+    # (unless heading into a park) when it doesn't cut through a park zone.
+    if direct_clear and not (avoid_park and
+                             seg_crosses_park(float(start[0]), float(start[1]),
+                                              float(final[0]), float(final[1]))):
         return [final]
 
     # NOTE: Long-goal scoring is handled by the block above. For non-scoring
@@ -351,7 +365,13 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
     ]
     sx, sy, fx, fy = float(start[0]), float(start[1]), float(final[0]), float(final[1])
 
-    best_dist = 1e9
+    # Park crossing adds a large but FINITE cost so a park-free route always wins
+    # when one exists, yet a crossing route is still chosen over stranding.
+    _PARK_PENALTY = 1000.0
+    def _park_pen(x0: float, y0: float, x1: float, y1: float) -> float:
+        return _PARK_PENALTY if (avoid_park and seg_crosses_park(x0, y0, x1, y1)) else 0.0
+
+    best_cost = 1e18
     best_path: list = []
 
     # 1-stop search
@@ -359,15 +379,14 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
         cx, cy = float(c[0]), float(c[1])
         if (not _los_blocked(sx, sy, cx, cy, margin=_NAV_MARGIN) and
                 not _los_blocked(cx, cy, fx, fy, margin=_NAV_MARGIN)):
-            d = math.hypot(cx - sx, cy - sy) + math.hypot(fx - cx, fy - cy)
-            if d < best_dist:
-                best_dist = d
+            cost = (math.hypot(cx - sx, cy - sy) + math.hypot(fx - cx, fy - cy)
+                    + _park_pen(sx, sy, cx, cy) + _park_pen(cx, cy, fx, fy))
+            if cost < best_cost:
+                best_cost = cost
                 best_path = [c.copy(), final.copy()]
 
-    if best_path:
-        return best_path
-
-    # 2-stop search
+    # 2-stop search — run even when a 1-stop exists so a park-free 2-stop can
+    # beat a park-crossing 1-stop (distances otherwise keep the 1-stop ahead).
     for c1 in _pool:
         c1x, c1y = float(c1[0]), float(c1[1])
         if _los_blocked(sx, sy, c1x, c1y, margin=_NAV_MARGIN):
@@ -378,16 +397,28 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
             c2x, c2y = float(c2[0]), float(c2[1])
             if (not _los_blocked(c1x, c1y, c2x, c2y, margin=_NAV_MARGIN) and
                     not _los_blocked(c2x, c2y, fx, fy, margin=_NAV_MARGIN)):
-                d = (math.hypot(c1x - sx, c1y - sy) +
-                     math.hypot(c2x - c1x, c2y - c1y) +
-                     math.hypot(fx - c2x, fy - c2y))
-                if d < best_dist:
-                    best_dist = d
+                cost = (math.hypot(c1x - sx, c1y - sy) +
+                        math.hypot(c2x - c1x, c2y - c1y) +
+                        math.hypot(fx - c2x, fy - c2y) +
+                        _park_pen(sx, sy, c1x, c1y) +
+                        _park_pen(c1x, c1y, c2x, c2y) +
+                        _park_pen(c2x, c2y, fx, fy))
+                if cost < best_cost:
+                    best_cost = cost
                     best_path = [c1.copy(), c2.copy(), final.copy()]
 
-    # If no corridor path was found, return [] rather than routing through the
-    # obstacle. The caller treats [] as "robot stays put" for this decision,
-    # which is correct — driving through a goal face causes oscillation.
+    # Prefer a park-free corridor route (cost under the penalty floor).
+    if best_path and best_cost < _PARK_PENALTY:
+        return best_path
+
+    # No park-free corridor route exists. If the direct path is obstacle-clear,
+    # take it (shortest park crossing) instead of a longer crossing detour.
+    if direct_clear:
+        return [final]
+
+    # Goal-blocked AND every corridor route crosses a park → best available
+    # route (may cross a park), or [] if nothing routes at all. Returning [] makes
+    # the caller keep the robot put rather than drive through a goal face.
     return best_path
 
 
@@ -649,7 +680,15 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
         # side and skipping anywhere we're already sitting.
         barren = int(getattr(robot, "explore_barren", 0))
         if known_target is None or barren >= _EXPLORE_CREEP_AT:
-            frontier  = min(1.0, barren / _EXPLORE_BARREN_FULL)
+            # Triangle-wave frontier: sweep the band UP to the top then back DOWN,
+            # repeating, so a persistently barren robot covers the whole field
+            # instead of camping at the top once it maxes out. A monotonic creep
+            # could strand it in a top corner pocket, never re-acquiring balls that
+            # are only visible/navigable from mid- or low-field.
+            period   = 2 * _EXPLORE_BARREN_FULL
+            phase    = barren % period
+            frontier = (phase if phase <= _EXPLORE_BARREN_FULL
+                        else period - phase) / _EXPLORE_BARREN_FULL
             explore_y = _EXPLORE_Y_LO + frontier * (_EXPLORE_Y_HI - _EXPLORE_Y_LO)
             robot_on_left = robot.x < FIELD_W * 0.5
             best_pt: np.ndarray | None = None
@@ -765,6 +804,7 @@ class VexAIEnv(gym.Env):
         alliance: str = "blue",
         log_decisions: bool = False,
         log_dir: str = "logs",
+        opponent_profile=None,
     ):
         super().__init__()
         self.render_mode    = render_mode
@@ -791,7 +831,27 @@ class VexAIEnv(gym.Env):
 
         self.opponent_policy = get_opponent(opponent_type)
         self.field           = Field()
+        # Opponent physical profile (speed / scoring rate / capacity). Stamped
+        # onto the opponent robots so they can differ from our robot. Swap the
+        # profile later to train against different opponent types.
+        self.opponent_profile = opponent_profile or DEFAULT_OPPONENT_PROFILE
+        self._apply_opponent_profile()
         self._renderer       = None
+
+        # ── Perceived goal state (camera-based belief) ──────────────────────
+        # field.goal_state is GROUND TRUTH. goal_belief is what the TEAM believes
+        # is scored in each goal, updated only from the robots' camera FOV (and
+        # their own scoring/descoring). It can go STALE: if an opponent descores a
+        # goal no ally is looking at, the belief keeps the last-seen contents until
+        # a robot sees that goal again. The policy/observation and decision
+        # heuristics act on this belief — the robot never assumes a scored ball
+        # stays forever; what it last saw in its FOV is its game-state knowledge.
+        # Toggle off to fall back to omniscient ground-truth (e.g. for an
+        # easier full-observability training curriculum).
+        self.use_goal_belief = True
+        self.goal_belief     = GoalState()
+        self._goal_in_view   = {"our_long": False, "opp_long": False,
+                                "center_mid": False, "center_low": False}
         # Action-change lock-in counter and last-action snapshot — see
         # _ACTION_CHANGE_PAUSE_TICKS at module top.
         self.action_pause_ticks    = np.zeros(2, dtype=np.int32)
@@ -867,6 +927,10 @@ class VexAIEnv(gym.Env):
         super().reset(seed=seed)
         self.rng = np.random.default_rng(seed)
         self.field.reset(self.rng)
+        # Goals start empty — that's known, so the belief starts accurate (empty).
+        self.goal_belief.reset()
+        for _g in self._goal_in_view:
+            self._goal_in_view[_g] = False
         # Curriculum stage 1: paint every ball blue so the policy can practice
         # collect→score chains without needing to discriminate by color yet.
         if self.all_blue_only:
@@ -1298,7 +1362,12 @@ class VexAIEnv(gym.Env):
         if robot_id >= self.num_allies:
             return mask
         robot = self.field.allies[robot_id]
-        gs    = self.field.goal_state
+        # Mask descore on the PERCEIVED goal state — the robot can only choose to
+        # descore a goal it BELIEVES holds opponent balls (what it has seen), not
+        # via omniscient truth. If its belief is stale it may drive over and find
+        # nothing (and the mid-step replanner re-routes); if it hasn't seen an
+        # opponent score yet, descore stays unavailable until it looks.
+        gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
 
         # Descore opp long: only when their goal has balls to remove
         if len(gs.opp_long) == 0:
@@ -1585,8 +1654,17 @@ class VexAIEnv(gym.Env):
             # `current_actions` keeps the agent's original choice so the
             # wasted-action penalty still fires. `live_actions` is what's
             # actually executed this tick.
-            n_opp_scored = len(self.field.scored_by_opp_indices()) if self.num_opponents > 0 else 0
-            our_long_count = len(self.field.goal_state.our_long)
+            # Descore/defend decisions act on the PERCEIVED goal state (what the
+            # team has seen), not omniscient truth — the robot can't react to an
+            # opponent score it hasn't observed yet.
+            _gs_dec = self.goal_belief if self.use_goal_belief else self.field.goal_state
+            n_opp_scored = (
+                sum(1 for _, c in (_gs_dec.our_long + _gs_dec.opp_long
+                                   + _gs_dec.center_mid + _gs_dec.center_low)
+                    if c == BALL_RED)
+                if self.num_opponents > 0 else 0
+            )
+            our_long_count = len(_gs_dec.our_long)
             defend_worth_it = (self.num_opponents > 0) and (our_long_count > 0)
             SCORE_INTENTS = (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID,
                              Action.SCORE_CENTER_LOW)
@@ -1795,6 +1873,11 @@ class VexAIEnv(gym.Env):
                     self.field.opponents[oi].move_toward_point(self.opp_targets[oi])
                 _resolve_goal_collisions(self.field.opponents[oi])
 
+            # Refresh perceived goal state from camera FOV (after movement, so
+            # headings are current). Scanning/driving past a goal updates what the
+            # team knows is scored in it; goals out of view keep their last belief.
+            self._update_goal_belief()
+
             # Update intake state: spinning only while actively collecting and not full
             for idx in range(self.num_allies):
                 robot = self.field.allies[idx]
@@ -1881,8 +1964,10 @@ class VexAIEnv(gym.Env):
             if has_target:
                 robot.explore_barren = 0
             else:
-                robot.explore_barren = min(robot.explore_barren + 1,
-                                           _EXPLORE_BARREN_FULL)
+                # Keep counting well past _EXPLORE_BARREN_FULL so the triangle-wave
+                # frontier in _action_to_target() keeps cycling (sweeps up↔down)
+                # rather than saturating at the top. Capped only to stay tidy.
+                robot.explore_barren = min(robot.explore_barren + 1, 600)
 
         for idx in range(2):
             self.field.allies[idx].actions_attempted += 1
@@ -1926,7 +2011,14 @@ class VexAIEnv(gym.Env):
                     travelled_in=_travelled,
                 )
 
-        return self._get_obs(), (r0, r1), self.done, False, {}
+        # On episode end, stash the FINAL scores in info. SB3's VecEnv auto-resets
+        # a done env before the training callbacks run, so reading env.field after
+        # the step yields the freshly-reset 0 — callbacks must read these instead.
+        info: dict = {}
+        if self.done:
+            info["episode_score"]     = float(self.field.my_score)
+            info["episode_opp_score"] = float(self.field.opponent_score)
+        return self._get_obs(), (r0, r1), self.done, False, info
 
     # ------------------------------------------------------------------
     # Effect checks (called each tick)
@@ -2031,6 +2123,49 @@ class VexAIEnv(gym.Env):
         # Fallback (shouldn't happen)
         return [score_pos]
 
+    # ------------------------------------------------------------------
+    # Perceived goal state (camera FOV belief)
+    # ------------------------------------------------------------------
+    # Sample points per goal that the camera must see to "read" its contents.
+    # Long goals: bar centre + both ends. Center goals: their reference points.
+    _GOAL_VIEW_POINTS = {
+        "our_long":   [(_RIGHT_GOAL_CX, _CY),
+                       (_RIGHT_GOAL_CX, LONG_GOAL_Y_MIN),
+                       (_RIGHT_GOAL_CX, LONG_GOAL_Y_MAX)],
+        "opp_long":   [(_LEFT_GOAL_CX, _CY),
+                       (_LEFT_GOAL_CX, LONG_GOAL_Y_MIN),
+                       (_LEFT_GOAL_CX, LONG_GOAL_Y_MAX)],
+        "center_mid": [(float(CENTER_MID_GOAL[0]), float(CENTER_MID_GOAL[1]))],
+        "center_low": [(float(CENTER_LOW_GOAL[0]), float(CENTER_LOW_GOAL[1]))],
+    }
+
+    def _observe_goal(self, gname: str) -> None:
+        """Copy one goal's ground-truth contents into the belief (robot read it)."""
+        self.goal_belief._list(gname)[:] = list(getattr(self.field.goal_state, gname))
+
+    def _update_goal_belief(self) -> None:
+        """Refresh the perceived goal state from the robots' camera FOV.
+
+        For each goal, if ANY ally currently sees it (cone + range, with the
+        center X occluding long-goal sightlines), copy ground truth into the
+        belief. Goals nobody is looking at keep their last-seen contents and may
+        therefore be stale (e.g. after an unseen opponent descore).
+        """
+        from sim.route_planner import goal_in_fov
+        for gname, pts in self._GOAL_VIEW_POINTS.items():
+            is_long = gname.endswith("long")
+            seen = False
+            for r in self.field.allies:
+                for gx, gy in pts:
+                    if goal_in_fov(r, gx, gy, blocked_by_arms=is_long):
+                        seen = True
+                        break
+                if seen:
+                    break
+            self._goal_in_view[gname] = seen
+            if seen:
+                self._observe_goal(gname)
+
     def _check_ally_effects(self, idx: int, action: Action):
         robot = self.field.allies[idx]
 
@@ -2071,6 +2206,7 @@ class VexAIEnv(gym.Env):
             if pts > 0:
                 self.descore_events[idx] += pts
                 robot.actions_succeeded += 1
+                self._observe_goal("opp_long")   # we know what we just removed
 
         elif action == Action.DESCORE_CENTER:
             pts = self.field.try_descore(robot, CENTER_MID_GOAL, self.rng)
@@ -2079,6 +2215,8 @@ class VexAIEnv(gym.Env):
             if pts > 0:
                 self.descore_events[idx] += pts
                 robot.actions_succeeded += 1
+                self._observe_goal("center_mid")
+                self._observe_goal("center_low")
 
         elif action == Action.EJECT_WRONG_COLOR:
             # One-shot per decision. Important: the action-change pause can
@@ -2135,6 +2273,9 @@ class VexAIEnv(gym.Env):
             if gname in ("center_mid", "center_low"):
                 self.center_score_events[idx] += pts
             robot.actions_succeeded += 1
+            # The robot knows what it just deposited even though the goal is now
+            # behind it (it backed in) — update the belief from its own scoring.
+            self._observe_goal(gname)
             if ejected is not None:
                 self._handle_overflow(ejected, gname, prepend, points)
             if ball_color is not None:
@@ -2214,13 +2355,42 @@ class VexAIEnv(gym.Env):
         obj.x = round(float(np.clip(obj.x, ROBOT_W / 2 + 1, FIELD_W - ROBOT_W / 2 - 1)), 2)
         obj.y = round(float(np.clip(obj.y, ROBOT_W / 2 + 1, FIELD_H - ROBOT_W / 2 - 1)), 2)
 
+    def _apply_opponent_profile(self) -> None:
+        """Stamp the opponent physical profile onto the opponent robots.
+
+        Capabilities persist across episodes (Robot.reset() leaves them alone),
+        so this only needs to run once at construction. Swap self.opponent_profile
+        and call again to retune (e.g. for a different opponent type later).
+        """
+        p = self.opponent_profile
+        for opp in self.field.opponents:
+            opp.speed_scale    = p.speed_scale
+            opp.capacity       = p.capacity
+            opp.score_interval = p.score_interval
+
     def _check_opp_effects(self):
         for oi in range(self.num_opponents):
             opp = self.field.opponents[oi]
             self.field.opp_try_collect(opp, self.rng)
-            self.field.opp_try_score(opp, OPP_LONG_GOAL,   LONG_GOAL_POINTS)
-            self.field.opp_try_score(opp, CENTER_MID_GOAL, CENTER_GOAL_POINTS)
-            self.field.opp_try_score(opp, CENTER_LOW_GOAL, CENTER_GOAL_POINTS)
+
+            # Scoring: the opponent must DWELL in range of a goal for its
+            # score_interval (profile) before depositing its load — a bit slower
+            # than our timed back-in, instead of the old instant dump.
+            in_range = False
+            if opp.balls_held > 0:
+                for goal_pos, pts in ((OPP_LONG_GOAL,   LONG_GOAL_POINTS),
+                                      (CENTER_MID_GOAL, CENTER_GOAL_POINTS),
+                                      (CENTER_LOW_GOAL, CENTER_GOAL_POINTS)):
+                    if float(np.linalg.norm(opp.position - goal_pos)) < SCORE_RANGE:
+                        in_range = True
+                        opp.score_timer += DT
+                        if opp.score_timer >= opp.score_interval:
+                            opp.score_timer = 0.0
+                            self.field.opp_try_score(opp, goal_pos, pts)
+                        break
+            if not in_range:
+                opp.score_timer = 0.0   # not lined up on a goal — reset the dwell
+
             self.field.opp_try_descore(opp, OUR_LONG_GOAL,   self.rng)
             self.field.opp_try_descore(opp, CENTER_MID_GOAL, self.rng)
 
@@ -2273,7 +2443,9 @@ class VexAIEnv(gym.Env):
             heatmap = self.field.get_heatmap()
 
         # Current quadrant control snapshot (normalised — 4 quadrants total).
-        ctrl_now = self.field.goal_state.compute_quadrant_control()
+        # From the PERCEIVED goal state — the policy only knows control it has seen.
+        _gs_obs  = self.goal_belief if self.use_goal_belief else self.field.goal_state
+        ctrl_now = _gs_obs.compute_quadrant_control()
         ctrl_us  = sum(1 for c in ctrl_now.values() if c == BALL_BLUE) / 4.0
         ctrl_opp = sum(1 for c in ctrl_now.values() if c == BALL_RED)  / 4.0
 
@@ -2311,9 +2483,11 @@ class VexAIEnv(gym.Env):
         # each goal is and how many opponent-colored balls are in each.
         # Without these, the policy can only infer goal fill indirectly from
         # the score value, which is too late for proactive descoring decisions.
+        # Sourced from the PERCEIVED goal state (camera belief) so the policy acts
+        # on what it has actually seen, not omniscient truth.
         _LONG_CAP   = 14.0
         _CTR_CAP    = 14.0  # center_mid (7) + center_low (7)
-        gs = self.field.goal_state
+        gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
         opp_long_fill      = len(gs.opp_long) / _LONG_CAP
         opp_balls_opp_long = sum(1 for _, c in gs.opp_long if c == BALL_RED) / _LONG_CAP
         our_long_fill      = len(gs.our_long) / _LONG_CAP

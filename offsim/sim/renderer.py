@@ -2053,6 +2053,22 @@ class PygameRenderer:
             count_s = f"({n_r}r {n_b}b)" if n else "(empty)"
             hdr = self.font_sm.render(f"{label}  {cap_pct}  {count_s}", True, hdr_col)
             self.screen.blit(hdr, (px, y))
+            # ── Perceived-state marker: what the robot's camera knows vs reality ──
+            # Green "see" = goal is in an ally's FOV right now (belief is current).
+            # Amber "knew Xr Yb" = belief differs from reality and nobody is
+            # looking (stale — e.g. an opponent changed it out of view).
+            belief = getattr(env, "goal_belief", None)
+            if belief is not None:
+                seen  = getattr(env, "_goal_in_view", {}).get(gname, False)
+                b_lst = belief._list(gname)
+                bn, br = len(b_lst), sum(1 for _, c in b_lst if c == BALL_RED)
+                mx = px + hdr.get_width() + 6
+                if seen:
+                    self.screen.blit(self.font_sm.render("see", True, (80, 220, 120)), (mx, y))
+                elif bn != n or br != n_r:
+                    self.screen.blit(
+                        self.font_sm.render(f"knew {br}r{bn - br}b", True, (230, 170, 60)),
+                        (mx, y))
             y += 13
 
             if lst:

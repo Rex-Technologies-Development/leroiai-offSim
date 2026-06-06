@@ -386,7 +386,7 @@ class Field:
         Only the front face of the robot (full width, _INTAKE_DEPTH reach) can
         collect. Tube balls still require the robot to face the tube within 30°.
         """
-        if robot.balls_held >= MAX_CARRY:
+        if robot.balls_held >= robot.capacity:
             return False
 
         best_idx, best_dist = -1, float("inf")
@@ -514,7 +514,7 @@ class Field:
     # Opponent action effects
     # ------------------------------------------------------------------
     def opp_try_collect(self, robot: Robot, rng: np.random.Generator) -> bool:
-        if robot.balls_held >= MAX_CARRY:
+        if robot.balls_held >= robot.capacity:
             return False
         best_idx, best_dist = -1, float("inf")
         for i, obj in enumerate(self.objects):

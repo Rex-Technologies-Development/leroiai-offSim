@@ -13,15 +13,16 @@ class ScoreLoggingCallback(BaseCallback):
         self._episode_opp_scores = []
 
     def _on_step(self) -> bool:
-        # Check for episode ends
+        # Read final episode scores from info on the done step. The env stashes
+        # them there because SB3 auto-resets a finished env before callbacks run
+        # (so env.field reads 0). Using info also works under SubprocVecEnv, where
+        # self.training_env.envs[i] isn't accessible.
+        infos = self.locals.get("infos", [])
         for i, done in enumerate(self.locals.get("dones", [])):
             if done:
-                env = self.training_env.envs[i].unwrapped
-                if hasattr(env, 'env'):
-                    env = env.env
-                if hasattr(env, 'field'):
-                    self._episode_scores.append(env.field.my_score)
-                    self._episode_opp_scores.append(env.field.opponent_score)
+                info = infos[i] if i < len(infos) else {}
+                self._episode_scores.append(float(info.get("episode_score", 0.0)))
+                self._episode_opp_scores.append(float(info.get("episode_opp_score", 0.0)))
 
         # Log every 100 episodes
         if len(self._episode_scores) >= 100:

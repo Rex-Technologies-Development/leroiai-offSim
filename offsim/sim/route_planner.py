@@ -25,6 +25,7 @@ from sim.config import (
     MATCHLOAD_TUBES, MATCHLOAD_TUBE_RADIUS,
     VISION_HALF_ANGLE, VISION_RANGE,
     ROBOT_W,
+    PARK_ZONE_X_MIN, PARK_ZONE_X_MAX, PARK_ZONE_BOTTOM, PARK_ZONE_TOP,
 )
 
 # Margin used to expand obstacles so the path planner routes the robot's
@@ -106,6 +107,40 @@ def _los_blocked(rx: float, ry: float, bx: float, by: float,
                          hl + margin, hw + margin):
             return True
     return False
+
+
+# ---- Parking zones (soft-avoid) -------------------------------------------
+# The top/bottom-centre park platforms are NOT hard obstacles — robots park on
+# them at endgame — but during play we PREFER not to drive through them. The nav
+# planner treats them as soft obstacles (a routing penalty) and the collection
+# scorer deprioritises balls inside them. Flip _PARK_AVOID off to ignore parks.
+_PARK_AVOID  = True
+_PARK_MARGIN = ROBOT_W / 2.0   # 7.5" — keep the robot BODY out of the platform
+_PARK_AABBS  = [
+    (PARK_ZONE_X_MIN, PARK_ZONE_X_MAX, 0.0,           PARK_ZONE_BOTTOM),  # bottom
+    (PARK_ZONE_X_MIN, PARK_ZONE_X_MAX, PARK_ZONE_TOP, FIELD_H),           # top
+]
+
+
+def point_in_park(x: float, y: float, margin: float = _PARK_MARGIN) -> bool:
+    """True if (x, y) is inside (or within `margin` of) a park platform."""
+    for ax0, ax1, ay0, ay1 in _PARK_AABBS:
+        if (ax0 - margin <= x <= ax1 + margin and
+                ay0 - margin <= y <= ay1 + margin):
+            return True
+    return False
+
+
+def seg_crosses_park(x0: float, y0: float, x1: float, y1: float,
+                     margin: float = _PARK_MARGIN) -> bool:
+    """True if the segment (x0,y0)->(x1,y1) passes through a park platform."""
+    for ax0, ax1, ay0, ay1 in _PARK_AABBS:
+        if _seg_hits_aabb(x0, y0, x1, y1,
+                          ax0 - margin, ax1 + margin,
+                          ay0 - margin, ay1 + margin):
+            return True
+    return False
+
 
 # ---- Proximity thresholds --------------------------------------------------
 _WALL_MARGIN         = 24.0   # 1 tile from any wall → "near a wall"
@@ -206,6 +241,38 @@ def _in_vision(robot, ball_x: float, ball_y: float) -> bool:
     return True
 
 
+def _los_blocked_by_arms(rx: float, ry: float, bx: float, by: float,
+                         margin: float = 0.0) -> bool:
+    """True if the segment is blocked by a center-X arm only (ignores long goals)."""
+    for cx, cy, angle, hl, hw in _LOS_ARM_OBSTACLES:
+        if _seg_hits_arm(rx, ry, bx, by, cx, cy, angle, hl + margin, hw + margin):
+            return True
+    return False
+
+
+def goal_in_fov(robot, gx: float, gy: float, blocked_by_arms: bool = True) -> bool:
+    """True if the goal point (gx, gy) is within the robot's camera FOV.
+
+    Unlike _in_vision() (used for balls), this does NOT treat long-goal bodies as
+    occluders — the robot is looking AT a goal, so a goal must not self-occlude.
+    The center X still blocks long-goal sightlines across the field, so callers
+    pass blocked_by_arms=True for long goals (and False for the center goals,
+    which ARE the X structure). Used to update the robot's perceived goal state.
+    """
+    dx = gx - robot.x
+    dy = gy - robot.y
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist > VISION_RANGE:
+        return False
+    angle_to = math.atan2(dy, dx)
+    diff = abs(((robot.heading - angle_to + math.pi) % (2 * math.pi)) - math.pi)
+    if diff > VISION_HALF_ANGLE:
+        return False
+    if blocked_by_arms and _los_blocked_by_arms(robot.x, robot.y, gx, gy):
+        return False
+    return True
+
+
 def _score_ball(obj, on_field_objs: list) -> float:
     """Return strategic desirability score for collecting this ball.
 
@@ -249,6 +316,12 @@ def _score_ball(obj, on_field_objs: list) -> float:
     # Rule 3: reduce priority for balls against one wall
     if nw == 1:
         base *= 0.6
+
+    # Soft park-zone avoidance: heavily deprioritise balls sitting on a park
+    # platform — collecting one means driving in, which we prefer not to do, so
+    # the robot picks them up only when nothing better is left.
+    if _PARK_AVOID and point_in_park(x, y, margin=0.0):
+        base *= 0.1
 
     return base
 
