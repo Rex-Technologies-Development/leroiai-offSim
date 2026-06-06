@@ -149,13 +149,13 @@ All commands run through `offsim/main.py`:
 python offsim/main.py demo
 python offsim/main.py demo --num-robots 2 --opponent mixed
 
-# Train (online PPO with action masking + curriculum)
+# Train — staged curriculum (default) OR manual phases; see "Training workflows" below
 python offsim/main.py train --timesteps 1000000 --n-envs 4
-python offsim/main.py train --resume latest --timesteps 200000 --render
+python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
 
-# Evaluate a trained policy
+# Evaluate a trained policy (add --opponents 1 to watch contested play)
 python offsim/main.py eval --model latest --episodes 10
-python offsim/main.py eval --model latest --render --opponent defensive
+python offsim/main.py eval --model latest --render --opponents 1 --opponent mixed
 
 # Offline RL from logged matches
 python offsim/main.py train-offline --data data/matches/ --algo cql
@@ -168,6 +168,88 @@ python offsim/main.py validate --onnx models/onnx/model.onnx --model models/fina
 **Demo controls:** `Space` pause · `S` step · `R` reset · `H` heatmap · `+/-` speed ·
 `Tab`/`WASD` manual drive · `RClick` add ball · panel buttons for auto-play / force-score /
 setup mode / training.
+
+---
+
+## Training workflows
+
+Two ways to schedule difficulty. Both write into `--output-dir` (default `models/`), and
+**any run can `--resume` a prior model and compound into it** — weights, optimizer state,
+and the step counter all carry over, so training accumulates instead of restarting.
+
+### A) Staged curriculum (default)
+With no regime flags, training runs a fixed 4-stage schedule keyed off the global step
+counter (`training/curriculum.py`): solo → solo + failures → 1 random opponent → 1 mixed
+opponent. Good for a single long, hands-off run:
+
+```bash
+python offsim/main.py train --timesteps 1000000 --n-envs 4
+```
+
+### B) Manual phases (you control the schedule)
+The curriculum's thresholds (300k / 600k / 1M) are guesses. To decide phase lengths
+yourself by watching the score curve, drive your own regime — **any of these flags turns
+the curriculum off for that run:**
+
+| Flag | Meaning |
+|---|---|
+| `--no-curriculum` | Train the whole run at one fixed regime. |
+| `--opponents {0,1,2}` | Opponent count (passing this implies `--no-curriculum`). |
+| `--opponent-type {random,greedy,defensive,mixed}` | Opponent strategy (default `mixed`). |
+| `--failures {none,light,medium}` | Failure-injection level (default `none`). |
+
+Because each phase resumes into the same model, the phases stack into one policy:
+
+```bash
+# Phase 1 — solo fundamentals, for as long as the reward keeps climbing
+python offsim/main.py train --no-curriculum --timesteps 400000
+
+# Phase 2 — add an opponent, picking up the SAME model
+python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
+
+# Phase 3 — keep going (or go harder); still the same model
+python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 300000
+```
+
+> **`--timesteps` on resume means *additional* steps.** SB3 adds it to the loaded counter,
+> so Phase 2 above trains 1.0M → 1.6M, not "until 600k". Watch `[ep …] blue=…` in the
+> console (or `tensorboard --logdir models/tb_logs`, curve `game/avg_score`); when a phase
+> plateaus, move to the next. Expect a brief dip right after a regime change while the
+> policy adapts — give each phase enough steps to re-plateau.
+
+### Evaluating
+```bash
+python offsim/main.py eval --model latest --episodes 10                           # solo
+python offsim/main.py eval --model latest --render --opponents 1 --opponent mixed  # vs opponent
+```
+`--model latest` picks the freshest model under `models/` by modification time
+(interrupted / final / newest checkpoint / best). `--opponents 1` puts a live opponent on
+the field so you can watch contested play.
+
+### Continuing training on another machine
+The policy is tiny (~278 KB), so git carries it fine — no LFS or cloud needed. Two things
+must travel, and they travel differently:
+
+- **Code** (`offsim/`) via git — **mandatory, and it must match.** A resume fails if the
+  env's observation/action shape differs, so the other machine must be on the **same commit**
+  that produced the model. Don't edit `STATE_DIM` or the action set between save and resume.
+- **The model `.zip`** — committed alongside the code. `models/final_model.zip` (and
+  `best/`, `interrupted_model.zip`) are tracked; checkpoints, TensorBoard logs, and eval
+  logs are git-ignored to keep history small, so `git add -A` stays clean.
+
+```bash
+# Machine A — after a phase finishes
+git add -A && git commit -m "training phase + model" && git push
+
+# Machine B
+git pull
+pip install -r offsim/requirements.txt
+python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
+```
+
+The `.zip` is device-agnostic: a model saved on CPU loads on GPU and vice-versa (`--device
+auto|cpu|cuda`). To snapshot a model before a risky phase, copy `models/final_model.zip`
+aside or point that phase at a different `--output-dir`.
 
 ---
 

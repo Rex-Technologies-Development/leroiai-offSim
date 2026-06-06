@@ -178,12 +178,24 @@ def cmd_demo(args):
 
 
 def cmd_train(args):
-    """Phase 1: PPO training in sim with curriculum."""
+    """PPO training in sim. Staged curriculum by default, or a fixed manual
+    regime via --no-curriculum / --opponents so you can compound your own solo
+    and opponent phases into one model with --resume."""
     from training.train_sim import train
 
     resume_path = args.resume
     if resume_path == "latest":
         resume_path = _resolve_model_path("latest", output_dir=args.output_dir)
+
+    # Passing --opponents (or --no-curriculum) takes this run off the staged
+    # schedule and trains the whole run at one fixed setup.
+    manual = args.no_curriculum or (args.opponents is not None)
+    if args.opponents is not None and not args.no_curriculum:
+        print("[train] --opponents set -> disabling staged curriculum for this run.")
+    if args.failures != "none" and not manual:
+        print("[train] Note: --failures applies only with --no-curriculum/--opponents.")
+    num_opponents = args.opponents if args.opponents is not None else 0
+
     train(
         total_timesteps=args.timesteps,
         n_envs=args.n_envs,
@@ -195,6 +207,10 @@ def cmd_train(args):
         resume=resume_path,
         render=args.render,
         device=args.device,
+        use_curriculum=not manual,
+        num_opponents=num_opponents,
+        opponent_type=args.opponent_type,
+        failure_level=args.failures,
     )
 
 
@@ -273,7 +289,7 @@ def cmd_eval(args):
         failure_config=failure_config,
         opponent_type=args.opponent,
         num_allies=1,
-        num_opponents=0,
+        num_opponents=args.opponents,
         use_timer=True,
     )
     if render_mode:
@@ -419,6 +435,24 @@ def main():
     # Equivalent to passing the resolved path from models/.
     # Example: python offsim/main.py train --resume latest --timesteps 200000
     # (still writes new checkpoints/final_model.zip into output-dir)
+    # --- Manual phase control (alternative to the staged curriculum) ---------
+    # Drive your own curriculum by hand: run a solo phase, then --resume into the
+    # SAME model for an opponent phase, etc. Phases compound because --resume
+    # loads prior weights + optimizer and continues the step counter.
+    p.add_argument("--no-curriculum", action="store_true",
+                   help="Disable the staged curriculum; train the WHOLE run at the "
+                        "fixed regime from --opponents/--opponent-type/--failures.")
+    p.add_argument("--opponents", type=int, default=None, choices=[0, 1, 2],
+                   help="Opponent count for a fixed run (0/1/2). Passing this implies "
+                        "--no-curriculum.")
+    p.add_argument("--opponent-type", default="mixed",
+                   choices=["random", "greedy", "defensive", "mixed"],
+                   help="Opponent strategy for a fixed run (default: mixed). Only used "
+                        "with --no-curriculum/--opponents.")
+    p.add_argument("--failures", default="none",
+                   choices=["none", "light", "medium"],
+                   help="Failure-injection level for a fixed run (default: none). Only "
+                        "used with --no-curriculum/--opponents.")
     p.add_argument("--render", action="store_true",
                    help="Show the pygame window while training. If n_envs>1, each SubprocVecEnv worker opens its own window.")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
@@ -453,8 +487,12 @@ def main():
     p.add_argument("--failure-rate", type=float, default=0.0,
                    help="Failure-injection rate during eval (default: 0.0)")
     p.add_argument("--teammate-offline", type=float, default=0.0)
-    p.add_argument("--opponent", default="random",
-                   choices=["random", "greedy", "defensive", "mixed"])
+    p.add_argument("--opponents", type=int, default=0, choices=[0, 1, 2],
+                   help="Number of opponent robots on the field during eval "
+                        "(default: 0). Use 1 to watch the policy play against an opponent.")
+    p.add_argument("--opponent", default="mixed",
+                   choices=["random", "greedy", "defensive", "mixed"],
+                   help="Opponent strategy when --opponents > 0 (default: mixed).")
     p.set_defaults(func=cmd_eval)
 
     # --- export ---

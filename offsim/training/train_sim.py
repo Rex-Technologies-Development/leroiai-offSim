@@ -48,11 +48,32 @@ from training.callbacks import ScoreLoggingCallback
 # ---------------------------------------------------------------------------
 # Environment factory
 # ---------------------------------------------------------------------------
-def make_env(render_mode=None, use_timer=True):
+# Failure-injection presets for fixed (--no-curriculum) runs. The staged
+# curriculum sets its own per-stage rates; these mirror those levels so a manual
+# run can opt into the same robustness noise without committing to the schedule.
+def _failure_config(level: str) -> FailureConfig:
+    level = (level or "none").lower()
+    if level == "light":    # ~ curriculum Stage 2/3
+        return FailureConfig(
+            teammate_fail_rate=0.0, action_delay_range=(1.0, 1.0),
+            object_stolen_rate=0.03, stuck_rate=0.02, teammate_offline_rate=0.0,
+        )
+    if level == "medium":   # ~ curriculum Stage 4
+        return FailureConfig(
+            teammate_fail_rate=0.0, action_delay_range=(1.0, 1.0),
+            object_stolen_rate=0.08, stuck_rate=0.05, teammate_offline_rate=0.0,
+        )
+    return FailureConfig.none()
+
+
+def make_env(render_mode=None, use_timer=True, num_opponents=0,
+             opponent_type="random", failure_level="none"):
     """Return a callable that creates a fresh SingleAgentWrapper episode.
 
-    Starts at curriculum Stage 1 (no opponents, no failures). The
-    CurriculumCallback ramps opponents and failure rates as training progresses.
+    num_opponents / opponent_type / failure_level set the FIXED regime for this
+    env. Under the staged curriculum these are only the Stage-1 starting point
+    (0 opponents, no failures) and CurriculumCallback overrides them live; with
+    --no-curriculum they are the regime for the entire run.
 
     When render_mode == "human", the renderer is primed inside the worker so
     the pygame window opens on that worker's process (important for
@@ -61,10 +82,10 @@ def make_env(render_mode=None, use_timer=True):
     def _init():
         env = SingleAgentWrapper(
             render_mode=render_mode,
-            failure_config=FailureConfig.none(),
-            opponent_type="random",
+            failure_config=_failure_config(failure_level),
+            opponent_type=opponent_type,
             num_allies=1,
-            num_opponents=0,
+            num_opponents=num_opponents,
             use_timer=use_timer,
         )
         if render_mode == "human":
@@ -215,8 +236,22 @@ def train(
     resume: str | None = None,
     render: bool = False,
     device: str = "auto",
+    use_curriculum: bool = True,
+    num_opponents: int = 0,
+    opponent_type: str = "random",
+    failure_level: str = "none",
 ):
     os.makedirs(output_dir, exist_ok=True)
+
+    # Starting env regime. Under the staged curriculum every env begins at
+    # Stage 1 (solo, no failures) and CurriculumCallback ramps it over time.
+    # With --no-curriculum the chosen regime is fixed for the whole run, so a
+    # solo phase and an opponent phase can be run as separate, compounding
+    # invocations (each --resume-ing into the same model).
+    if use_curriculum:
+        start_opps, start_type, start_fail = 0, "random", "none"
+    else:
+        start_opps, start_type, start_fail = num_opponents, opponent_type, failure_level
 
     # Render mode:
     #   n_envs == 1 → in-process DummyVecEnv with one pygame window
@@ -227,35 +262,42 @@ def train(
         if n_envs == 1:
             rendered_env = SingleAgentWrapper(
                 render_mode="human",
-                failure_config=FailureConfig.none(),
-                opponent_type="random",
+                failure_config=_failure_config(start_fail),
+                opponent_type=start_type,
                 num_allies=1,
-                num_opponents=0,
+                num_opponents=start_opps,
                 use_timer=True,
             )
             rendered_env.render()
             train_env = DummyVecEnv([lambda: rendered_env])
         else:
             train_env = make_vec_env(
-                make_env(render_mode="human", use_timer=True),
+                make_env(render_mode="human", use_timer=True,
+                         num_opponents=start_opps, opponent_type=start_type,
+                         failure_level=start_fail),
                 n_envs=n_envs,
                 vec_env_cls=SubprocVecEnv,
             )
     else:
         train_env = make_vec_env(
-            make_env(use_timer=True),
+            make_env(use_timer=True, num_opponents=start_opps,
+                     opponent_type=start_type, failure_level=start_fail),
             n_envs=n_envs,
             vec_env_cls=SubprocVecEnv,
         )
 
-    # Eval env — single process, timer on (always headless)
+    # Eval env — single process, timer on (always headless). Matches the run's
+    # regime so the "best model" is judged under the same conditions it trains in.
     eval_env = make_vec_env(
-        make_env(use_timer=True),
+        make_env(use_timer=True, num_opponents=start_opps,
+                 opponent_type=start_type, failure_level=start_fail),
         n_envs=1,
     )
 
-    callbacks = [
-        CurriculumCallback(verbose=1),
+    callbacks = []
+    if use_curriculum:
+        callbacks.append(CurriculumCallback(verbose=1))
+    callbacks += [
         CheckpointCallback(
             save_freq=max(checkpoint_freq // n_envs, 1),
             save_path=os.path.join(output_dir, "checkpoints"),
@@ -361,9 +403,16 @@ def train(
     except ImportError:
         use_pbar = False
 
-    print(f"\nTraining {n_envs} parallel envs × {total_timesteps} timesteps "
-          f"(60s/episode, 1 robot, no opponents){' [render]' if render else ''}")
-    print(f"Checkpoints every {checkpoint_freq:,} steps → {os.path.join(output_dir, 'checkpoints')}")
+    if use_curriculum:
+        regime = "staged curriculum (solo -> opponents over time)"
+    else:
+        regime = f"fixed regime: {start_opps} opponent(s)"
+        if start_opps > 0:
+            regime += f" [{start_type}]"
+        regime += f", failures={start_fail}"
+    print(f"\nTraining {n_envs} env(s) x {total_timesteps:,} new timesteps -- {regime}"
+          f"{' [render]' if render else ''}")
+    print(f"Checkpoints every {checkpoint_freq:,} steps -> {os.path.join(output_dir, 'checkpoints')}")
     print(f"Ctrl+C at any time saves current model to {os.path.join(output_dir, 'interrupted_model.zip')}\n")
 
     interrupted = False

@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Training artifacts (regenerable; keep only the models you hand off) ----
+# Per-step checkpoints pile up fast (~278 KB each, dozens per run). Keep the
+# directory itself (via .gitkeep) but ignore the snapshots.
+offsim/models/checkpoints/*
+!offsim/models/checkpoints/.gitkeep
+# TensorBoard event files + eval logs: grow unbounded and are machine-specific.
+offsim/models/tb_logs/
+offsim/models/logs/
+# ONNX exports are regenerable from the model via `main.py export`.
+offsim/models/onnx/*
+!offsim/models/onnx/.gitkeep
+
+# Intentionally TRACKED (do not ignore) — these travel between machines:
+#   offsim/models/final_model.zip
+#   offsim/models/interrupted_model.zip
+#   offsim/models/best/best_model.zip
