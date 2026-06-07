@@ -530,7 +530,8 @@ class Field:
             return True
         return False
 
-    def opp_try_score(self, robot: Robot, goal_pos: np.ndarray, points: int) -> int:
+    def opp_try_score(self, robot: Robot, goal_pos: np.ndarray, points: int,
+                       gname: str | None = None) -> int:
         if robot.balls_held <= 0:
             return 0
         if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
@@ -538,7 +539,11 @@ class Field:
         n = robot.balls_held
         scored = points * n
         self.opponent_score += scored
-        gname = _goal_name(goal_pos)
+        # gname overrides center-lookup when goal_pos is a goal END/TIP (the
+        # opponent backs in at the same scoring poses the ally uses, which don't
+        # match the goal-center constants _goal_name keys on).
+        if gname is None:
+            gname = _goal_name(goal_pos)
         for idx in robot.held_object_ids:
             self.objects[idx].status = OBJ_SCORED_OPP
             self.objects[idx].scored_in_goal = gname

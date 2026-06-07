@@ -54,7 +54,10 @@ class GreedyOpponent:
     def __call__(self, state: dict, rng: np.random.Generator) -> Action:
         if state["balls_held"] >= MAX_CARRY:
             pos   = state["position"]
-            d_long = np.linalg.norm(pos - OPP_LONG_GOAL)
+            # Either long goal is a valid target (either color scores in any goal);
+            # SCORE_LONG_GOAL routes to whichever long goal is nearer (see env).
+            d_long = min(np.linalg.norm(pos - OPP_LONG_GOAL),
+                         np.linalg.norm(pos - OUR_LONG_GOAL))
             d_mid  = np.linalg.norm(pos - CENTER_MID_GOAL)
             d_low  = np.linalg.norm(pos - CENTER_LOW_GOAL)
             best   = min(d_long, d_mid, d_low)

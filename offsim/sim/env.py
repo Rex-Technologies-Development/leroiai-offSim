@@ -168,6 +168,23 @@ def _wrap_angle(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+# Opponent deposit references: the SAME scoring approach poses the opponent
+# navigates to (long-goal ends / center tips), each with its goal name + points.
+# The opponent's deposit range is checked against these — matching where it
+# actually drives — instead of the goal CENTERS (which sit inside the goal body
+# and are far from the ends, so the opponent could camp a goal and never score).
+_OPP_SCORE_REFS = [
+    (_RIGHT_GOAL_TOP_POS, "our_long",   LONG_GOAL_POINTS),
+    (_RIGHT_GOAL_BOT_POS, "our_long",   LONG_GOAL_POINTS),
+    (_LEFT_GOAL_TOP_POS,  "opp_long",   LONG_GOAL_POINTS),
+    (_LEFT_GOAL_BOT_POS,  "opp_long",   LONG_GOAL_POINTS),
+    (_MID_NE_POS,         "center_mid", CENTER_GOAL_POINTS),
+    (_LOW_SW_POS,         "center_mid", CENTER_GOAL_POINTS),
+    (_MID_NW_POS,         "center_low", CENTER_GOAL_POINTS),
+    (_LOW_SE_POS,         "center_low", CENTER_GOAL_POINTS),
+]
+
+
 # ---------------------------------------------------------------------------
 # Navigation waypoints (path avoidance around center X)
 # ---------------------------------------------------------------------------
@@ -518,6 +535,11 @@ def _resolve_goal_collisions(robot, skip_center: bool = False,
 # Field diagonal — used to normalise distance to [0, 1]
 _FIELD_DIAG = math.sqrt(FIELD_W * FIELD_W + FIELD_H * FIELD_H)
 
+# Opponent jam threshold: if an opponent moves less than this (inches) over a full
+# decision AND scores nothing, it's pinned against a goal body/wall and gets peeled
+# toward field center next decision (see the opponent loop in step()).
+_OPP_JAM_MIN_DIST = 3.0
+
 
 def _nearest_balls_of_color(robot, objects, color: int, n: int) -> list:
     """Return n on-field balls of `color` sorted by distance. Pads with None."""
@@ -763,7 +785,11 @@ def _opp_action_to_target(action: Action, field: Field, robot: Robot) -> np.ndar
     if action == Action.COLLECT_NEAREST_BALL:
         return field.nearest_on_field_target(robot.position)
     elif action == Action.SCORE_LONG_GOAL:
-        return OPP_LONG_GOAL.copy()
+        # Reachable approach pose for the nearest long-goal end (either wall — the
+        # opponent can score in both). The raw goal reference sits against the wall
+        # and pins the robot; the approach point is navigable.
+        approach, *_ = _nearest_long_goal_target(robot)
+        return approach.copy()
     elif action == Action.SCORE_CENTER_MID:
         approach, *_ = _nearest_center_tip(robot, lower=False)
         return approach.copy()
@@ -971,6 +997,8 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = False
         self.opp_targets: list[np.ndarray | None] = [None, None]
+        self.opp_prev_pos:  list[np.ndarray | None] = [None, None]
+        self.opp_prev_oscore: list[float] = [0.0, 0.0]
 
         if self._decision_logger is not None:
             self._decision_logger.new_episode()
@@ -1030,6 +1058,8 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = False
         self.opp_targets   = [None, None]
+        self.opp_prev_pos   = [None, None]
+        self.opp_prev_oscore = [0.0, 0.0]
         self.score_animations.clear()
         self._eject_fired_this_decision[:] = False
 
@@ -1523,8 +1553,26 @@ class VexAIEnv(gym.Env):
         if self.num_allies < 2 or fi.teammate_offline or fi.should_teammate_fail():
             a1 = Action.IDLE
 
+        # Obstacle-aware nav queue per opponent (mirrors ally_wq). Without this the
+        # opponent drives in a straight line and jams against the center X / long-goal
+        # bodies, appearing to "stop" until it happens to pick an unobstructed target.
+        opp_wq: list[list] = [[] for _ in range(2)]
         for oi in range(self.num_opponents):
             opp = self.field.opponents[oi]
+            # Jam detection (across decisions): if the opponent barely moved AND
+            # didn't score last decision, it's pinned against a goal body / wall
+            # (its raw goal-reference target is an unreachable pose). Peel it toward
+            # field center to break the deadlock; normal targeting resumes next
+            # decision. A productive goal-camp (motionless but scoring) is NOT
+            # treated as a jam.
+            jammed = False
+            if self.opp_prev_pos[oi] is not None:
+                moved  = float(np.linalg.norm(opp.position - self.opp_prev_pos[oi]))
+                scored = self.field.opponent_score > self.opp_prev_oscore[oi]
+                jammed = moved < _OPP_JAM_MIN_DIST and not scored
+            self.opp_prev_pos[oi]    = opp.position.copy()
+            self.opp_prev_oscore[oi] = float(self.field.opponent_score)
+
             opp_state = {
                 "position":       opp.position,
                 "balls_held":     opp.balls_held,
@@ -1533,7 +1581,22 @@ class VexAIEnv(gym.Env):
                 "us_scored_count": len(self.field.scored_by_us_indices()),
             }
             opp_action = self.opponent_policy(opp_state, self.rng)
-            self.opp_targets[oi] = _opp_action_to_target(opp_action, self.field, opp)
+            tgt = _opp_action_to_target(opp_action, self.field, opp)
+            if tgt is None:
+                # Never let the opponent freeze (IDLE/EJECT, or COLLECT with no
+                # reachable ball all yield no target). Fall back to the nearest
+                # ball, or failing that the nearest goal, so it always keeps
+                # moving instead of stopping in place.
+                tgt = self.field.nearest_on_field_target(opp.position)
+                if tgt is None:
+                    tgt = min(
+                        (OPP_LONG_GOAL, OUR_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL),
+                        key=lambda g: float(np.linalg.norm(opp.position - g)),
+                    ).copy()
+            if jammed:
+                tgt = np.array([FIELD_W * 0.5, FIELD_H * 0.5])
+            self.opp_targets[oi] = tgt
+            opp_wq[oi] = _build_nav_waypoints(opp.position, tgt)
 
         for idx in range(2):
             if fi.should_steal_object():
@@ -1874,9 +1937,18 @@ class VexAIEnv(gym.Env):
                         stall_strikes[idx] = 0
 
             for oi in range(self.num_opponents):
-                if self.opp_targets[oi] is not None:
-                    self.field.opponents[oi].move_toward_point(self.opp_targets[oi])
-                _resolve_goal_collisions(self.field.opponents[oi])
+                opp_r = self.field.opponents[oi]
+                if opp_wq[oi]:
+                    # Follow the obstacle-aware route, advancing waypoints on arrival.
+                    arrived = opp_r.move_toward_point(opp_wq[oi][0])
+                    if arrived and len(opp_wq[oi]) > 1:
+                        opp_wq[oi].pop(0)
+                    elif arrived:
+                        opp_wq[oi].clear()
+                elif self.opp_targets[oi] is not None:
+                    # No route found (target unreachable) — straight-line fallback.
+                    opp_r.move_toward_point(self.opp_targets[oi])
+                _resolve_goal_collisions(opp_r)
 
             # Refresh perceived goal state from camera FOV (after movement, so
             # headings are current). Scanning/driving past a goal updates what the
@@ -2383,15 +2455,18 @@ class VexAIEnv(gym.Env):
             # than our timed back-in, instead of the old instant dump.
             in_range = False
             if opp.balls_held > 0:
-                for goal_pos, pts in ((OPP_LONG_GOAL,   LONG_GOAL_POINTS),
-                                      (CENTER_MID_GOAL, CENTER_GOAL_POINTS),
-                                      (CENTER_LOW_GOAL, CENTER_GOAL_POINTS)):
-                    if float(np.linalg.norm(opp.position - goal_pos)) < SCORE_RANGE:
+                # Opponent can score in EVERY goal (either color scores in any
+                # goal). Deposit range is checked against the goal ENDS/TIPS it
+                # actually backs into (the same poses the ally scores at), not the
+                # goal centers — so it can no longer camp a goal end out of range
+                # and never score.
+                for ref, gname, pts in _OPP_SCORE_REFS:
+                    if float(np.linalg.norm(opp.position - ref)) < SCORE_RANGE:
                         in_range = True
                         opp.score_timer += DT
                         if opp.score_timer >= opp.score_interval:
                             opp.score_timer = 0.0
-                            self.field.opp_try_score(opp, goal_pos, pts)
+                            self.field.opp_try_score(opp, ref, pts, gname=gname)
                         break
             if not in_range:
                 opp.score_timer = 0.0   # not lined up on a goal — reset the dwell
