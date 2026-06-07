@@ -44,18 +44,62 @@ BALL_BLUE = 1   # blue alliance balls (our team)
 # Actions — RL decides WHERE to go, not HOW to move
 # ---------------------------------------------------------------------------
 class Action(enum.IntEnum):
-    COLLECT_NEAREST_BALL = 0
-    SCORE_LONG_GOAL      = 1   # score in our long goal (right wall)
-    SCORE_CENTER_MID     = 2   # score in upper-diagonal center goal (NE–SW bar)
-    SCORE_CENTER_LOW     = 3   # score in lower-diagonal center goal (NW–SE bar)
-    DESCORE_OPP_LONG     = 4   # descore from opponent long goal (left wall)
-    DESCORE_CENTER       = 5   # descore from center goals
-    DEFEND_ZONE          = 6
-    EJECT_WRONG_COLOR    = 7   # dump held red (wrong-color) balls out the back
-    IDLE                 = 8
+    STOP = 0
+    MOVE_CHASSIS_ONLY = 1
+    COLLECT_BLOCKS = 2
+    SCORE_LEFT_LONG_GOAL_ALLIANCE = 3
+    SCORE_LEFT_LONG_GOAL_OPPONENT = 4
+    SCORE_RIGHT_LONG_GOAL_ALLIANCE = 5
+    SCORE_RIGHT_LONG_GOAL_OPPONENT = 6
+    SCORE_MID_LEFT = 7
+    SCORE_MID_RIGHT = 8
+    SCORE_LOW_LEFT = 9
+    SCORE_LOW_RIGHT = 10
+    DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD = 11
+    DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL = 12
+    DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD = 13
+    DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL = 14
+    DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD = 15
+    DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL = 16
+    DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD = 17
+    DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL = 18
+    RAM_RIGHT_LONG_GOAL_OPPONENT = 19
+    RAM_RIGHT_LONG_GOAL_ALLIANCE = 20
+    RAM_LEFT_LONG_GOAL_OPPONENT = 21
+    RAM_LEFT_LONG_GOAL_ALLIANCE = 22
+
+
+ACTION_NAMES: dict[int, str] = {
+    0: "STOP",
+    1: "MOVE_CHASSIS_ONLY",
+    2: "COLLECT_BLOCKS",
+    3: "SCORE_LEFT_LONG_GOAL_ALLIANCE",
+    4: "SCORE_LEFT_LONG_GOAL_OPPONENT",
+    5: "SCORE_RIGHT_LONG_GOAL_ALLIANCE",
+    6: "SCORE_RIGHT_LONG_GOAL_OPPONENT",
+    7: "SCORE_MID_LEFT",
+    8: "SCORE_MID_RIGHT",
+    9: "SCORE_LOW_LEFT",
+    10: "SCORE_LOW_RIGHT",
+    11: "DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD",
+    12: "DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL",
+    13: "DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD",
+    14: "DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL",
+    15: "DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD",
+    16: "DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL",
+    17: "DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD",
+    18: "DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL",
+    19: "RAM_RIGHT_LONG_GOAL_OPPONENT",
+    20: "RAM_RIGHT_LONG_GOAL_ALLIANCE",
+    21: "RAM_LEFT_LONG_GOAL_OPPONENT",
+    22: "RAM_LEFT_LONG_GOAL_ALLIANCE",
+}
 
 NUM_ACTIONS = len(Action)
-# Catch comment/code drift before training silently samples a broken index
+assert NUM_ACTIONS == 23, f"expected 23 actions, got {NUM_ACTIONS}"
+assert all(Action(i).name == ACTION_NAMES[i] for i in ACTION_NAMES), (
+    "Action enum names must match ACTION_NAMES"
+)
 assert NUM_ACTIONS == len(Action), (
     f"NUM_ACTIONS={NUM_ACTIONS} but len(Action)={len(Action)} — action enum drift"
 )
@@ -81,6 +125,7 @@ LONG_GOAL_Y_MIN    = 47.61   # bottom of goal bar
 LONG_GOAL_Y_MAX    = 96.39   # top of goal bar
 LONG_GOAL_WALL_GAP = 21.50   # alley width: gap between wall and outer face of goal
 LONG_GOAL_WIDTH    =  4.125  # goal tray width (outer → inner/scoring face)
+LONG_GOAL_CAPACITY = 12       # max scored balls per long goal before spill
 
 # Center goal X-structure — two crossing rectangular bars forming an X.
 # The upper two arms = MID goal; lower two arms = LOW goal.
@@ -105,20 +150,60 @@ PARK_ZONE_X_MAX  = 84.5    # right edge (72 + 12.5)
 PARK_ZONE_BOTTOM = 24.0    # top edge of bottom park zone
 PARK_ZONE_TOP    = 120.0   # bottom edge of top park zone
 
+# VAIRC Section 7: blue below midfield, red above. Within each alliance, R0 starts
+# on the left wall and R1 on the right wall (opposite sides of the field).
+ALLY_START_R0 = np.array([24.00, 18.00])
+ALLY_START_R1 = np.array([108.00, 18.00])
+OPP_START_R0  = np.array([24.00, 126.00])
+OPP_START_R1  = np.array([108.00, 126.00])
+ALLY_START_HEADING_R0 = 0.0          # face east into field (left wall)
+ALLY_START_HEADING_R1 = np.pi        # face west into field (right wall)
+OPP_START_HEADING_R0  = 0.0
+OPP_START_HEADING_R1  = np.pi
+
 # Vision cone — wide-angle camera in front of robot
 VISION_HALF_ANGLE = np.radians(34.5)   # ±34.5° → 69° total HFOV (OAK-D Lite Auto Focus)
 VISION_RANGE      = 72.0               # max depth in inches
 
-# Named zones
-# DEFEND_ZONE_POS sits in front of our long goal but back far enough that the
-# robot's corners (half-diagonal ≈ 10.6" when rotated 45°) don't clip the goal
-# inner face at x=118.375. Pushed back from 108 → 102 for a ~6" buffer.
+# VAIRC Isolation Period — alliance sides split at y=72 (midfield tape).
+# Robots stay on their side during Isolation only; Interaction Period is full-field.
+HALF_FIELD_Y: float = 72.0
+CENTER_STRIP_HALF_W: float = 8.0
+HALF_BOTTOM_Y_MAX: float = HALF_FIELD_Y - CENTER_STRIP_HALF_W   # exclusive bottom ceiling
+HALF_TOP_Y_MIN: float = HALF_FIELD_Y + CENTER_STRIP_HALF_W      # exclusive top floor
+HALF_SHARED_STRIP_Y_LO: float = HALF_BOTTOM_Y_MAX
+HALF_SHARED_STRIP_Y_HI: float = HALF_TOP_Y_MIN
+HALF_FIELD_X: float = 72.0
+HALF_LEFT_X_MAX: float = HALF_FIELD_X - CENTER_STRIP_HALF_W
+HALF_RIGHT_X_MIN: float = HALF_FIELD_X + CENTER_STRIP_HALF_W
+HALF_SHARED_STRIP_X_LO: float = HALF_LEFT_X_MAX
+HALF_SHARED_STRIP_X_HI: float = HALF_RIGHT_X_MIN
+
+# Per-side defend / jam positions (role 0 = left, role 1 = right)
+DEFEND_ZONE_ALLY_LEFT   = np.array([42.00,  36.00])
+DEFEND_ZONE_ALLY_RIGHT  = np.array([102.00, 36.00])
+DEFEND_ZONE_OPP_LEFT    = np.array([42.00,  108.00])
+DEFEND_ZONE_OPP_RIGHT   = np.array([102.00, 108.00])
+JAM_RECOVERY_ALLY_LEFT  = np.array([54.00,  54.00])
+JAM_RECOVERY_ALLY_RIGHT = np.array([90.00,  54.00])
+JAM_RECOVERY_OPP_LEFT   = np.array([54.00,  90.00])
+JAM_RECOVERY_OPP_RIGHT  = np.array([90.00,  90.00])
+# Legacy aliases (lane naming from earlier half-field model)
+DEFEND_ZONE_ALLY_BOTTOM = DEFEND_ZONE_ALLY_LEFT
+DEFEND_ZONE_ALLY_TOP    = DEFEND_ZONE_ALLY_RIGHT
+DEFEND_ZONE_OPP_BOTTOM  = DEFEND_ZONE_OPP_LEFT
+DEFEND_ZONE_OPP_TOP     = DEFEND_ZONE_OPP_RIGHT
+JAM_RECOVERY_BOTTOM     = JAM_RECOVERY_ALLY_LEFT
+JAM_RECOVERY_TOP        = JAM_RECOVERY_OPP_LEFT
+
+# Legacy alias (midline); prefer per-half constants above
 DEFEND_ZONE_POS  = np.array([102.00,  72.00])
 
 # ---------------------------------------------------------------------------
 # Game rules
 # ---------------------------------------------------------------------------
 MATCH_DURATION: float    = SHARED_CFG["game"]["match_duration"]       # 120s
+ISOLATION_PERIOD: float  = SHARED_CFG["game"]["isolation_period"]     # 15s VAIRC
 DT: float                = SHARED_CFG["game"]["dt"]                   # 0.05s
 DECISION_INTERVAL: float = SHARED_CFG["game"]["decision_interval"]    # 3.0s
 TICKS_PER_DECISION: int  = int(DECISION_INTERVAL / DT)                # 60
@@ -139,6 +224,22 @@ SCORE_COMMIT_DECISIONS: int = int(SHARED_CFG["game"].get("score_commit_decisions
 SCORE_COMMIT_UNTIL_EMPTY: bool = bool(SHARED_CFG["game"].get("score_commit_until_empty", True))
 SCORE_COMMIT_MAX_S: float = float(SHARED_CFG["game"].get("score_commit_max_s", 9.0))
 SCORE_COMMIT_MAX_DECISIONS: int = max(1, int(SCORE_COMMIT_MAX_S / max(DECISION_INTERVAL, 1e-6)))
+
+# Descore mechanics — long-goal vertical partition (P0..P3) and slide/slam tuning
+_LONG_GOAL_SPAN = LONG_GOAL_Y_MAX - LONG_GOAL_Y_MIN
+LONG_GOAL_PARTITION_Y: tuple[float, float, float, float] = (
+    LONG_GOAL_Y_MIN,
+    LONG_GOAL_Y_MIN + _LONG_GOAL_SPAN / 3.0,
+    LONG_GOAL_Y_MIN + 2.0 * _LONG_GOAL_SPAN / 3.0,
+    LONG_GOAL_Y_MAX,
+)
+DESCORE_P0, DESCORE_P1, DESCORE_P2, DESCORE_P3 = 0, 1, 2, 3
+DESCORE_MODE_SLIDE = "slide"
+DESCORE_MODE_SLAM = "slam"
+SLAM_SPEED_DIVISOR: float = 10.0
+SLAM_MIN_SPEED: float = 6.0
+DESCORE_SLIDE_DWELL_S: float = 1.0
+DESCORE_SLIDE_DWELL_TICKS: int = max(1, int(DESCORE_SLIDE_DWELL_S / DT))
 
 # ---------------------------------------------------------------------------
 # Game objects

@@ -46,7 +46,7 @@ class DecisionLogger:
     def __init__(self, log_dir: str = "logs"):
         os.makedirs(log_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        self._path = Path(log_dir) / f"decisions_{stamp}.csv"
+        self._path = Path(log_dir) / f"decisions_{stamp}_{os.getpid()}.csv"
         self._file = open(self._path, "w", newline="", buffering=1)
         self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
         self._writer.writeheader()

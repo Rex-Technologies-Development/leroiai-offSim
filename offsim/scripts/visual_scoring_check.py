@@ -69,7 +69,7 @@ def _run_case(env: E.SingleAgentWrapper, case: str, max_decisions: int) -> tuple
         if gname != "our_long":
             return False, f"expected 'our_long', got {gname!r}"
         goal_list = inner.field.goal_state.our_long
-        action = Action.SCORE_LONG_GOAL
+        action = Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE
 
     elif case == "mid":
         # Bias nearest center-tip to MID goal.
@@ -78,7 +78,7 @@ def _run_case(env: E.SingleAgentWrapper, case: str, max_decisions: int) -> tuple
         if gname != "center_mid":
             return False, f"expected 'center_mid', got {gname!r}"
         goal_list = inner.field.goal_state.center_mid
-        action = Action.SCORE_CENTER_MID
+        action = Action.SCORE_MID_RIGHT
 
     elif case == "low":
         # Bias nearest center-tip to LOW goal.
@@ -87,7 +87,7 @@ def _run_case(env: E.SingleAgentWrapper, case: str, max_decisions: int) -> tuple
         if gname != "center_low":
             return False, f"expected 'center_low', got {gname!r}"
         goal_list = inner.field.goal_state.center_low
-        action = Action.SCORE_CENTER_LOW
+        action = Action.SCORE_LOW_RIGHT
 
     else:
         return False, f"unknown case: {case!r}"

@@ -18,58 +18,88 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-def _greedy_score_action(robot, env) -> int:
-    """Pick the SCORE action for the NEAREST non-full goal (long / mid / low).
-
-    Greedy by approach distance so the demo naturally exercises all three goal
-    types — long when near a long goal, center mid/low when near the X — instead
-    of always driving back to a long goal. Full goals are skipped; if every goal
-    is full it falls back to the long goal.
-    """
-    import numpy as np
+def _home_long_score_action(robot) -> int:
+    """Default long-goal score for this robot's lane (R0=left, R1=right)."""
+    from sim.env import _home_long_score_action as _env_home_long
     from sim.config import Action
-    from sim.env import _nearest_long_goal_target, _nearest_center_tip
+    return int(_env_home_long(robot))
 
-    # Decide on the robot's PERCEIVED goal state (camera belief) when available,
-    # so the demo reflects what it actually knows — not omniscient ground truth.
+
+def _greedy_score_action(robot, env) -> int:
+    """Pick the SCORE action for the nearest reachable non-full goal."""
+    import numpy as np
+    from sim.config import Action, LONG_GOAL_CAPACITY
+    from sim.env import _score_pose_for_action
+    from sim.field import x_bounds_for_robot, y_bounds_for_robot
+
     gs = getattr(env, "goal_belief", None) if getattr(env, "use_goal_belief", False) \
         else None
     if gs is None:
         gs = env.field.goal_state
-    options: list[tuple[float, int]] = []   # (approach_dist, action)
 
-    long_app, _, _, long_gname = _nearest_long_goal_target(robot)
-    if len(getattr(gs, long_gname)) < 14:
-        options.append((float(np.linalg.norm(robot.position - long_app)),
-                        int(Action.SCORE_LONG_GOAL)))
-    mid_app, *_ = _nearest_center_tip(robot, lower=False)
-    if len(gs.center_mid) < 7:
-        options.append((float(np.linalg.norm(robot.position - mid_app)),
-                        int(Action.SCORE_CENTER_MID)))
-    low_app, *_ = _nearest_center_tip(robot, lower=True)
-    if len(gs.center_low) < 7:
-        options.append((float(np.linalg.norm(robot.position - low_app)),
-                        int(Action.SCORE_CENTER_LOW)))
+    candidates = [
+        Action.SCORE_LEFT_LONG_GOAL_ALLIANCE,
+        Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE,
+        Action.SCORE_MID_LEFT,
+        Action.SCORE_MID_RIGHT,
+        Action.SCORE_LOW_LEFT,
+        Action.SCORE_LOW_RIGHT,
+    ]
+    y_min, y_max = y_bounds_for_robot(robot, False, None)
+    options: list[tuple[float, int]] = []
+    for act in candidates:
+        approach, _, _, gname = _score_pose_for_action(act, robot, y_min, y_max)
+        x_min, x_max = x_bounds_for_robot(robot, act)
+        ax, ay = float(approach[0]), float(approach[1])
+        if not (x_min <= ax <= x_max and y_min <= ay <= y_max):
+            continue
+        cap = LONG_GOAL_CAPACITY if gname.endswith("long") else 7
+        if len(getattr(gs, gname)) >= cap:
+            continue
+        options.append((float(np.linalg.norm(robot.position - approach)), int(act)))
 
     if not options:
-        return int(Action.SCORE_LONG_GOAL)
+        return _home_long_score_action(robot)
     options.sort(key=lambda o: o[0])
     return options[0][1]
 
 
-def _greedy_demo_action(robot_idx: int, env) -> int:
-    """Greedy demo policy: collect until full, then score the nearest goal.
+def _greedy_descore_action(robot, env) -> int | None:
+    """Return a descore action when the robot is empty and opponent balls are scored."""
+    from sim.config import Action
+    from sim.env import _opponent_ball_color, _removable_count_for_long_action
 
-    Priority:
-      1. Full (MAX_CARRY balls) → score nearest non-full goal (long / mid / low)
-      2. Accessible balls exist → COLLECT_NEAREST_BALL
-      3. Holding any balls but none accessible → score nearest non-full goal
-      4. No balls anywhere → IDLE
-    """
+    if robot.balls_held > 0:
+        return None
+    gs = env.field.goal_state
+    opp_color = _opponent_ball_color(descore_as_opponent=False)
+    opp_left = sum(1 for _, c in gs.opp_long if c == opp_color)
+    opp_right = sum(1 for _, c in gs.our_long if c == opp_color)
+    if opp_left <= 0 and opp_right <= 0:
+        return None
+    if opp_left >= 2:
+        act = Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
+    elif opp_right >= 2:
+        act = Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
+    elif opp_left >= 1:
+        act = Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
+    else:
+        act = Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
+    if _removable_count_for_long_action(env.field, act) <= 0:
+        return None
+    return int(act)
+
+
+def _greedy_demo_action(robot_idx: int, env) -> int:
+    """Greedy demo policy: collect until full, then score the nearest goal."""
     from sim.route_planner import compute_collection_route
     from sim.config import Action, MAX_CARRY
 
     robot = env.field.allies[robot_idx]
+
+    descore = _greedy_descore_action(robot, env)
+    if descore is not None:
+        return descore
 
     if robot.balls_held >= MAX_CARRY:
         return _greedy_score_action(robot, env)
@@ -81,23 +111,25 @@ def _greedy_demo_action(robot_idx: int, env) -> int:
         robot=robot,
     )
     if route:
-        return int(Action.COLLECT_NEAREST_BALL)
+        return int(Action.COLLECT_BLOCKS)
     if robot.balls_held > 0:
         return _greedy_score_action(robot, env)
-    return int(Action.COLLECT_NEAREST_BALL)   # fallback: drive toward field to get LOS
+    return int(Action.COLLECT_BLOCKS)
 
 
 def cmd_demo(args):
     """Run the sim with greedy (or random) actions and Pygame visualization."""
     from sim.env import VexAIEnv
-    from sim.config import Action
+    from sim.config import Action, NUM_ACTIONS
     from sim.failure import FailureConfig
 
+    num_opponents = args.num_robots if args.num_robots >= 2 else 0
     env = VexAIEnv(
         render_mode="human",
         failure_config=FailureConfig.none(),
         opponent_type=args.opponent,
         num_allies=args.num_robots,
+        num_opponents=num_opponents,
     )
     env.enable_logging(args.log_dir)
     # No fixed seed → the ball layout (positions + colors) is randomized fresh on
@@ -107,7 +139,11 @@ def cmd_demo(args):
     episode = 1
     total_reward = 0.0
 
-    print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
+    if num_opponents > 0:
+        print(f"VEX Push Back Sim Demo — {args.num_robots} allied vs "
+              f"{num_opponents} opponent robot(s) ({args.opponent})")
+    else:
+        print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
     print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
     print("          Panel: AUTO PLAY = greedy policy  SCORE = force scoring")
 
@@ -157,10 +193,7 @@ def cmd_demo(args):
                 _greedy_demo_action(min(1, env.num_allies - 1), env),
             ])
         else:
-            demo_actions = [int(Action.COLLECT_NEAREST_BALL), int(Action.SCORE_LONG_GOAL),
-                            int(Action.SCORE_CENTER_MID), int(Action.SCORE_CENTER_LOW),
-                            int(Action.IDLE)]
-            actions = np.array([rng.choice(demo_actions) for _ in range(2)])
+            actions = np.array([rng.integers(0, NUM_ACTIONS) for _ in range(2)])
 
         obs, rewards, done, _, _ = env.step(actions)
         total_reward += rewards[0]
@@ -208,9 +241,12 @@ def cmd_train(args):
         render=args.render,
         device=args.device,
         use_curriculum=not manual,
+        num_allies=args.num_allies,
         num_opponents=num_opponents,
         opponent_type=args.opponent_type,
         failure_level=args.failures,
+        log_decisions=args.log_decisions,
+        log_dir=args.log_dir,
     )
 
 
@@ -269,10 +305,35 @@ def _resolve_model_path(arg: str, output_dir: str = "models") -> str:
     return candidates[0][1]
 
 
+def _infer_num_allies_from_model(model_path: str) -> int:
+    """Return 1 or 2 based on saved observation space (90 vs 180 with heatmap off)."""
+    from sim.config import STATE_DIM
+
+    model = None
+    try:
+        from sb3_contrib import MaskablePPO
+        model = MaskablePPO.load(model_path, env=None, print_system_info=False)
+    except Exception:
+        pass
+    if model is None:
+        from stable_baselines3 import PPO
+        model = PPO.load(model_path, env=None, print_system_info=False)
+
+    dim = int(model.observation_space.shape[0])
+    if dim == STATE_DIM * 2:
+        return 2
+    if dim == STATE_DIM:
+        return 1
+    raise ValueError(
+        f"Model observation dim {dim} does not match STATE_DIM={STATE_DIM} "
+        f"(solo={STATE_DIM}, team={STATE_DIM * 2}). Retrain or check config."
+    )
+
+
 def cmd_eval(args):
-    """Evaluate a trained single-agent policy."""
+    """Evaluate a trained policy (solo or 2-robot team)."""
     from stable_baselines3 import PPO
-    from sim.env import SingleAgentWrapper
+    from sim.env import make_training_wrapper
     from sim.failure import FailureConfig
 
     model_path = _resolve_model_path(args.model)
@@ -283,15 +344,22 @@ def cmd_eval(args):
         teammate_offline_rate=args.teammate_offline,
     )
 
+    num_allies = args.num_allies
+    if num_allies is None:
+        num_allies = _infer_num_allies_from_model(model_path)
+        print(f"Auto-detected {num_allies} allied robot(s) from model observation space")
+
     render_mode = "human" if args.render else None
-    env = SingleAgentWrapper(
+    env = make_training_wrapper(
+        num_allies=num_allies,
         render_mode=render_mode,
         failure_config=failure_config,
         opponent_type=args.opponent,
-        num_allies=1,
         num_opponents=args.opponents,
         use_timer=True,
     )
+    if args.log_decisions:
+        env.env.enable_logging(args.log_dir)
     if render_mode:
         env.render()
         # The renderer starts paused by default; auto-run so the policy plays
@@ -349,7 +417,11 @@ def cmd_eval(args):
                 action, _ = model.predict(obs, deterministic=True, action_masks=masks)
             else:
                 action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _, _ = env.step(int(action))
+            step_action = (
+                np.asarray(action, dtype=np.int32)
+                if num_allies >= 2 else int(action)
+            )
+            obs, reward, done, _, _ = env.step(step_action)
             ep_reward += float(reward)
 
             if render_mode:
@@ -420,10 +492,14 @@ def main():
     p.set_defaults(func=cmd_demo)
 
     # --- train ---
-    p = sub.add_parser("train", help="PPO training — 1 robot, 60s episodes")
+    p = sub.add_parser("train", help="PPO training — 1- or 2-robot team, 60s episodes")
     p.add_argument("--timesteps", type=int, default=1_000_000)
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--num-allies", "--num-robots", dest="num_allies",
+                   type=int, default=2, choices=[1, 2],
+                   help="Allied robots controlled by the policy (default: 2). "
+                        "--num-robots is accepted as a deprecated alias.")
     p.add_argument("--checkpoint-freq", type=int, default=10_000,
                    help="Save a checkpoint every N timesteps (default: 10000)")
     p.add_argument("--eval-freq", type=int, default=25_000)
@@ -455,6 +531,10 @@ def main():
                         "used with --no-curriculum/--opponents.")
     p.add_argument("--render", action="store_true",
                    help="Show the pygame window while training. If n_envs>1, each SubprocVecEnv worker opens its own window.")
+    p.add_argument("--log-decisions", action="store_true",
+                   help="Write per-decision CSV logs for training envs (best with --n-envs 1).")
+    p.add_argument("--log-dir", default="logs",
+                   help="Directory for decision log CSV files (default: logs/).")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                    help="PyTorch device for PPO. 'auto' uses CUDA if available "
                         "(default: auto). Note: for this workload, env stepping "
@@ -493,6 +573,13 @@ def main():
     p.add_argument("--opponent", default="mixed",
                    choices=["random", "greedy", "defensive", "mixed"],
                    help="Opponent strategy when --opponents > 0 (default: mixed).")
+    p.add_argument("--num-allies", type=int, default=None, choices=[1, 2],
+                   help="Allied robots controlled by the policy (default: auto-detect "
+                        "from model — use 2 for 2v2 team checkpoints).")
+    p.add_argument("--log-decisions", action="store_true",
+                   help="Write per-decision CSV log while evaluating.")
+    p.add_argument("--log-dir", default="logs",
+                   help="Directory for decision log CSV files (default: logs/).")
     p.set_defaults(func=cmd_eval)
 
     # --- export ---

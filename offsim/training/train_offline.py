@@ -27,7 +27,7 @@ import d3rlpy
 # ---------------------------------------------------------------------------
 
 # Bump these when their respective contracts change.
-ACTION_ENUM_VERSION   = "v2"           # bumped when Action enum members or order change
+ACTION_ENUM_VERSION   = "v3"           # bumped when Action enum members or order change
 REWARD_VERSION        = "winning_v1"   # bumped when REWARD_WEIGHTS / components change
 FIELD_CONFIG_VERSION  = "push_back_v1" # bumped when field geometry / shared_config.yaml changes
 
@@ -44,14 +44,14 @@ def build_dataset_metadata(n_transitions: int) -> dict:
     Captures everything needed to detect drift between the recorded dataset
     and the env at training time.
     """
-    from sim.config import Action, NUM_ACTIONS, STATE_DIM
+    from sim.config import Action, ACTION_NAMES, NUM_ACTIONS, STATE_DIM
     return {
         "action_enum_version":  ACTION_ENUM_VERSION,
         "reward_version":       REWARD_VERSION,
         "field_config_version": FIELD_CONFIG_VERSION,
         "state_dim":            int(STATE_DIM),
         "num_actions":          int(NUM_ACTIONS),
-        "action_names":         [a.name for a in Action],
+        "action_names":         [ACTION_NAMES[i] for i in range(NUM_ACTIONS)],
         "n_transitions":        int(n_transitions),
         "created_at":           datetime.now(timezone.utc).isoformat(),
     }

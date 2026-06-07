@@ -1,0 +1,96 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[train] Using MaskablePPO (sb3-contrib) — action masks active
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+PyTorch device (requested=cuda): cuda  (torch=2.6.0+cu124, torch.cuda=12.4)
+Using cuda device
+
+Training 4 env(s) x 2,000,000 new timesteps -- staged curriculum (solo -> opponents over time)
+Checkpoints every 10,000 steps -> models/checkpoints
+Ctrl+C at any time saves current model to models/interrupted_model.zip
+
+Logging to models/tb_logs/MaskablePPO_2
+/home/nex/leroiai-offSim/.venv/lib/python3.12/site-packages/stable_baselines3/common/callbacks.py:419: UserWarning: Training and eval env are not of the same type<stable_baselines3.common.vec_env.subproc_vec_env.SubprocVecEnv object at 0x78708ada7e00> != <stable_baselines3.common.vec_env.dummy_vec_env.DummyVecEnv object at 0x78708ada4440>
+  warnings.warn("Training and eval env are not of the same type" f"{self.training_env} != {self.eval_env}")
+[Curriculum] -> Stage 1 at 4 steps  (all_blue=False, opps=0, fails=0.00)
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 28.1     |
+|    ep_rew_mean     | 63.4     |
+| time/              |          |
+|    fps             | 73       |
+|    iterations      | 1        |
+|    time_elapsed    | 27       |
+|    total_timesteps | 2048     |
+---------------------------------
+[ep   100] reward=+69.41  blue=31.6  red=18.8  steps=2,828
+-----------------------------------------
+| game/                   |             |
+|    avg_margin           | 12.8        |
+|    avg_opp_score        | 18.8        |
+|    avg_score            | 31.6        |
+|    win_rate             | 0.86        |
+| rollout/                |             |
+|    ep_len_mean          | 27.7        |
+|    ep_rew_mean          | 75.1        |
+| time/                   |             |
+|    fps                  | 72          |
+|    iterations           | 2           |
+|    time_elapsed         | 56          |
+|    total_timesteps      | 4096        |
+| train/                  |             |
+|    approx_kl            | 0.001927187 |
+|    clip_fraction        | 0.000122    |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.97       |
+|    explained_variance   | 0.00165     |
+|    learning_rate        | 0.0003      |
+|    loss                 | 925         |
+|    n_updates            | 8           |
+|    policy_gradient_loss | -0.00626    |
+|    value_loss           | 1.88e+03    |
+-----------------------------------------
+[ep   200] reward=+78.80  blue=33.7  red=18.8  steps=5,624
+-----------------------------------------
+| game/                   |             |
+|    avg_margin           | 14.9        |
+|    avg_opp_score        | 18.8        |
+|    avg_score            | 33.7        |
+|    win_rate             | 0.95        |
+| rollout/                |             |
+|    ep_len_mean          | 28.1        |
+|    ep_rew_mean          | 80.2        |
+| time/                   |             |
+|    fps                  | 74          |
+|    iterations           | 3           |
+|    time_elapsed         | 82          |
+|    total_timesteps      | 6144        |
+| train/                  |             |
+|    approx_kl            | 0.001408498 |
+|    clip_fraction        | 0           |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.99       |
+|    explained_variance   | 0.00153     |
+|    learning_rate        | 0.0003      |
+|    loss                 | 682         |
+|    n_updates            | 16          |
+|    policy_gradient_loss | -0.00453    |
+|    value_loss           | 1.9e+03     |
+-----------------------------------------

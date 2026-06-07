@@ -15,13 +15,116 @@ from sim.config import (
     OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP, OBJ_REMOVED,
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS,
-    COLLECT_RANGE, SCORE_RANGE, MAX_CARRY, ROBOT_W,
+    COLLECT_RANGE, SCORE_RANGE, MAX_CARRY, ROBOT_W, Action,
     BALL_RED, BALL_BLUE,
     MATCHLOAD_TUBES, MATCHLOAD_TUBE_RADIUS,
     LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX, LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH,
-    CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W,
+    LONG_GOAL_CAPACITY, CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W,
+    HALF_BOTTOM_Y_MAX, HALF_TOP_Y_MIN,
+    HALF_SHARED_STRIP_Y_LO, HALF_SHARED_STRIP_Y_HI,
+    ALLY_START_R0, ALLY_START_R1, OPP_START_R0, OPP_START_R1,
+    ALLY_START_HEADING_R0, ALLY_START_HEADING_R1,
+    OPP_START_HEADING_R0, OPP_START_HEADING_R1,
+    HALF_LEFT_X_MAX, HALF_RIGHT_X_MIN,
+    HALF_SHARED_STRIP_X_LO, HALF_SHARED_STRIP_X_HI,
+    DESCORE_P0, DESCORE_P1, DESCORE_P2, DESCORE_P3,
+    SLAM_SPEED_DIVISOR, SLAM_MIN_SPEED,
 )
-from sim.game_object import BALL_RADIUS
+from sim.game_object import BALL_RADIUS, GameObject
+from sim.action_helpers import is_descore_action, is_ram_action
+
+# Staging / approach margin beyond long-goal ends (matches env _STAGE_* offsets).
+_LONG_GOAL_NAV_MARGIN = 25.0
+
+# Long-goal center X (matches env scoring geometry)
+_RIGHT_GOAL_CX = (FIELD_W - LONG_GOAL_WALL_GAP - LONG_GOAL_WIDTH + FIELD_W - LONG_GOAL_WALL_GAP) / 2.0
+_LEFT_GOAL_CX  = (LONG_GOAL_WALL_GAP + LONG_GOAL_WALL_GAP + LONG_GOAL_WIDTH) / 2.0
+_CENTER_X, _CENTER_Y = 72.0, 72.0
+_ARM_TIP = CENTER_GOAL_ARM_LEN / math.sqrt(2.0)
+_APPROACH_GAP = min(ROBOT_W / 2.0 + 4.5, SCORE_RANGE - 1.0)
+_CENTER_TIP_DIAG = (CENTER_GOAL_ARM_LEN + _APPROACH_GAP) / math.sqrt(2.0)
+CENTER_MID_ACCESS_Y_MAX = _CENTER_Y + _CENTER_TIP_DIAG + ROBOT_W / 2.0 + 1.0
+CENTER_LOW_ACCESS_Y_MIN = _CENTER_Y - _CENTER_TIP_DIAG - ROBOT_W / 2.0 - 1.0
+_TIP_NE = (_CENTER_X + _ARM_TIP, _CENTER_Y + _ARM_TIP)
+_TIP_SW = (_CENTER_X - _ARM_TIP, _CENTER_Y - _ARM_TIP)
+_TIP_NW = (_CENTER_X - _ARM_TIP, _CENTER_Y + _ARM_TIP)
+_TIP_SE = (_CENTER_X + _ARM_TIP, _CENTER_Y - _ARM_TIP)
+_SPILL_GAP = ROBOT_W + 4.0
+
+
+def exit_end_opposite_entry(entry_end: int) -> int:
+    """Return the goal end balls spill from when entering at entry_end."""
+    return DESCORE_P3 if entry_end == DESCORE_P0 else DESCORE_P0
+
+
+def exit_end_for_scoring_prepend(prepend: bool) -> int:
+    """Return spill end when a ball enters with prepend=True (start) or False (end)."""
+    return DESCORE_P3 if prepend else DESCORE_P0
+
+
+def spill_ball_at_goal_exit(obj: GameObject, gname: str, exit_end: int,
+                            rng: np.random.Generator) -> None:
+    """Place a ball just outside the goal exit with spill velocity."""
+    scatter = 8.0
+    if gname == "our_long":
+        cx = _RIGHT_GOAL_CX
+        if exit_end == DESCORE_P3:
+            obj.x, obj.y = cx, LONG_GOAL_Y_MAX + _SPILL_GAP
+            obj.vx, obj.vy = 0.0, 12.0
+        else:
+            obj.x, obj.y = cx, LONG_GOAL_Y_MIN - _SPILL_GAP
+            obj.vx, obj.vy = 0.0, -12.0
+    elif gname == "opp_long":
+        cx = _LEFT_GOAL_CX
+        if exit_end == DESCORE_P3:
+            obj.x, obj.y = cx, LONG_GOAL_Y_MAX + _SPILL_GAP
+            obj.vx, obj.vy = 0.0, 12.0
+        else:
+            obj.x, obj.y = cx, LONG_GOAL_Y_MIN - _SPILL_GAP
+            obj.vx, obj.vy = 0.0, -12.0
+    elif gname == "center_mid":
+        if exit_end == DESCORE_P3:
+            tip, vx, vy = _TIP_NE, 8.0, 8.0
+        else:
+            tip, vx, vy = _TIP_SW, -8.0, -8.0
+        d = _SPILL_GAP / math.sqrt(2.0)
+        sign = 1.0 if exit_end == DESCORE_P3 else -1.0
+        obj.x = float(tip[0]) + sign * d
+        obj.y = float(tip[1]) + sign * d
+        obj.vx, obj.vy = sign * vx, sign * vy
+    elif gname == "center_low":
+        d = _SPILL_GAP / math.sqrt(2.0)
+        if exit_end == DESCORE_P3:
+            obj.x = float(_TIP_NW[0]) - d
+            obj.y = float(_TIP_NW[1]) + d
+            obj.vx, obj.vy = -8.0, 8.0
+        else:
+            obj.x = float(_TIP_SE[0]) + d
+            obj.y = float(_TIP_SE[1]) - d
+            obj.vx, obj.vy = 8.0, -8.0
+    else:
+        obj.vx = obj.vy = 0.0
+
+    obj.x += float(rng.uniform(-scatter, scatter))
+    obj.y += float(rng.uniform(-scatter, scatter))
+    obj.vx += float(rng.uniform(-6.0, 6.0))
+    obj.vy += float(rng.uniform(-6.0, 6.0))
+    half = ROBOT_W / 2.0 + 1.0
+    obj.x = round(float(np.clip(obj.x, half, FIELD_W - half)), 2)
+    obj.y = round(float(np.clip(obj.y, half, FIELD_H - half)), 2)
+
+
+def infer_scoring_prepend(gname: str, goal_pos: np.ndarray) -> bool:
+    """Infer whether scoring enters from the 'start' end (prepend) at goal_pos."""
+    gy = float(goal_pos[1])
+    gx = float(goal_pos[0])
+    if "long" in gname:
+        return gy < (_CENTER_Y)
+    if gname == "center_mid":
+        return gy < _CENTER_Y or (abs(gx - _CENTER_X) < 1.0 and gy <= _CENTER_Y)
+    if gname == "center_low":
+        return gy > _CENTER_Y
+    return False
 
 # ---------------------------------------------------------------------------
 # Ball-position randomisation
@@ -121,8 +224,140 @@ def _goal_name(goal_pos: np.ndarray) -> str:
     if np.allclose(goal_pos, CENTER_LOW_GOAL):  return "center_low"
     return "other"
 from sim.robot import Robot
-from sim.game_object import GameObject
 from sim.heatmap import compute_heatmap
+
+
+def field_half(robot: Robot, is_opponent: bool) -> str:
+    """Return alliance half: allies bottom, opponents top (VAIRC midfield at y=72)."""
+    return "top" if is_opponent else "bottom"
+
+
+def field_side(robot: Robot) -> str:
+    """Return 'left' or 'right' lane for this robot (role 0 = left, role 1 = right)."""
+    return "left" if robot.role_id == 0 else "right"
+
+
+def cross_alliance_pair(ally_idx: int, opp_idx: int) -> bool:
+    """True when ally and opponent share a field side (R0↔R0 left, R1↔R1 right)."""
+    return ally_idx == opp_idx
+
+
+def y_bounds_for_robot(robot: Robot, is_opponent: bool,
+                       action: Action | None = None) -> tuple[float, float]:
+    """Allowed y-range for this robot (inclusive), with center-goal extensions."""
+    half_w = ROBOT_W / 2.0 + 1.0
+    if field_half(robot, is_opponent) == "bottom":
+        y_min = half_w
+        y_max = HALF_BOTTOM_Y_MAX
+        if action is not None:
+            if action in (Action.SCORE_MID_LEFT, Action.SCORE_MID_RIGHT):
+                y_max = max(y_max, CENTER_MID_ACCESS_Y_MAX)
+            elif action in (Action.SCORE_LOW_LEFT, Action.SCORE_LOW_RIGHT):
+                y_max = max(y_max, HALF_SHARED_STRIP_Y_HI)
+            elif is_descore_action(action) or is_ram_action(action):
+                y_max = max(y_max, LONG_GOAL_Y_MAX + _LONG_GOAL_NAV_MARGIN)
+    else:
+        y_min = HALF_TOP_Y_MIN
+        y_max = FIELD_H - half_w
+        if action is not None:
+            if action in (Action.SCORE_LOW_LEFT, Action.SCORE_LOW_RIGHT):
+                y_min = min(y_min, CENTER_LOW_ACCESS_Y_MIN)
+            elif action in (Action.SCORE_MID_LEFT, Action.SCORE_MID_RIGHT):
+                y_min = min(y_min, HALF_SHARED_STRIP_Y_LO)
+            elif is_descore_action(action) or is_ram_action(action):
+                y_min = min(y_min, LONG_GOAL_Y_MIN - _LONG_GOAL_NAV_MARGIN)
+    return y_min, y_max
+
+
+def x_bounds_for_robot(robot: Robot,
+                       action: Action | None = None) -> tuple[float, float]:
+    """Allowed x-range for this robot's field side (inclusive)."""
+    half_w = ROBOT_W / 2.0 + 1.0
+    center_intent = action in (
+        Action.SCORE_MID_LEFT, Action.SCORE_MID_RIGHT,
+        Action.SCORE_LOW_LEFT, Action.SCORE_LOW_RIGHT,
+    ) if action is not None else False
+    if field_side(robot) == "left":
+        x_min = half_w
+        x_max = HALF_SHARED_STRIP_X_HI if center_intent else HALF_LEFT_X_MAX
+    else:
+        x_min = HALF_SHARED_STRIP_X_LO if center_intent else HALF_RIGHT_X_MIN
+        x_max = FIELD_W - half_w
+    return x_min, x_max
+
+
+def clip_xy_to_zone(x: float, y: float,
+                    x_min: float, x_max: float,
+                    y_min: float, y_max: float) -> tuple[float, float]:
+    """Clip position to allowed x/y bounds."""
+    return (
+        round(float(np.clip(x, x_min, x_max)), 2),
+        round(float(np.clip(y, y_min, y_max)), 2),
+    )
+
+
+def clip_xy_to_half(x: float, y: float, y_min: float, y_max: float) -> tuple[float, float]:
+    """Clip position to field x-bounds and robot half y-bounds."""
+    half_w = ROBOT_W / 2.0 + 1.0
+    return clip_xy_to_zone(x, y, half_w, FIELD_W - half_w, y_min, y_max)
+
+
+def clamp_robot_to_half(robot: Robot, is_opponent: bool,
+                        action: Action | None = None,
+                        enforce_x_lane: bool = False) -> None:
+    """Clamp robot center to alliance y-bounds and optional left/right x-lane."""
+    y_min, y_max = y_bounds_for_robot(robot, is_opponent, action)
+    if enforce_x_lane:
+        x_min, x_max = x_bounds_for_robot(robot, action)
+    else:
+        half_w = ROBOT_W / 2.0 + 1.0
+        x_min, x_max = half_w, FIELD_W - half_w
+    robot.x, robot.y = clip_xy_to_zone(robot.x, robot.y, x_min, x_max, y_min, y_max)
+
+
+def resolve_robot_pair_collision(robot_a: Robot, robot_b: Robot) -> bool:
+    """Push apart two overlapping robots (center distance < ROBOT_W). Returns True if moved."""
+    dx = float(robot_b.x - robot_a.x)
+    dy = float(robot_b.y - robot_a.y)
+    dist = math.hypot(dx, dy)
+    min_dist = float(ROBOT_W)
+    if dist >= min_dist:
+        return False
+    if dist < 1e-6:
+        dx, dy, dist = 1.0, 0.0, 1.0
+    overlap = min_dist - dist
+    nx, ny = dx / dist, dy / dist
+    push = overlap / 2.0
+    robot_a.x = round(robot_a.x - nx * push, 2)
+    robot_a.y = round(robot_a.y - ny * push, 2)
+    robot_b.x = round(robot_b.x + nx * push, 2)
+    robot_b.y = round(robot_b.y + ny * push, 2)
+    return True
+
+
+def _robots_overlap(robots: list[Robot]) -> bool:
+    min_dist = float(ROBOT_W)
+    for i in range(len(robots)):
+        for j in range(i + 1, len(robots)):
+            a, b = robots[i], robots[j]
+            if math.hypot(b.x - a.x, b.y - a.y) < min_dist - 1e-6:
+                return True
+    return False
+
+
+def resolve_all_robot_collisions(allies: list[Robot],
+                                 opponents: list[Robot],
+                                 max_passes: int = 16) -> None:
+    """Push apart every overlapping robot pair (allies, opponents, and cross-alliance)."""
+    robots = list(allies) + list(opponents)
+    if len(robots) < 2:
+        return
+    for _ in range(max_passes):
+        if not _robots_overlap(robots):
+            break
+        for i in range(len(robots)):
+            for j in range(i + 1, len(robots)):
+                resolve_robot_pair_collision(robots[i], robots[j])
 
 
 class GoalState:
@@ -159,11 +394,11 @@ class GoalState:
         prepend=False (default): ball enters from the 'end' (N for long, NE for MID, NW for LOW).
         prepend=True: ball enters from the 'start' (S for long, SW for MID, SE for LOW).
 
-        Capacities: long goals = 14 balls, center goals = 7 balls.
+        Capacities: long goals = 12 balls, center goals = 7 balls.
         If full, the ball at the OPPOSITE end is ejected (rolls out).
         Returns (ejected_ball_idx, ejected_color) on overflow, else None.
         """
-        _LONG_CAP   = 14
+        _LONG_CAP   = LONG_GOAL_CAPACITY
         _CENTER_CAP = 7
         lst = self._list(gname)
         cap = _LONG_CAP if "long" in gname else _CENTER_CAP
@@ -187,6 +422,46 @@ class GoalState:
             if idx == ball_idx:
                 lst.pop(i)
                 return
+
+    @staticmethod
+    def partition_boundaries(n_balls: int) -> list[int]:
+        """Return [P0, P1, P2, P3] list-index boundaries for n scored balls."""
+        if n_balls <= 0:
+            return [0, 0, 0, 0]
+        b0 = (n_balls + 2) // 3
+        b1 = b0 + (n_balls - b0 + 1) // 2
+        return [0, b0, b1, n_balls]
+
+    @staticmethod
+    def segment_bounds(n_balls: int) -> list[tuple[int, int]]:
+        """Three equal-ish index segments for n balls in a goal."""
+        if n_balls <= 0:
+            return [(0, -1), (0, -1), (0, -1)]
+        b = GoalState.partition_boundaries(n_balls)
+        return [(b[0], b[1] - 1), (b[1], b[2] - 1), (b[2], b[3] - 1)]
+
+    @staticmethod
+    def slide_index_range(n_balls: int, start_pt: int, end_pt: int) -> tuple[int, int] | None:
+        """Inclusive index span of balls between partition points start_pt → end_pt."""
+        if n_balls <= 0 or start_pt == end_pt:
+            return None
+        b = GoalState.partition_boundaries(n_balls)
+        if end_pt < start_pt:
+            lo, hi = b[end_pt], b[start_pt] - 1
+        else:
+            lo, hi = b[start_pt], b[end_pt] - 1
+        if lo > hi:
+            return None
+        return lo, hi
+
+    @staticmethod
+    def is_slide_allowed(gname: str, start_pt: int, end_pt: int) -> bool:
+        """Validate slide partition pairs per goal type."""
+        if gname in ("our_long", "opp_long"):
+            return (start_pt, end_pt) in ((DESCORE_P1, DESCORE_P0), (DESCORE_P2, DESCORE_P0))
+        if gname == "center_mid":
+            return start_pt in (DESCORE_P1, DESCORE_P2) and end_pt in (DESCORE_P0, DESCORE_P3)
+        return False
 
     def outer_colors(self, gname: str) -> tuple[int | None, int | None]:
         """Return (south/left outer color, north/right outer color).
@@ -238,15 +513,19 @@ class Field:
     """Manages all field state: 4 robots + 44 game objects + scores."""
 
     def __init__(self):
-        # Allied robots — blue team, start right side
+        # Allied robots — blue team, bottom park zone (VAIRC Section 7)
         self.allies: list[Robot] = [
-            Robot(x=108.00, y=18.00,  heading=np.pi, role_id=0),
-            Robot(x=108.00, y=126.00, heading=np.pi, role_id=1),
+            Robot(x=float(ALLY_START_R0[0]), y=float(ALLY_START_R0[1]),
+                  heading=ALLY_START_HEADING_R0, role_id=0),
+            Robot(x=float(ALLY_START_R1[0]), y=float(ALLY_START_R1[1]),
+                  heading=ALLY_START_HEADING_R1, role_id=1),
         ]
-        # Opponent robots — red team, start left side
+        # Opponent robots — red team, top half (VAIRC Section 7)
         self.opponents: list[Robot] = [
-            Robot(x=24.00, y=126.00, heading=0.0, role_id=0),
-            Robot(x=24.00, y=18.00,  heading=0.0, role_id=1),
+            Robot(x=float(OPP_START_R0[0]), y=float(OPP_START_R0[1]),
+                  heading=OPP_START_HEADING_R0, role_id=0),
+            Robot(x=float(OPP_START_R1[0]), y=float(OPP_START_R1[1]),
+                  heading=OPP_START_HEADING_R1, role_id=1),
         ]
         # 44 colored balls
         self.objects: list[GameObject] = []
@@ -261,10 +540,14 @@ class Field:
 
     def reset(self, rng: np.random.Generator):
         """Reset field to starting positions (clears any editor changes)."""
-        self.allies[0].reset(108.00,  18.00, heading=np.pi)
-        self.allies[1].reset(108.00, 126.00, heading=np.pi)
-        self.opponents[0].reset(24.00, 126.00, heading=0.0)
-        self.opponents[1].reset(24.00,  18.00, heading=0.0)
+        self.allies[0].reset(float(ALLY_START_R0[0]), float(ALLY_START_R0[1]),
+                               heading=ALLY_START_HEADING_R0)
+        self.allies[1].reset(float(ALLY_START_R1[0]), float(ALLY_START_R1[1]),
+                               heading=ALLY_START_HEADING_R1)
+        self.opponents[0].reset(float(OPP_START_R0[0]), float(OPP_START_R0[1]),
+                                heading=OPP_START_HEADING_R0)
+        self.opponents[1].reset(float(OPP_START_R1[0]), float(OPP_START_R1[1]),
+                                heading=OPP_START_HEADING_R1)
 
         # Rebuild from INITIAL_OBJECTS with randomized position+color assignment.
         # Each ball is jittered ±_JITTER_RADIUS from its anchor — keeps the
@@ -374,14 +657,12 @@ class Field:
         diff = abs(((robot.heading - angle_to + math.pi) % (2 * math.pi)) - math.pi)
         return diff <= _TUBE_FACE_TOL
 
-    def try_collect(self, robot: Robot) -> bool:
-        """Pick up the nearest ball (any color) inside the front-face intake zone.
+    def try_collect(self, robot: Robot) -> int | bool:
+        """Pick up a blue ball or automatically reject a wrong-color ball.
 
-        Intake is colorblind — the *policy* learns to avoid red balls through
-        the collect_red / holding_wrong_color penalties, and the route planner
-        only targets blue balls so the robot rarely drives toward reds in the
-        first place. If a red ball ends up in the intake (e.g. opp pushed it
-        in front of us), EJECT_WRONG_COLOR clears it.
+        The real robot color-sorts at the intake. In sim, a red ball that enters
+        the blue robot's intake is dropped just behind the robot with a small
+        spill velocity instead of being held or requiring a separate action.
 
         Only the front face of the robot (full width, _INTAKE_DEPTH reach) can
         collect. Tube balls still require the robot to face the tube within 30°.
@@ -398,10 +679,29 @@ class Field:
                     best_idx = i
 
         if best_idx >= 0:
-            tube = self._ball_at_tube(self.objects[best_idx])
+            obj = self.objects[best_idx]
+            tube = self._ball_at_tube(obj)
             if tube is not None and not self._facing_toward(robot, tube):
                 return False   # must face the tube head-on
-            self.objects[best_idx].status = OBJ_HELD
+
+            if obj.color != BALL_BLUE:
+                # Automatic color-sort reject: drop the ball out the back face.
+                back_x = -math.cos(robot.heading)
+                back_y = -math.sin(robot.heading)
+                side_x = math.sin(robot.heading)
+                side_y = -math.cos(robot.heading)
+                offset = ROBOT_W / 2.0 + BALL_RADIUS + 1.5
+                obj.x = round(float(robot.x + back_x * offset + side_x * 2.0), 2)
+                obj.y = round(float(robot.y + back_y * offset + side_y * 2.0), 2)
+                half = ROBOT_W / 2.0 + 1.0
+                obj.x = round(float(np.clip(obj.x, half, FIELD_W - half)), 2)
+                obj.y = round(float(np.clip(obj.y, half, FIELD_H - half)), 2)
+                obj.vx = float(back_x * 18.0 + side_x * 4.0)
+                obj.vy = float(back_y * 18.0 + side_y * 4.0)
+                obj.status = OBJ_ON_FIELD
+                return -1
+
+            obj.status = OBJ_HELD
             robot.balls_held += 1
             robot.held_object_ids.append(best_idx)
             return True
@@ -438,42 +738,138 @@ class Field:
             self.opponent_score += points
         return points, ejected
 
-    def try_descore(self, robot: Robot, goal_pos: np.ndarray, rng: np.random.Generator) -> int:
-        """Remove an opponent-scored ball from the SPECIFIC targeted goal.
+    def _goal_points(self, gname: str) -> int:
+        return LONG_GOAL_POINTS if "long" in gname else CENTER_GOAL_POINTS
 
-        Returns points removed (0 if out of range or no opp ball in that goal).
-        Only removes balls whose .scored_in_goal matches the goal_pos —
-        the previous version removed any opp-scored ball anywhere on the field,
-        which made the cause-effect chain meaningless for the policy.
-        """
-        if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
+    def _eject_ball_from_goal(self, gname: str, ball_idx: int, exit_end: int,
+                              rng: np.random.Generator) -> None:
+        obj = self.objects[ball_idx]
+        obj.status = OBJ_ON_FIELD
+        obj.scored_in_goal = ""
+        self.goal_state.remove_ball(gname, ball_idx)
+        spill_ball_at_goal_exit(obj, gname, exit_end, rng)
+
+    def spill_overflow_ball(self, gname: str, ball_idx: int, prepend: bool,
+                            rng: np.random.Generator) -> None:
+        """Spill an overflow ball out the end opposite the scoring entry."""
+        obj = self.objects[ball_idx]
+        obj.status = OBJ_ON_FIELD
+        obj.scored_in_goal = ""
+        spill_ball_at_goal_exit(obj, gname, exit_end_for_scoring_prepend(prepend), rng)
+
+    @staticmethod
+    def _descore_target_color(remove_ally_scored: bool,
+                              *, blue_alliance: bool = True) -> int:
+        """Ball color removable for this descore intent (matches belief/planning)."""
+        alliance_color = BALL_BLUE if blue_alliance else BALL_RED
+        opponent_color = BALL_RED if blue_alliance else BALL_BLUE
+        return alliance_color if remove_ally_scored else opponent_color
+
+    def _ball_removable_for_descore(self, ball_idx: int, remove_ally_scored: bool,
+                                    *, blue_alliance: bool = True) -> bool:
+        """True when this scored ball matches the descore action's color filter."""
+        obj = self.objects[ball_idx]
+        if obj.status not in (OBJ_SCORED_US, OBJ_SCORED_OPP):
+            return False
+        return obj.color == self._descore_target_color(
+            remove_ally_scored, blue_alliance=blue_alliance,
+        )
+
+    def _removable_in_goal(self, gname: str, remove_ally_scored: bool,
+                           *, blue_alliance: bool = True) -> list[int]:
+        """Ball indices in goal list that the descoring alliance may remove."""
+        lst = self.goal_state._list(gname)
+        out: list[int] = []
+        for ball_idx, _ in lst:
+            if (self.objects[ball_idx].scored_in_goal == gname
+                    and self._ball_removable_for_descore(
+                        ball_idx, remove_ally_scored, blue_alliance=blue_alliance,
+                    )):
+                out.append(ball_idx)
+        return out
+
+    def _remove_balls_from_goal(self, gname: str, ball_indices: list[int],
+                                exit_end: int, rng: np.random.Generator) -> int:
+        """Eject balls and subtract score from whichever alliance earned the points."""
+        if not ball_indices:
             return 0
+        pts_each = self._goal_points(gname)
+        total = 0
+        for ball_idx in sorted(ball_indices, reverse=True):
+            color = self.objects[ball_idx].color
+            self._eject_ball_from_goal(gname, ball_idx, exit_end, rng)
+            if color == BALL_BLUE:
+                self.my_score = max(0, self.my_score - pts_each)
+            else:
+                self.opponent_score = max(0, self.opponent_score - pts_each)
+            total += pts_each
+        return total
 
-        target_gname = _goal_name(goal_pos)
-        # Only consider opp-scored balls actually sitting in the targeted goal
-        candidates = [
-            i for i, obj in enumerate(self.objects)
-            if obj.status == OBJ_SCORED_OPP and obj.scored_in_goal == target_gname
-        ]
-        if not candidates:
+    def try_descore_slide(self, robot: Robot, gname: str,
+                          start_pt: int, end_pt: int,
+                          approach_pos: np.ndarray,
+                          rng: np.random.Generator,
+                          remove_ally_scored: bool = False,
+                          *, blue_alliance: bool = True) -> int:
+        """Slide descore: eject removable balls in the partition span start_pt → end_pt."""
+        drop_ref = OPP_LONG_GOAL if gname == "opp_long" else OUR_LONG_GOAL
+        dist = min(
+            float(np.linalg.norm(robot.position - approach_pos)),
+            float(np.linalg.norm(robot.position - drop_ref)),
+        )
+        if dist >= SCORE_RANGE:
             return 0
+        if not GoalState.is_slide_allowed(gname, start_pt, end_pt):
+            return 0
+        lst = self.goal_state._list(gname)
+        span = GoalState.slide_index_range(len(lst), start_pt, end_pt)
+        if span is None:
+            return 0
+        lo, hi = span
+        to_remove: list[int] = []
+        for i, (ball_idx, _) in enumerate(lst):
+            if (lo <= i <= hi
+                    and self._ball_removable_for_descore(
+                        ball_idx, remove_ally_scored, blue_alliance=blue_alliance,
+                    )):
+                to_remove.append(ball_idx)
+        return self._remove_balls_from_goal(gname, to_remove, end_pt, rng)
 
-        idx = candidates[0]
-        self.objects[idx].status = OBJ_ON_FIELD
-        self.objects[idx].scored_in_goal = ""
-        self.goal_state.remove_ball(target_gname, idx)
-        drop_pos = goal_pos + rng.uniform(-8.0, 8.0, size=2)
-        drop_pos = np.clip(drop_pos, [0.0, 0.0], [FIELD_W, FIELD_H])
-        self.objects[idx].position = drop_pos
-
-        # Point value matches the goal type — long goals are worth different
-        # points than center goals.
-        if target_gname in ("our_long", "opp_long"):
-            pts = LONG_GOAL_POINTS
-        else:
-            pts = CENTER_GOAL_POINTS
-        self.opponent_score = max(0, self.opponent_score - pts)
-        return pts
+    def try_descore_slam(self, robot: Robot, gname: str, entry_end: int,
+                         impact_speed: float, approach_pos: np.ndarray,
+                         rng: np.random.Generator,
+                         remove_ally_scored: bool = False,
+                         *, blue_alliance: bool = True) -> int:
+        """Slam descore: eject floor(speed/K) balls from the end opposite entry_end."""
+        drop_ref = OPP_LONG_GOAL if gname == "opp_long" else OUR_LONG_GOAL
+        dist = min(
+            float(np.linalg.norm(robot.position - approach_pos)),
+            float(np.linalg.norm(robot.position - drop_ref)),
+        )
+        if dist >= SCORE_RANGE:
+            return 0
+        if impact_speed < SLAM_MIN_SPEED:
+            return 0
+        if entry_end not in (DESCORE_P0, DESCORE_P3):
+            return 0
+        n_eject = int(math.floor(impact_speed / SLAM_SPEED_DIVISOR))
+        if n_eject <= 0:
+            return 0
+        lst = self.goal_state._list(gname)
+        if not lst:
+            return 0
+        exit_end = exit_end_opposite_entry(entry_end)
+        indices = range(len(lst) - 1, -1, -1) if exit_end == DESCORE_P3 else range(len(lst))
+        to_remove: list[int] = []
+        for i in indices:
+            ball_idx, _ = lst[i]
+            if self._ball_removable_for_descore(
+                ball_idx, remove_ally_scored, blue_alliance=blue_alliance,
+            ):
+                to_remove.append(ball_idx)
+                if len(to_remove) >= n_eject:
+                    break
+        return self._remove_balls_from_goal(gname, to_remove, exit_end, rng)
 
     def nearest_on_field_target(self, pos: np.ndarray) -> np.ndarray | None:
         """Return position of nearest on-field ball, or None (no obstacle check)."""
@@ -531,43 +927,55 @@ class Field:
         return False
 
     def opp_try_score(self, robot: Robot, goal_pos: np.ndarray, points: int,
-                       gname: str | None = None) -> int:
+                       gname: str | None = None, rng: np.random.Generator | None = None,
+                       prepend: bool | None = None) -> int:
         if robot.balls_held <= 0:
             return 0
         if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
             return 0
-        n = robot.balls_held
-        scored = points * n
-        self.opponent_score += scored
-        # gname overrides center-lookup when goal_pos is a goal END/TIP (the
-        # opponent backs in at the same scoring poses the ally uses, which don't
-        # match the goal-center constants _goal_name keys on).
         if gname is None:
             gname = _goal_name(goal_pos)
-        for idx in robot.held_object_ids:
+        if prepend is None:
+            prepend = infer_scoring_prepend(gname, goal_pos)
+        n = robot.balls_held
+        scored = 0
+        for idx in list(robot.held_object_ids):
             self.objects[idx].status = OBJ_SCORED_OPP
             self.objects[idx].scored_in_goal = gname
-            self.goal_state.score_ball(gname, idx, self.objects[idx].color)
+            ejected = self.goal_state.score_ball(
+                gname, idx, self.objects[idx].color, prepend=prepend,
+            )
+            scored += points
+            if ejected is not None and rng is not None:
+                ej_idx, ej_color = ejected
+                self.spill_overflow_ball(gname, ej_idx, prepend, rng)
+                if ej_color == BALL_BLUE:
+                    self.my_score = max(0, self.my_score - points)
+                else:
+                    self.opponent_score = max(0, self.opponent_score - points)
+        self.opponent_score += scored
         robot.held_object_ids.clear()
         robot.balls_held = 0
         return scored
 
-    def opp_try_descore(self, robot: Robot, goal_pos: np.ndarray, rng: np.random.Generator) -> int:
-        if np.linalg.norm(robot.position - goal_pos) >= SCORE_RANGE:
-            return 0
-        us_scored = self.scored_by_us_indices()
-        if len(us_scored) == 0:
-            return 0
-        idx = us_scored[0]
-        gname_remove = self.objects[idx].scored_in_goal
-        self.objects[idx].status = OBJ_ON_FIELD
-        self.objects[idx].scored_in_goal = ""
-        self.goal_state.remove_ball(gname_remove, idx)
-        drop_pos = goal_pos + rng.uniform(-8.0, 8.0, size=2)
-        drop_pos = np.clip(drop_pos, [0.0, 0.0], [FIELD_W, FIELD_H])
-        self.objects[idx].position = drop_pos
-        self.my_score = max(0, self.my_score - CENTER_GOAL_POINTS)
-        return CENTER_GOAL_POINTS
+    def opp_try_descore_slide(self, robot: Robot, gname: str,
+                              start_pt: int, end_pt: int,
+                              approach_pos: np.ndarray,
+                              rng: np.random.Generator,
+                              remove_ally_scored: bool) -> int:
+        return self.try_descore_slide(
+            robot, gname, start_pt, end_pt, approach_pos, rng,
+            remove_ally_scored=remove_ally_scored, blue_alliance=False,
+        )
+
+    def opp_try_descore_slam(self, robot: Robot, gname: str, entry_end: int,
+                             impact_speed: float, approach_pos: np.ndarray,
+                             rng: np.random.Generator,
+                             remove_ally_scored: bool) -> int:
+        return self.try_descore_slam(
+            robot, gname, entry_end, impact_speed, approach_pos, rng,
+            remove_ally_scored=remove_ally_scored, blue_alliance=False,
+        )
 
     # ------------------------------------------------------------------
     # Ball rolling physics
@@ -631,3 +1039,4 @@ class Field:
                 scale  = _MAX_BALL_SPD / spd
                 obj.vx *= scale
                 obj.vy *= scale
+

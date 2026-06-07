@@ -36,14 +36,31 @@ sim, exported to ONNX, and intended for deployment on the real robot via ROS 2 (
 | 1 | `SCORE_LONG_GOAL` | Back into the nearest long goal and deposit |
 | 2 | `SCORE_CENTER_MID` | Back into the mid (NE–SW) center goal |
 | 3 | `SCORE_CENTER_LOW` | Back into the low (NW–SE) center goal |
-| 4 | `DESCORE_OPP_LONG` | Remove balls from the opponent's long goal |
-| 5 | `DESCORE_CENTER` | Remove opponent balls from the center goals |
+| 4 | `DESCORE_OPP_LONG` | Descore the opponent's long goal (slide or slam) |
+| 5 | `DESCORE_CENTER` | Descore center goals (slide and/or slam) |
 | 6 | `DEFEND_ZONE` | Hold a defensive position |
 | 7 | `EJECT_WRONG_COLOR` | Dump held wrong-color balls out the back |
 | 8 | `IDLE` | Do nothing this decision |
 
 Invalid actions are masked (e.g. descore is only offered for a goal the robot *believes*
 holds opponent balls).
+
+**Descore mechanics** (same two actions; nav picks slide vs slam from belief):
+
+- **Long goals** are split into three equal segments (four partition points: south exterior,
+  two interior points, north exterior). **Slide** from an interior point toward the south
+  exterior ejects all opponent balls in that span (`P1→P0` or `P2→P0`). A ceiling between
+  `P2` and `P3` blocks sliding the full length. **Slam** from a south or north entry ejects
+  `floor(speed / K)` balls from the opposite end (`K = 10` in/s per ball by default).
+- **Center mid** (NE–SW bar): slide across the full goal (no ceiling) or slam from NE/SW tips.
+- **Center low** (NW–SE bar): **slam only** from NW or SE tips.
+
+Minimum slam speed is 6 in/s. Slide runs a short dwell animation along the goal axis before
+balls eject. Ejected balls **spill out the correct end** (south vs north) with velocity so
+they roll onto the field.
+
+Long goals hold **12 balls** max; scoring a 13th pushes the ball out the **opposite end**
+from the entry side (same spill physics as descore).
 
 ### Observation
 A flat per-robot vector (`STATE_DIM = 90` with the heatmap off; 234 with it on):
@@ -55,9 +72,14 @@ A flat per-robot vector (`STATE_DIM = 90` with the heatmap off; 234 with it on):
 - 3 extras — expected score delta, success ratio, wrong-color held.
 - (optional) 12×12 potential heatmap.
 
-Training and eval use a **single-agent wrapper** (`SingleAgentWrapper`): the policy controls
-robot 0 with a `STATE_DIM` observation and a single `Discrete(9)` action; the teammate idles.
-(To drive two robots from a policy, query it once per robot.)
+**Training wrappers:**
+- **1-robot** (`SingleAgentWrapper`): policy controls robot 0 with a `STATE_DIM` observation
+  and `Discrete(9)` action; robot 1 idles.
+- **2-robot / 2v2** (`TeamAgentWrapper`, default): both allies act each decision. Observation
+  is `concat(robot_0, robot_1)` → `STATE_DIM × 2`; action is `MultiDiscrete([9, 9])`; reward
+  is the sum of both robots' per-decision rewards. Spawns follow **VAIRC Section 7**: blue
+  below midfield, red above; within each alliance R0 starts on the **left wall** and R1 on
+  the **right wall**.
 
 ### Decision cycle
 Every RL decision runs for `decision_interval` (3 s) of simulated time, sub-stepped at
@@ -80,6 +102,12 @@ out** stuck actions.
   top/bottom park platforms and deprioritizes balls sitting on them, but still crosses (or
   enters for an in-park ball) as a last resort rather than stranding the robot. Tunable via
   `_PARK_AVOID` / `_PARK_MARGIN` in `route_planner.py`.
+- **VAIRC Isolation Period (15 s)** — robots stay on their alliance side of midfield (y=72).
+  Blue below, red above. After Isolation, the **Interaction Period** allows full **y** movement.
+- **Per-robot field halves (always)** — R0 stays on the left (x ≤ 64), R1 on the right (x ≥ 80),
+  with a shared center strip for center-goal actions. Teammates never cross into each other's half.
+- **Robot–robot collision** — all robots physically collide (teammates and opponents).
+  Policies do **not** observe other robots in the state vector.
 - **Randomized layouts** — each run/episode jitters and permutes ball positions/colors.
 - **Failure injection** — optional stuck/offline/steal events for sim-to-real robustness.
 
@@ -147,15 +175,18 @@ All commands run through `offsim/main.py`:
 ```bash
 # Visual sim — greedy auto-play; randomized layout each run
 python offsim/main.py demo
-python offsim/main.py demo --num-robots 2 --opponent mixed
+python offsim/main.py demo --num-robots 2 --opponent mixed   # 2v2 greedy demo
+# AUTO PLAY (default): collect → score → descore when opponent balls are in goals.
+# Mixed opponents descore your goals once you have scored; use panel DESCORE buttons to force it.
 
-# Train — staged curriculum (default) OR manual phases; see "Training workflows" below
-python offsim/main.py train --timesteps 1000000 --n-envs 4
-python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
+# Train — 2v2 by default (2 allies, curriculum ramps to 2 opponents)
+python offsim/main.py train --num-allies 2 --timesteps 2000000 --n-envs 4
+python offsim/main.py train --num-allies 1 --timesteps 1000000 --n-envs 4   # legacy 1-robot
+python offsim/main.py train --resume latest --no-curriculum --num-allies 2 --opponents 2 --timesteps 600000
 
-# Evaluate a trained policy (add --opponents 1 to watch contested play)
-python offsim/main.py eval --model latest --episodes 10
-python offsim/main.py eval --model latest --render --opponents 1 --opponent mixed
+# Evaluate (auto-detects 1v1 vs 2v2 model shape; --num-allies can override)
+python offsim/main.py eval --model latest --num-allies 2 --episodes 10
+python offsim/main.py eval --model latest --render --num-allies 2 --opponents 2 --opponent mixed
 
 # Offline RL from logged matches
 python offsim/main.py train-offline --data data/matches/ --algo cql
@@ -179,11 +210,11 @@ and the step counter all carry over, so training accumulates instead of restarti
 
 ### A) Staged curriculum (default)
 With no regime flags, training runs a fixed 4-stage schedule keyed off the global step
-counter (`training/curriculum.py`): solo → solo + failures → 1 random opponent → 1 mixed
-opponent. Good for a single long, hands-off run:
+counter (`training/curriculum.py`): 2-ally solo → solo + failures → 2v1 (1 opponent) →
+full 2v2 (2 opponents, mixed strategy). Good for a single long, hands-off run:
 
 ```bash
-python offsim/main.py train --timesteps 1000000 --n-envs 4
+python offsim/main.py train --num-allies 2 --timesteps 2000000 --n-envs 4
 ```
 
 ### B) Manual phases (you control the schedule)
@@ -194,6 +225,7 @@ the curriculum off for that run:**
 | Flag | Meaning |
 |---|---|
 | `--no-curriculum` | Train the whole run at one fixed regime. |
+| `--num-allies {1,2}` | Allied robots (default `2` for 2v2 team training). |
 | `--opponents {0,1,2}` | Opponent count (passing this implies `--no-curriculum`). |
 | `--opponent-type {random,greedy,defensive,mixed}` | Opponent strategy (default `mixed`). |
 | `--failures {none,light,medium}` | Failure-injection level (default `none`). |

@@ -3,17 +3,31 @@
 # Game: VEX Push Back 2025-2026
 
 actions:
-  0: COLLECT_NEAREST_BALL
-  1: SCORE_LONG_GOAL
-  2: SCORE_CENTER_MID
-  3: SCORE_CENTER_LOW
-  4: DESCORE_OPP_LONG
-  5: DESCORE_CENTER
-  6: DEFEND_ZONE
-  7: EJECT_WRONG_COLOR
-  8: IDLE
+  0: STOP
+  1: MOVE_CHASSIS_ONLY
+  2: COLLECT_BLOCKS
+  3: SCORE_LEFT_LONG_GOAL_ALLIANCE
+  4: SCORE_LEFT_LONG_GOAL_OPPONENT
+  5: SCORE_RIGHT_LONG_GOAL_ALLIANCE
+  6: SCORE_RIGHT_LONG_GOAL_OPPONENT
+  7: SCORE_MID_LEFT
+  8: SCORE_MID_RIGHT
+  9: SCORE_LOW_LEFT
+  10: SCORE_LOW_RIGHT
+  11: DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD
+  12: DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL
+  13: DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
+  14: DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL
+  15: DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD
+  16: DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL
+  17: DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
+  18: DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL
+  19: RAM_RIGHT_LONG_GOAL_OPPONENT
+  20: RAM_RIGHT_LONG_GOAL_ALLIANCE
+  21: RAM_LEFT_LONG_GOAL_OPPONENT
+  22: RAM_LEFT_LONG_GOAL_ALLIANCE
 
-num_actions: 9
+num_actions: 23
 
 # VEX field — 12ft x 12ft = 144in x 144in
 field:
@@ -21,7 +35,8 @@ field:
   height: 144.00   # inches
 
 game:
-  match_duration: 120    # seconds
+  match_duration: 120    # seconds (VAIRC: 15s Isolation + 105s Interaction)
+  isolation_period: 15   # VAIRC Section 7 — robots stay on alliance side
   dt: 0.05               # seconds per sim tick (fine-grained for movement animation)
   decision_interval: 3.0 # seconds between RL re-queries (40 decisions per match)
   # Minimum time before mid-step auto-replanning is allowed to swap the

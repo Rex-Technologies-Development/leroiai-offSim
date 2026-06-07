@@ -380,6 +380,10 @@ def compute_collection_route(
     already_held: int = 0,
     max_volley: int = 5,
     robot=None,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
 ) -> list[tuple[list[int], np.ndarray, float]]:
     """Return an ordered list of (ball_indices, waypoint_pos, score).
 
@@ -406,6 +410,12 @@ def compute_collection_route(
         for i, obj in enumerate(field.objects):
             if obj.status != OBJ_ON_FIELD:
                 continue
+            if y_min is not None and y_max is not None:
+                if obj.y < y_min or obj.y > y_max:
+                    continue
+            if x_min is not None and x_max is not None:
+                if obj.x < x_min or obj.x > x_max:
+                    continue
             # Skip balls whose direct path is blocked when accounting for robot width
             if _los_blocked(rx, ry, obj.x, obj.y, margin=_NAV_MARGIN):
                 continue

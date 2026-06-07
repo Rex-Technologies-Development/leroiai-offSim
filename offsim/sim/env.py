@@ -20,21 +20,42 @@ from gymnasium import spaces
 import numpy as np
 
 from sim.config import (
-    Action, NUM_ACTIONS, STATE_DIM,
+    Action, NUM_ACTIONS, STATE_DIM, BALL_BLUE, BALL_RED,
     N_NEAREST_BLUE, N_NEAREST_RED,
-    FIELD_W, FIELD_H, MATCH_DURATION, DT, TICKS_PER_DECISION, MAX_CARRY,
+    FIELD_W, FIELD_H, MATCH_DURATION, ISOLATION_PERIOD, DT, TICKS_PER_DECISION, MAX_CARRY,
     MAX_GAME_OBJECTS, OBJ_ON_FIELD, OBJ_HELD, OBJ_SCORED_US, OBJ_SCORED_OPP,
     HEATMAP_W, HEATMAP_H, INCLUDE_HEATMAP, REPLAN_LOCK_TICKS, SCORING_DWELL_TICKS,
     SCORE_COMMIT_DECISIONS, SCORE_COMMIT_UNTIL_EMPTY, SCORE_COMMIT_MAX_DECISIONS, MAX_SCORE,
     OUR_LONG_GOAL, OPP_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL,
-    DEFEND_ZONE_POS,
+    DEFEND_ZONE_ALLY_LEFT, DEFEND_ZONE_ALLY_RIGHT,
+    DEFEND_ZONE_OPP_LEFT, DEFEND_ZONE_OPP_RIGHT,
+    JAM_RECOVERY_ALLY_LEFT, JAM_RECOVERY_ALLY_RIGHT,
+    JAM_RECOVERY_OPP_LEFT, JAM_RECOVERY_OPP_RIGHT,
     LONG_GOAL_POINTS, CENTER_GOAL_POINTS, COLLECT_RANGE,
     SCORE_RANGE, VISION_RANGE, VISION_HALF_ANGLE,
     LONG_GOAL_WALL_GAP, LONG_GOAL_WIDTH, LONG_GOAL_Y_MIN, LONG_GOAL_Y_MAX,
+    LONG_GOAL_CAPACITY,
+    LONG_GOAL_PARTITION_Y,
     CENTER_GOAL_ARM_LEN, CENTER_GOAL_ARM_W, ROBOT_W, TURN_RATE, MAX_SPEED,
-    BALL_BLUE, BALL_RED,
+    DESCORE_P0, DESCORE_P1, DESCORE_P2, DESCORE_P3,
+    DESCORE_MODE_SLIDE, DESCORE_MODE_SLAM,
+    SLAM_MIN_SPEED, DESCORE_SLIDE_DWELL_TICKS,
 )
-from sim.field import Field, GoalState
+from sim.field import (
+    Field, GoalState,
+    field_half, field_side,
+    y_bounds_for_robot, x_bounds_for_robot,
+    clip_xy_to_half, clip_xy_to_zone,
+    clamp_robot_to_half, resolve_all_robot_collisions,
+)
+from sim.action_helpers import (
+    SCORE_ACTIONS, DESCORE_ACTIONS, RAM_ACTIONS,
+    is_stop, is_collect, is_chassis_only, is_score_action,
+    is_descore_action, is_ram_action, wants_intake,
+    long_gname_for, descore_remove_ally_scored, descore_mode_for_action,
+    ram_remove_ally_scored,
+    score_intent_alliance,
+)
 from sim.robot import Robot
 from sim.failure import FailureConfig, FailureInjector
 from sim.opponent import get_opponent, DEFAULT_OPPONENT_PROFILE
@@ -106,6 +127,7 @@ _HDG_SW = -3.0 * math.pi / 4.0
 
 _SCORE_HDG_TOL      = math.pi / 6.0   # 30° tolerance
 _SCORE_ARRIVAL_DIST = 6.0
+_DESCORE_ALIGN_TIMEOUT = 90          # ~1.5 s at 60 Hz before abandoning slide
 _SCORE_INTERVAL     = 1.5
 # Final-approach stop tolerance for the scoring leg. The default move tolerance
 # (ARRIVAL_DIST, 2") is wider than the standoff's margin inside SCORE_RANGE, so a
@@ -120,8 +142,125 @@ _SCORE_FINAL_ARRIVAL = max(0.3, (SCORE_RANGE - _SCORE_APPROACH_GAP) - 0.25)
 # 15 ticks × DT(0.05s) = 0.75s of in-sim pause.
 _ACTION_CHANGE_PAUSE_TICKS = 15
 
+_CENTER_INTENT_ACTIONS = frozenset({
+    Action.SCORE_MID_LEFT, Action.SCORE_MID_RIGHT,
+    Action.SCORE_LOW_LEFT, Action.SCORE_LOW_RIGHT,
+})
 
-def _nearest_long_goal_target(robot):
+
+def _is_center_intent(action: Action) -> bool:
+    return action in _CENTER_INTENT_ACTIONS
+
+
+# Set each physics tick by VexAIEnv — True during VAIRC Isolation Period only.
+_ALLIANCE_HALF_ENFORCED: bool = True
+# Left/right x-lanes (role 0 = left, role 1 = right) — always enforced.
+_LANE_X_ENFORCED: bool = True
+
+
+def _set_isolation_lanes(enforced: bool) -> None:
+    """Toggle VAIRC alliance-side y confinement (Isolation Period only)."""
+    global _ALLIANCE_HALF_ENFORCED
+    _ALLIANCE_HALF_ENFORCED = enforced
+
+
+def _opponent_ball_color(*, descore_as_opponent: bool) -> int:
+    """Ball color that the descoring alliance may remove (symmetric blue/red)."""
+    return BALL_BLUE if descore_as_opponent else BALL_RED
+
+
+def _is_removable_ball(color: int, descore_as_opponent: bool) -> bool:
+    """True if this scored ball color is removable by the descoring alliance."""
+    return color == _opponent_ball_color(descore_as_opponent=descore_as_opponent)
+
+
+def _home_long_score_action(robot: Robot) -> Action:
+    """Default long-goal score for this robot's lane (R0=left, R1=right)."""
+    if field_side(robot) == "left":
+        return Action.SCORE_LEFT_LONG_GOAL_ALLIANCE
+    return Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE
+
+
+def _score_fallback_for_robot(robot: Robot) -> int:
+    """Mask fallback / replan score when the chosen action is invalid."""
+    return int(_home_long_score_action(robot))
+
+
+def _role_allowed_team_action(robot: Robot, action: Action) -> bool:
+    """Lane-specialized action set for centralized 2-robot team training."""
+    if action in (Action.STOP, Action.MOVE_CHASSIS_ONLY, Action.COLLECT_BLOCKS):
+        return True
+    left = field_side(robot) == "left"
+    if left:
+        return action in {
+            Action.SCORE_LEFT_LONG_GOAL_ALLIANCE,
+            Action.SCORE_MID_LEFT,
+            Action.SCORE_LOW_LEFT,
+            Action.DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD,
+            Action.DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL,
+            Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD,
+            Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL,
+            Action.RAM_LEFT_LONG_GOAL_OPPONENT,
+            Action.RAM_LEFT_LONG_GOAL_ALLIANCE,
+        }
+    return action in {
+        Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE,
+        Action.SCORE_MID_RIGHT,
+        Action.SCORE_LOW_RIGHT,
+        Action.DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD,
+        Action.DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL,
+        Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD,
+        Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL,
+        Action.RAM_RIGHT_LONG_GOAL_OPPONENT,
+        Action.RAM_RIGHT_LONG_GOAL_ALLIANCE,
+    }
+
+
+def _half_y_bounds(robot: Robot, is_opponent: bool,
+                   action: Action | None) -> tuple[float, float]:
+    if not _ALLIANCE_HALF_ENFORCED:
+        half_w = ROBOT_W / 2.0 + 1.0
+        return half_w, FIELD_H - half_w
+    return y_bounds_for_robot(robot, is_opponent, action)
+
+
+def _clip_to_half(pos: np.ndarray, robot: Robot, is_opponent: bool,
+                  action: Action | None) -> np.ndarray:
+    y_min, y_max = _half_y_bounds(robot, is_opponent, action)
+    if _LANE_X_ENFORCED:
+        x_min, x_max = x_bounds_for_robot(robot, action)
+    else:
+        half_w = ROBOT_W / 2.0 + 1.0
+        x_min, x_max = half_w, FIELD_W - half_w
+    x, y = clip_xy_to_zone(float(pos[0]), float(pos[1]), x_min, x_max, y_min, y_max)
+    return np.array([x, y], dtype=np.float64)
+
+
+def _defend_pos_for(robot: Robot, is_opponent: bool) -> np.ndarray:
+    left = field_side(robot) == "left"
+    if is_opponent:
+        return (DEFEND_ZONE_OPP_LEFT if left else DEFEND_ZONE_OPP_RIGHT).copy()
+    return (DEFEND_ZONE_ALLY_LEFT if left else DEFEND_ZONE_ALLY_RIGHT).copy()
+
+
+def _jam_recovery_for(robot: Robot, is_opponent: bool) -> np.ndarray:
+    left = field_side(robot) == "left"
+    if is_opponent:
+        return (JAM_RECOVERY_OPP_LEFT if left else JAM_RECOVERY_OPP_RIGHT).copy()
+    return (JAM_RECOVERY_ALLY_LEFT if left else JAM_RECOVERY_ALLY_RIGHT).copy()
+
+
+def _nav_waypoints_for(start: np.ndarray, final: np.ndarray | None,
+                       robot: Robot, is_opponent: bool,
+                       action: Action | None) -> list[np.ndarray]:
+    if final is None:
+        return []
+    final_c = _clip_to_half(np.asarray(final, dtype=np.float64), robot, is_opponent, action)
+    wq = _build_nav_waypoints(start, final_c)
+    return [_clip_to_half(wp, robot, is_opponent, action) for wp in wq]
+
+
+def _nearest_long_goal_target(robot, y_min: float | None = None, y_max: float | None = None):
     """Pick nearest long-goal scoring end for this robot.
 
     Returns (approach_pos, goal_end_pos, required_heading, goal_name).
@@ -132,14 +271,399 @@ def _nearest_long_goal_target(robot):
         (_LEFT_GOAL_TOP_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MAX]), _HDG_NORTH, "opp_long"),
         (_LEFT_GOAL_BOT_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MIN]), _HDG_SOUTH, "opp_long"),
     ]
+    if y_min is not None and y_max is not None:
+        eligible = [o for o in options if y_min <= float(o[0][1]) <= y_max]
+        if eligible:
+            options = eligible
     return min(options, key=lambda o: float(np.linalg.norm(robot.position - o[0])))
 
 
+def _nearest_end_on_goal(robot, gname: str,
+                         y_min: float | None = None, y_max: float | None = None):
+    """Pick nearest top/bottom end for a fixed long goal."""
+    if gname == "our_long":
+        options = [
+            (_RIGHT_GOAL_TOP_POS, np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MAX]), _HDG_NORTH, "our_long"),
+            (_RIGHT_GOAL_BOT_POS, np.array([_RIGHT_GOAL_CX, LONG_GOAL_Y_MIN]), _HDG_SOUTH, "our_long"),
+        ]
+    else:
+        options = [
+            (_LEFT_GOAL_TOP_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MAX]), _HDG_NORTH, "opp_long"),
+            (_LEFT_GOAL_BOT_POS,  np.array([_LEFT_GOAL_CX,  LONG_GOAL_Y_MIN]), _HDG_SOUTH, "opp_long"),
+        ]
+    if y_min is not None and y_max is not None:
+        eligible = [o for o in options if y_min <= float(o[0][1]) <= y_max]
+        if eligible:
+            options = eligible
+    return min(options, key=lambda o: float(np.linalg.norm(robot.position - o[0])))
+
+
+def _score_pose_for_action(action: Action, robot: Robot,
+                           y_min: float | None = None, y_max: float | None = None):
+    """Return (approach_pos, goal_end_pos, required_heading, gname)."""
+    act = Action(action)
+    if act == Action.SCORE_MID_LEFT:
+        return _LOW_SW_POS.copy(), _TIP_SW.copy(), _HDG_SW, "center_mid"
+    if act == Action.SCORE_MID_RIGHT:
+        return _MID_NE_POS.copy(), _TIP_NE.copy(), _HDG_NE, "center_mid"
+    if act == Action.SCORE_LOW_LEFT:
+        return _MID_NW_POS.copy(), _TIP_NW.copy(), _HDG_NW, "center_low"
+    if act == Action.SCORE_LOW_RIGHT:
+        return _LOW_SE_POS.copy(), _TIP_SE.copy(), _HDG_SE, "center_low"
+    if act in (Action.SCORE_LEFT_LONG_GOAL_ALLIANCE, Action.SCORE_LEFT_LONG_GOAL_OPPONENT):
+        return _nearest_end_on_goal(robot, "opp_long", y_min, y_max)
+    if act in (Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE, Action.SCORE_RIGHT_LONG_GOAL_OPPONENT):
+        return _nearest_end_on_goal(robot, "our_long", y_min, y_max)
+    raise ValueError(f"Unsupported score action: {act}")
+
+
+def _is_long_score_action(action: Action) -> bool:
+    return Action(action) in (
+        Action.SCORE_LEFT_LONG_GOAL_ALLIANCE, Action.SCORE_LEFT_LONG_GOAL_OPPONENT,
+        Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE, Action.SCORE_RIGHT_LONG_GOAL_OPPONENT,
+    )
+
+
+def _is_center_score_action(action: Action) -> bool:
+    return Action(action) in (
+        Action.SCORE_MID_LEFT, Action.SCORE_MID_RIGHT,
+        Action.SCORE_LOW_LEFT, Action.SCORE_LOW_RIGHT,
+    )
+
+
+def _ram_pose_for_action(action: Action, robot: Robot) -> tuple[str, np.ndarray, int]:
+    """Return (gname, approach_pos, entry_end) for a RAM long-goal slam."""
+    gname = long_gname_for(action)
+    p0, _, _ = _long_partition_approach(gname, DESCORE_P0)
+    p3, _, _ = _long_partition_approach(gname, DESCORE_P3)
+    if float(np.linalg.norm(robot.position - p0)) <= float(np.linalg.norm(robot.position - p3)):
+        return gname, p0.copy(), DESCORE_P0
+    return gname, p3.copy(), DESCORE_P3
+
+
+def _ram_target_for_action(action: Action, robot: Robot) -> np.ndarray:
+    _, approach, _ = _ram_pose_for_action(action, robot)
+    return approach
+
+
+def _descore_belief_flag(remove_ally: bool, descore_as_opponent: bool) -> bool:
+    """Map remove_ally_scored + alliance role to belief color filter."""
+    if descore_as_opponent:
+        return not remove_ally
+    return remove_ally
+
+
+# Descore geometry — partition points, approach poses, and plan tuples.
 _ARM_TIP_X = _ARM_LEN / math.sqrt(2.0)
 _TIP_NE = np.array([_CX + _ARM_TIP_X, _CY + _ARM_TIP_X])
 _TIP_NW = np.array([_CX - _ARM_TIP_X, _CY + _ARM_TIP_X])
 _TIP_SE = np.array([_CX + _ARM_TIP_X, _CY - _ARM_TIP_X])
 _TIP_SW = np.array([_CX - _ARM_TIP_X, _CY - _ARM_TIP_X])
+
+# Descore geometry — partition points, approach poses, and plan tuples.
+# Plan: (gname, mode, approach_pos, drop_ref, heading, start_pt, end_pt, entry_end, slide_end_pos)
+_DESCORE_NO_PT = -1
+
+
+def _long_goal_cx(gname: str) -> float:
+    return _LEFT_GOAL_CX if gname == "opp_long" else _RIGHT_GOAL_CX
+
+
+def _long_goal_fieldside_x(gname: str) -> float:
+    """X of robot center when pressed against the field-side opening of a long goal."""
+    if gname == "opp_long":
+        return _LEFT_GOAL_X_HI + _SCORE_APPROACH_GAP
+    return _RIGHT_GOAL_X_LO - _SCORE_APPROACH_GAP
+
+
+def _long_goal_drop_ref(gname: str) -> np.ndarray:
+    return OPP_LONG_GOAL if gname == "opp_long" else OUR_LONG_GOAL
+
+
+def _in_descore_range(robot_pos: np.ndarray, approach_pos: np.ndarray,
+                      drop_ref: np.ndarray) -> bool:
+    """True when the robot is close enough to brush/eject at this goal."""
+    return min(
+        float(np.linalg.norm(robot_pos - approach_pos)),
+        float(np.linalg.norm(robot_pos - drop_ref)),
+    ) < SCORE_RANGE
+
+
+def _long_partition_approach(gname: str, partition_pt: int) -> tuple[np.ndarray, float, np.ndarray]:
+    """Return (approach_pos, heading, drop_ref) for a long-goal partition or end."""
+    ax = _long_goal_fieldside_x(gname)
+    drop_ref = _long_goal_drop_ref(gname)
+    if partition_pt == DESCORE_P0:
+        pos = np.array([ax, LONG_GOAL_Y_MIN - _SCORE_APPROACH_GAP])
+        return pos, _HDG_SOUTH, drop_ref
+    if partition_pt == DESCORE_P3:
+        pos = np.array([ax, LONG_GOAL_Y_MAX + _SCORE_APPROACH_GAP])
+        return pos, _HDG_NORTH, drop_ref
+    y = LONG_GOAL_PARTITION_Y[partition_pt]
+    pos = np.array([ax, y])
+    return pos, _HDG_SOUTH, drop_ref
+
+
+def _is_long_goal_face_slide_approach(final: np.ndarray) -> bool:
+    """True when `final` is a mid-span slide-brush pose on a long-goal opening."""
+    fx, fy = float(final[0]), float(final[1])
+    on_left = abs(fx - _long_goal_fieldside_x("opp_long")) < 4.0
+    on_right = abs(fx - _long_goal_fieldside_x("our_long")) < 4.0
+    if not (on_left or on_right):
+        return False
+    return LONG_GOAL_Y_MIN <= fy <= LONG_GOAL_Y_MAX
+
+
+def _center_mid_on_arm(frac: float) -> np.ndarray:
+    return _TIP_SW + frac * (_TIP_NE - _TIP_SW)
+
+
+def _center_mid_partition_approach(partition_pt: int) -> tuple[np.ndarray, float, np.ndarray]:
+    drop_ref = CENTER_MID_GOAL
+    if partition_pt == DESCORE_P0:
+        return _LOW_SW_POS.copy(), _HDG_SW, drop_ref
+    if partition_pt == DESCORE_P3:
+        return _MID_NE_POS.copy(), _HDG_NE, drop_ref
+    frac = 1.0 / 3.0 if partition_pt == DESCORE_P1 else 2.0 / 3.0
+    base = _center_mid_on_arm(frac)
+    d = _CENTER_APPROACH_GAP / math.sqrt(2.0)
+    pos = base + np.array([d, d])
+    heading = _HDG_NE if partition_pt == DESCORE_P1 else _HDG_SW
+    return pos, heading, drop_ref
+
+
+def _center_low_slam_approach(entry_end: int) -> tuple[np.ndarray, float, np.ndarray]:
+    drop_ref = CENTER_LOW_GOAL
+    if entry_end == DESCORE_P0:
+        return _LOW_SE_POS.copy(), _HDG_SE, drop_ref
+    return _MID_NW_POS.copy(), _HDG_NW, drop_ref
+
+
+def _removable_in_span(belief_list: list, lo: int, hi: int,
+                       descore_as_opponent: bool) -> int:
+    if hi < lo:
+        return 0
+    return sum(
+        1 for i, (_, color) in enumerate(belief_list)
+        if lo <= i <= hi and _is_removable_ball(color, descore_as_opponent)
+    )
+
+
+def _count_removable_balls(belief_list: list, descore_as_opponent: bool) -> int:
+    return sum(
+        1 for _, color in belief_list
+        if _is_removable_ball(color, descore_as_opponent)
+    )
+
+
+def _build_long_descore_candidates(gname: str, belief_list: list,
+                                   descore_as_opponent: bool = False) -> list[tuple]:
+    n = len(belief_list)
+    pts_each = LONG_GOAL_POINTS
+    out: list[tuple] = []
+    for start_pt, end_pt in ((DESCORE_P1, DESCORE_P0), (DESCORE_P2, DESCORE_P0)):
+        span = GoalState.slide_index_range(n, start_pt, end_pt)
+        if span is None:
+            continue
+        removable = _removable_in_span(
+            belief_list, span[0], span[1], descore_as_opponent,
+        )
+        if removable <= 0:
+            continue
+        approach, heading, drop_ref = _long_partition_approach(gname, start_pt)
+        slide_end, _, _ = _long_partition_approach(gname, end_pt)
+        out.append((
+            removable * pts_each, DESCORE_MODE_SLIDE, gname, approach, drop_ref, heading,
+            start_pt, end_pt, DESCORE_P0, slide_end,
+        ))
+    n_opp = _count_removable_balls(belief_list, descore_as_opponent)
+    if n_opp > 0:
+        for entry_end in (DESCORE_P0, DESCORE_P3):
+            approach, heading, drop_ref = _long_partition_approach(gname, entry_end)
+            out.append((
+                n_opp * pts_each, DESCORE_MODE_SLAM, gname, approach, drop_ref, heading,
+                _DESCORE_NO_PT, _DESCORE_NO_PT, entry_end, None,
+            ))
+    return out
+
+
+def _build_center_mid_descore_candidates(belief_list: list,
+                                         descore_as_opponent: bool = False) -> list[tuple]:
+    n = len(belief_list)
+    pts_each = CENTER_GOAL_POINTS
+    gname = "center_mid"
+    out: list[tuple] = []
+    for start_pt, end_pt in (
+        (DESCORE_P1, DESCORE_P0), (DESCORE_P2, DESCORE_P0),
+        (DESCORE_P1, DESCORE_P3), (DESCORE_P2, DESCORE_P3),
+    ):
+        span = GoalState.slide_index_range(n, start_pt, end_pt)
+        if span is None:
+            continue
+        removable = _removable_in_span(
+            belief_list, span[0], span[1], descore_as_opponent,
+        )
+        if removable <= 0:
+            continue
+        approach, heading, drop_ref = _center_mid_partition_approach(start_pt)
+        slide_end, _, _ = _center_mid_partition_approach(end_pt)
+        out.append((
+            removable * pts_each, DESCORE_MODE_SLIDE, gname, approach, drop_ref, heading,
+            start_pt, end_pt, _DESCORE_NO_PT, slide_end,
+        ))
+    n_opp = _count_removable_balls(belief_list, descore_as_opponent)
+    if n_opp > 0:
+        for entry_end in (DESCORE_P0, DESCORE_P3):
+            approach, heading, drop_ref = _center_mid_partition_approach(entry_end)
+            out.append((
+                n_opp * pts_each, DESCORE_MODE_SLAM, gname, approach, drop_ref, heading,
+                _DESCORE_NO_PT, _DESCORE_NO_PT, entry_end, None,
+            ))
+    return out
+
+
+def _build_center_low_descore_candidates(belief_list: list,
+                                         descore_as_opponent: bool = False) -> list[tuple]:
+    n_opp = _count_removable_balls(belief_list, descore_as_opponent)
+    if n_opp <= 0:
+        return []
+    pts_each = CENTER_GOAL_POINTS
+    gname = "center_low"
+    out: list[tuple] = []
+    for entry_end in (DESCORE_P0, DESCORE_P3):
+        approach, heading, drop_ref = _center_low_slam_approach(entry_end)
+        out.append((
+            n_opp * pts_each, DESCORE_MODE_SLAM, gname, approach, drop_ref, heading,
+            _DESCORE_NO_PT, _DESCORE_NO_PT, entry_end, None,
+        ))
+    return out
+
+
+def _pick_descore_plan(gname: str, belief_list: list,
+                       robot_pos: np.ndarray,
+                       descore_as_opponent: bool = False) -> tuple | None:
+    """Pick best descore plan for a goal based on belief and robot distance."""
+    if gname in ("opp_long", "our_long"):
+        candidates = _build_long_descore_candidates(
+            gname, belief_list, descore_as_opponent,
+        )
+    elif gname == "center_mid":
+        candidates = _build_center_mid_descore_candidates(
+            belief_list, descore_as_opponent,
+        )
+    elif gname == "center_low":
+        candidates = _build_center_low_descore_candidates(
+            belief_list, descore_as_opponent,
+        )
+    else:
+        return None
+    if not candidates:
+        return None
+    best = min(
+        candidates,
+        key=lambda c: (float(np.linalg.norm(robot_pos - c[3])), -c[0]),
+    )
+    return best[1:]
+
+
+def _pick_center_descore_plan(belief_mid: list, belief_low: list,
+                              robot_pos: np.ndarray,
+                              descore_as_opponent: bool = False) -> tuple | None:
+    """Prefer center_mid when it has removable balls, else center_low."""
+    mid_removable = _count_removable_balls(belief_mid, descore_as_opponent)
+    if mid_removable > 0:
+        return _pick_descore_plan(
+            "center_mid", belief_mid, robot_pos, descore_as_opponent,
+        )
+    return _pick_descore_plan(
+        "center_low", belief_low, robot_pos, descore_as_opponent,
+    )
+
+
+def _resolve_descore_plan(action: Action, field: Field, robot: Robot,
+                          goal_belief: GoalState | None,
+                          descore_as_opponent: bool = False) -> tuple | None:
+    """Return descore plan tuple or None."""
+    if not is_descore_action(action):
+        return None
+    gs = goal_belief if goal_belief is not None else field.goal_state
+    gname = long_gname_for(action)
+    remove_ally = descore_remove_ally_scored(action)
+    if descore_as_opponent:
+        remove_ally = not remove_ally
+    belief_flag = _descore_belief_flag(remove_ally, descore_as_opponent)
+    candidates = _build_long_descore_candidates(
+        gname, getattr(gs, gname), belief_flag,
+    )
+    if not candidates:
+        return None
+    mode = descore_mode_for_action(action)
+    filtered = [c for c in candidates if c[1] == mode]
+    if not filtered:
+        return None
+    best = min(
+        filtered,
+        key=lambda c: (float(np.linalg.norm(robot.position - c[3])), -c[0]),
+    )
+    return best[1:]
+
+
+def _resolve_descore_plan_for_execution(action: Action, field: Field, robot: Robot,
+                                        descore_as_opponent: bool = False) -> tuple | None:
+    """Resolve descore from ground truth — never drive to an empty goal."""
+    return _resolve_descore_plan(
+        action, field, robot, field.goal_state, descore_as_opponent,
+    )
+
+
+def _resolve_descore_plan_with_fallback(action: Action, field: Field, robot: Robot,
+                                        belief: GoalState | None,
+                                        use_belief: bool,
+                                        descore_as_opponent: bool = False) -> tuple | None:
+    """Resolve a descore plan for execution (ground truth only)."""
+    del belief, use_belief  # kept for call-site compatibility
+    return _resolve_descore_plan_for_execution(
+        action, field, robot, descore_as_opponent,
+    )
+
+
+def _removable_count_for_long_action(field: Field, action: Action,
+                                     *, descore_as_opponent: bool = False) -> int:
+    """Count removable balls in the target long goal for a descore/RAM action."""
+    gname = long_gname_for(action)
+    remove_ally = descore_remove_ally_scored(action)
+    if descore_as_opponent:
+        remove_ally = not remove_ally
+    flag = _descore_belief_flag(remove_ally, descore_as_opponent)
+    return _count_removable_balls(getattr(field.goal_state, gname), flag)
+
+
+def _believed_descore_available(gs: GoalState, action: Action,
+                                *, descore_as_opponent: bool = False) -> bool:
+    """True when the perceived goal state has removable balls for this descore action."""
+    if not is_descore_action(action):
+        return False
+    gname = long_gname_for(action)
+    remove_ally = descore_remove_ally_scored(action)
+    if descore_as_opponent:
+        remove_ally = not remove_ally
+    belief_flag = _descore_belief_flag(remove_ally, descore_as_opponent)
+    candidates = _build_long_descore_candidates(
+        gname, getattr(gs, gname), belief_flag,
+    )
+    if not candidates:
+        return False
+    mode = descore_mode_for_action(action)
+    return any(c[1] == mode for c in candidates)
+
+
+def _descore_action_target(action: Action, field: Field, robot: Robot,
+                           goal_belief: GoalState | None = None,
+                           descore_as_opponent: bool = False) -> np.ndarray | None:
+    plan = _resolve_descore_plan(action, field, robot, goal_belief, descore_as_opponent)
+    if plan is None:
+        return None
+    return plan[2].copy()
 
 
 def _nearest_center_tip(robot, lower: bool):
@@ -290,6 +814,48 @@ def _build_nav_waypoints(start: np.ndarray, final: np.ndarray) -> list[np.ndarra
         if float(np.linalg.norm(legs[-1] - final)) > 1e-6:
             legs.append(final)
         return legs
+
+    # ── Long-goal slide descore (mid-span brush pose on the goal opening) ───
+    if _is_long_goal_face_slide_approach(final):
+        is_left = abs(float(final[0]) - _long_goal_fieldside_x("opp_long")) < 4.0
+        is_upper = float(final[1]) > _CY
+        corridor = (
+            (_NAV_LEFT_HIGH if is_upper else _NAV_LEFT_LOW)
+            if is_left else
+            (_NAV_RIGHT_HIGH if is_upper else _NAV_RIGHT_LOW)
+        )
+        stage = (
+            (_STAGE_L_TOP if is_upper else _STAGE_L_BOT)
+            if is_left else
+            (_STAGE_R_TOP if is_upper else _STAGE_R_BOT)
+        )
+        start_x = float(start[0])
+        corr_x = float(corridor[0])
+        past_corridor = (
+            (not is_left and start_x >= corr_x) or
+            (is_left and start_x <= corr_x)
+        )
+        goal_col_x = float(final[0])
+        in_column = abs(float(start[0]) - goal_col_x) < 6.0
+        vertical = np.array([goal_col_x, float(stage[1])])
+        if past_corridor and in_column:
+            legs = [final.copy()]
+        elif past_corridor:
+            legs = [vertical, final.copy()]
+        else:
+            legs = [corridor.copy(), vertical, final.copy()]
+        compact: list[np.ndarray] = []
+        for p in legs:
+            if not compact:
+                if float(np.linalg.norm(p - start)) > 0.75:
+                    compact.append(p.copy())
+            elif float(np.linalg.norm(p - compact[-1])) > 0.75:
+                compact.append(p.copy())
+        if not compact:
+            return [final.copy()]
+        if float(np.linalg.norm(compact[-1] - final)) > 1e-6:
+            compact.append(final.copy())
+        return compact
 
     # ── Long-goal scoring approach: force 2 intermediate waypoints ──────────
     # Layout: start → (optional center) → corridor → stage → final
@@ -589,7 +1155,18 @@ def _relative_goal_features(goal_pos: np.ndarray, robot) -> list:
 # ---------------------------------------------------------------------------
 def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray | None:
     """Convert allied RL action to a moveToPoint target."""
-    if action == Action.COLLECT_NEAREST_BALL:
+    y_min, y_max = _half_y_bounds(robot, False, action)
+    if _LANE_X_ENFORCED:
+        x_min, x_max = x_bounds_for_robot(robot, action)
+    else:
+        half_w = ROBOT_W / 2.0 + 1.0
+        x_min, x_max = half_w, FIELD_W - half_w
+
+    if is_stop(action):
+        return None
+    if is_chassis_only(action):
+        return _clip_to_half(_jam_recovery_for(robot, False), robot, False, action)
+    if is_collect(action):
         # Priority 1: route planner with full vision cone + LOS + strategic scoring
         from sim.route_planner import compute_collection_route
         route = compute_collection_route(
@@ -597,13 +1174,16 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
             already_held=robot.balls_held,
             max_volley=1,
             robot=robot,
+            y_min=y_min, y_max=y_max,
+            x_min=x_min, x_max=x_max,
         )
         if route:
-            return route[0][1].copy()   # centroid of best cluster
+            return _clip_to_half(route[0][1].copy(), robot, False, action)
         # Priority 2: nearest ball with LOS check (ball not behind a goal)
         nav = field.nearest_navigable_target(robot.position)
-        if nav is not None:
-            return nav
+        if (nav is not None and y_min <= float(nav[1]) <= y_max
+                and x_min <= float(nav[0]) <= x_max):
+            return _clip_to_half(nav, robot, False, action)
 
         # Priority 3 — no accessible target in vision cone or via LOS.
         # Explore: go to the scan position in the field quadrant that has the
@@ -623,8 +1203,10 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
         on_blue = [obj for obj in field.objects
                    if obj.status == OBJ_ON_FIELD and obj.color == BALL_BLUE]
         if not on_blue:
-            # No blue balls at all — stay near center so policy sees goals.
-            return np.array([FIELD_W * 0.5, FIELD_H * 0.5])
+            # No blue balls at all — stay near half-center so policy sees goals.
+            return _clip_to_half(
+                np.array([FIELD_W * 0.5, (y_min + y_max) * 0.5]), robot, False, action,
+            )
 
         # Priority 2.5 — rotate-to-look before committing to a long scan drive.
         # For each of 8 evenly-spaced candidate headings, count how many on-field
@@ -661,12 +1243,15 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
                                     7.5, FIELD_W - 7.5))
                 _ly = float(np.clip(robot.y + 30.0 * math.sin(_theta),
                                     7.5, FIELD_H - 7.5))
-                if _build_nav_waypoints(robot.position, np.array([_lx, _ly])):
+                if (y_min <= _ly <= y_max and x_min <= _lx <= x_max
+                        and _nav_waypoints_for(
+                            robot.position, np.array([_lx, _ly]), robot, False, action,
+                        )):
                     _best_look_cnt = _cnt
                     _best_look_lx  = _lx
                     _best_look_ly  = _ly
         if _best_look_lx is not None:
-            return np.array([_best_look_lx, _best_look_ly])
+            return _clip_to_half(np.array([_best_look_lx, _best_look_ly]), robot, False, action)
 
         counts = {q: 0 for q in _SCAN_POS}
         for obj in on_blue:
@@ -689,47 +1274,46 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
             if q == robot_q and robot_near_scan:
                 continue
             cand = _SCAN_POS[q].copy()
-            if _build_nav_waypoints(robot.position, cand):
+            if (y_min <= float(cand[1]) <= y_max
+                    and x_min <= float(cand[0]) <= x_max
+                    and _nav_waypoints_for(
+                robot.position, cand, robot, False, action,
+            )):
                 known_target = cand
                 break
 
-        # Creeping exploration: once the robot has cycled several decisions without
-        # finding a reachable ball (explore_barren), or when no known quadrant is
-        # routable, push a frontier northward so it expands into new territory (the
-        # top half) instead of oscillating in the cleaned-out bottom. The frontier
-        # y creeps from the bottom band to the top as barren grows; we head for the
-        # reachable explore anchor nearest that frontier, preferring the opposite
-        # side and skipping anywhere we're already sitting.
+        # Creeping exploration within this robot's half only (no teammate crossover).
         barren = int(getattr(robot, "explore_barren", 0))
         if known_target is None or barren >= _EXPLORE_CREEP_AT:
-            # Triangle-wave frontier: sweep the band UP to the top then back DOWN,
-            # repeating, so a persistently barren robot covers the whole field
-            # instead of camping at the top once it maxes out. A monotonic creep
-            # could strand it in a top corner pocket, never re-acquiring balls that
-            # are only visible/navigable from mid- or low-field.
             period   = 2 * _EXPLORE_BARREN_FULL
             phase    = barren % period
             frontier = (phase if phase <= _EXPLORE_BARREN_FULL
                         else period - phase) / _EXPLORE_BARREN_FULL
-            explore_y = _EXPLORE_Y_LO + frontier * (_EXPLORE_Y_HI - _EXPLORE_Y_LO)
+            explore_y_lo = y_min
+            explore_y_hi = y_max
+            explore_y = explore_y_lo + frontier * (explore_y_hi - explore_y_lo)
             robot_on_left = robot.x < FIELD_W * 0.5
             best_pt: np.ndarray | None = None
             best_key = float("inf")
             for p in _EXPLORE_POOL:
+                if not (y_min <= float(p[1]) <= y_max):
+                    continue
+                if not (x_min <= float(p[0]) <= x_max):
+                    continue
                 if float(np.linalg.norm(robot.position - p)) < 16.0:
-                    continue                # already basically here — keep moving
-                if not _build_nav_waypoints(robot.position, p):
-                    continue                # not routable from here
+                    continue
+                if not _nav_waypoints_for(robot.position, p.copy(), robot, False, action):
+                    continue
                 same_side = (float(p[0]) < FIELD_W * 0.5) == robot_on_left
                 key = abs(float(p[1]) - explore_y) + (6.0 if same_side else 0.0)
                 if key < best_key:
                     best_key = key
                     best_pt  = p
             if best_pt is not None:
-                return best_pt.copy()
+                return _clip_to_half(best_pt.copy(), robot, False, action)
 
         if known_target is not None:
-            return known_target.copy()
+            return _clip_to_half(known_target.copy(), robot, False, action)
 
         # No quadrant scan position is routable — fall back to the nearest
         # corridor point that IS reachable and meaningfully far from the robot.
@@ -744,65 +1328,56 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
         best_corr: np.ndarray | None = None
         best_dist = float("inf")
         for c in _CORRIDOR_FALLBACKS:
-            d = float(np.linalg.norm(c - robot.position))
-            if d < 12.0:          # already here — skip
+            if not (y_min <= float(c[1]) <= y_max):
                 continue
-            if not _build_nav_waypoints(robot.position, c):
-                continue          # not routable
+            if not (x_min <= float(c[0]) <= x_max):
+                continue
+            d = float(np.linalg.norm(c - robot.position))
+            if d < 12.0:
+                continue
+            if not _nav_waypoints_for(robot.position, c.copy(), robot, False, action):
+                continue
             if d < best_dist:
                 best_dist = d
                 best_corr = c
         if best_corr is not None:
-            return best_corr.copy()
+            return _clip_to_half(best_corr.copy(), robot, False, action)
 
         # Absolute last resort: idle (caller treats None as no waypoints).
         return None
-    elif action == Action.SCORE_LONG_GOAL:
-        approach, _, _, _ = _nearest_long_goal_target(robot)
-        return approach.copy()
-    elif action == Action.SCORE_CENTER_MID:
-        approach, _, _, _ = _nearest_center_tip(robot, lower=False)
-        return approach.copy()
-    elif action == Action.SCORE_CENTER_LOW:
-        approach, _, _, _ = _nearest_center_tip(robot, lower=True)
-        return approach.copy()
-    elif action == Action.DESCORE_OPP_LONG:
-        return OPP_LONG_GOAL.copy()
-    elif action == Action.DESCORE_CENTER:
-        approach, _, _, _ = _nearest_center_tip(robot, lower=False)
-        return approach.copy()
-    elif action == Action.DEFEND_ZONE:
-        return DEFEND_ZONE_POS.copy()
-    elif action == Action.EJECT_WRONG_COLOR:
-        return None   # robot stays in place; eject happens in _check_ally_effects
-    elif action == Action.IDLE:
-        return None
+    if is_score_action(action):
+        approach, _, _, _ = _score_pose_for_action(action, robot, y_min, y_max)
+        return _clip_to_half(approach.copy(), robot, False, action)
+    if is_descore_action(action):
+        tgt = _descore_action_target(action, field, robot, goal_belief=None)
+        return _clip_to_half(tgt, robot, False, action) if tgt is not None else None
+    if is_ram_action(action):
+        return _clip_to_half(_ram_target_for_action(action, robot), robot, False, action)
     return None
 
 
 def _opp_action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray | None:
     """Convert opponent action to a moveToPoint target (mirror of allied)."""
-    if action == Action.COLLECT_NEAREST_BALL:
-        return field.nearest_on_field_target(robot.position)
-    elif action == Action.SCORE_LONG_GOAL:
-        # Reachable approach pose for the nearest long-goal end (either wall — the
-        # opponent can score in both). The raw goal reference sits against the wall
-        # and pins the robot; the approach point is navigable.
-        approach, *_ = _nearest_long_goal_target(robot)
-        return approach.copy()
-    elif action == Action.SCORE_CENTER_MID:
-        approach, *_ = _nearest_center_tip(robot, lower=False)
-        return approach.copy()
-    elif action == Action.SCORE_CENTER_LOW:
-        approach, *_ = _nearest_center_tip(robot, lower=True)
-        return approach.copy()
-    elif action == Action.DESCORE_OPP_LONG:
-        return OUR_LONG_GOAL.copy()
-    elif action == Action.DESCORE_CENTER:
-        approach, *_ = _nearest_center_tip(robot, lower=False)
-        return approach.copy()
-    elif action == Action.DEFEND_ZONE:
-        return np.array([24.00, 72.00])   # opp defend zone (left side)
+    y_min, y_max = _half_y_bounds(robot, True, action)
+    if is_stop(action):
+        return None
+    if is_chassis_only(action):
+        return _clip_to_half(_jam_recovery_for(robot, True), robot, True, action)
+    if is_collect(action):
+        tgt = field.nearest_on_field_target(robot.position)
+        if tgt is not None and y_min <= float(tgt[1]) <= y_max:
+            return _clip_to_half(tgt, robot, True, action)
+        return None
+    if is_score_action(action):
+        approach, *_ = _score_pose_for_action(action, robot, y_min, y_max)
+        return _clip_to_half(approach.copy(), robot, True, action)
+    if is_descore_action(action):
+        tgt = _descore_action_target(
+            action, field, robot, field.goal_state, descore_as_opponent=True,
+        )
+        return _clip_to_half(tgt, robot, True, action) if tgt is not None else None
+    if is_ram_action(action):
+        return _clip_to_half(_ram_target_for_action(action, robot), robot, True, action)
     return None
 
 
@@ -810,10 +1385,12 @@ def _opp_action_to_target(action: Action, field: Field, robot: Robot) -> np.ndar
 # Main environment
 # ---------------------------------------------------------------------------
 class VexAIEnv(gym.Env):
-    """Two-agent VEX Push Back field environment.
+    """VAIRC (VEX AI Section 7) Push Back field environment.
 
     Each step() = one RL decision interval (3 seconds / 60 ticks).
     Both allied robots act; opponents are rule-based.
+    Alliance-side movement limits apply only during the 15s Isolation Period;
+    the Interaction Period allows full-field movement.
     For SB3, wrap with SingleAgentWrapper.
     """
 
@@ -881,7 +1458,7 @@ class VexAIEnv(gym.Env):
         # Action-change lock-in counter and last-action snapshot — see
         # _ACTION_CHANGE_PAUSE_TICKS at module top.
         self.action_pause_ticks    = np.zeros(2, dtype=np.int32)
-        self.prev_action_for_pause = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
+        self.prev_action_for_pause = np.array([Action.STOP, Action.STOP], dtype=np.int32)
         # Curriculum stage-1 mode: convert all red balls to blue at reset so the
         # policy can master collect/score without the red-ball discrimination
         # problem getting in the way. Toggled live by CurriculumCallback.
@@ -892,7 +1469,8 @@ class VexAIEnv(gym.Env):
         self.eject_events          = np.zeros(2, dtype=np.int32)
         self.collected_this_step   = np.zeros(2, dtype=np.int32)
         self.red_collected_this_step = np.zeros(2, dtype=np.int32)
-        self.current_actions       = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
+        self.current_actions       = np.array([Action.STOP, Action.STOP], dtype=np.int32)
+        self._opp_live_actions: list[Action] = [Action.STOP, Action.STOP]
 
         # Scoring target cache (per robot): locks the chosen goal END while a
         # SCORE_* action is active, so the robot doesn't thrash between ends as
@@ -907,7 +1485,7 @@ class VexAIEnv(gym.Env):
         # for a couple of decisions so it can align + complete scoring instead
         # of thrashing to a different goal next decision.
         self._score_commit_left = np.zeros(2, dtype=np.int32)
-        self._score_committed_action = np.array([Action.IDLE, Action.IDLE], dtype=np.int32)
+        self._score_committed_action = np.array([Action.STOP, Action.STOP], dtype=np.int32)
         self.expected_state_delta  = np.zeros(2)
         self.prev_predicted_score  = np.zeros(2)
         # Per-decision shaping signals (read by compute_reward)
@@ -946,6 +1524,20 @@ class VexAIEnv(gym.Env):
         # every tick once stationary).
         self._eject_fired_this_decision = np.zeros(2, dtype=bool)
 
+        # Descore state — slide dwell, slam speed capture, per-decision caches.
+        self._descore_target_cache: list[tuple | None] = [None, None]
+        self._descore_dwell_left = np.zeros(2, dtype=np.int32)
+        self._descore_slide_start: list[np.ndarray | None] = [None, None]
+        self._descore_slide_end: list[np.ndarray | None] = [None, None]
+        self._descore_slam_fired = np.zeros(2, dtype=bool)
+        self._descore_slide_fired = np.zeros(2, dtype=bool)
+        self._descore_align_ticks = np.zeros(2, dtype=np.int32)
+        self.slam_impact_speed = np.zeros(2, dtype=np.float32)
+        self._ram_fired = np.zeros(2, dtype=bool)
+        self._opp_descore_cache: list[tuple | None] = [None, None]
+        self._opp_descore_slam_fired = np.zeros(2, dtype=bool)
+        self._opp_slam_impact_speed = np.zeros(2, dtype=np.float32)
+
     # ------------------------------------------------------------------
     # Gymnasium API
     # ------------------------------------------------------------------
@@ -963,6 +1555,7 @@ class VexAIEnv(gym.Env):
             for obj in self.field.objects:
                 obj.color = BALL_BLUE
         self.field.time_remaining = MATCH_DURATION   # decremented if use_timer=True
+        self._match_elapsed = 0.0
 
         self.failure_injector = FailureInjector(self.failure_config, self.rng)
         self.failure_injector.reset()
@@ -972,9 +1565,10 @@ class VexAIEnv(gym.Env):
         self.eject_events[:]           = 0
         self.collected_this_step[:]    = 0
         self.red_collected_this_step[:] = 0
-        self.current_actions[:]      = Action.IDLE
+        self.current_actions[:]      = Action.STOP
+        self._opp_live_actions       = [Action.STOP, Action.STOP]
         self._score_commit_left[:]   = 0
-        self._score_committed_action[:] = Action.IDLE
+        self._score_committed_action[:] = Action.STOP
         self._score_target_cache = [None, None]
         self._score_route_hint   = [None, None]
         self.expected_state_delta[:] = 0
@@ -992,7 +1586,7 @@ class VexAIEnv(gym.Env):
         self.prev_opp_score          = 0.0
         self.score_milestones_hit    = {10: False, 20: False}
         self.action_pause_ticks[:]   = 0
-        self.prev_action_for_pause[:] = Action.IDLE
+        self.prev_action_for_pause[:] = Action.STOP
         self.done          = False
         self.decision_tick = 0
         self.executing     = False
@@ -1037,7 +1631,8 @@ class VexAIEnv(gym.Env):
         self.eject_events[:]            = 0
         self.collected_this_step[:]     = 0
         self.red_collected_this_step[:] = 0
-        self.current_actions[:]         = Action.IDLE
+        self.current_actions[:]         = Action.STOP
+        self._opp_live_actions           = [Action.STOP, Action.STOP]
         self._score_target_cache = [None, None]
         self._score_route_hint   = [None, None]
         self.expected_state_delta[:]    = 0
@@ -1053,7 +1648,7 @@ class VexAIEnv(gym.Env):
         self.ctrl_gain_opp           = 0
         self.score_milestones_hit    = {10: False, 20: False}
         self.action_pause_ticks[:]   = 0
-        self.prev_action_for_pause[:] = Action.IDLE
+        self.prev_action_for_pause[:] = Action.STOP
         self.done          = False
         self.decision_tick = 0
         self.executing     = False
@@ -1089,34 +1684,123 @@ class VexAIEnv(gym.Env):
         queued = getattr(renderer, "queued_manual_action", None)
         if queued is not None:
             renderer.queued_manual_action = None
-            act    = Action(queued)
-            target = _action_to_target(act, self.field, robot)
-            self._manual_rl_action    = int(act)
-            self._manual_rl_ticks     = 0
-            self._manual_rl_wq        = (
+            act = Action(queued)
+            self._manual_rl_action = int(act)
+            self._manual_rl_ticks = 0
+            self._descore_dwell_left[ridx] = 0
+            self._descore_slam_fired[ridx] = False
+            self._descore_slide_fired[ridx] = False
+            self._descore_align_ticks[ridx] = 0
+            self._ram_fired[ridx] = False
+            self.slam_impact_speed[ridx] = 0.0
+            self._descore_target_cache[ridx] = None
+            robot.score_timer = 0.0
+            self._eject_fired_this_decision[ridx] = False
+
+            target = None
+            if is_score_action(act) and robot.balls_held > 0:
+                self._get_scoring_target(ridx, act)
+                score_pos, *_ = self._get_scoring_target(ridx, act)
+                target = score_pos.copy()
+            elif is_descore_action(act):
+                self._cache_descore_target(ridx, act)
+                plan = self._get_descore_plan(ridx, act)
+                if plan is not None:
+                    target = plan[2].copy()
+            elif is_ram_action(act):
+                _, target, _ = _ram_pose_for_action(act, robot)
+            else:
+                target = _action_to_target(act, self.field, robot)
+
+            self._manual_rl_wq = (
                 _build_nav_waypoints(robot.position, target)
                 if target is not None else []
             )
-            robot.score_timer = 0.0   # reset score timer for fresh approach
-            self._eject_fired_this_decision[ridx] = False
 
         # ── Run active manual RL action (overrides WASD movement) ────────
         if getattr(self, "_manual_rl_action", None) is not None:
             act  = Action(self._manual_rl_action)
             wq   = self._manual_rl_wq
             prev_pos = robot.position.copy()
+            reverse_drive = False
+
+            if is_descore_action(act):
+                cache = self._descore_target_cache[ridx]
+                if cache is not None:
+                    plan = cache[1:]
+                    mode, _, approach_pos, drop_ref, *_rest = plan
+                    dist_app = float(np.linalg.norm(robot.position - approach_pos))
+                    in_range = _in_descore_range(robot.position, approach_pos, drop_ref)
+                    if mode == DESCORE_MODE_SLAM and not self._descore_slam_fired[ridx]:
+                        self.slam_impact_speed[ridx] = max(
+                            float(self.slam_impact_speed[ridx]), float(robot.speed),
+                        )
+                    if self._descore_dwell_left[ridx] > 0:
+                        wq.clear()
+                    elif mode == DESCORE_MODE_SLIDE and in_range:
+                        wq.clear()
+                        robot.speed = 0.0
+                    elif mode == DESCORE_MODE_SLAM and in_range:
+                        wq.clear()
+                    elif (mode == DESCORE_MODE_SLIDE and wq and len(wq) <= 1):
+                        fy = float(approach_pos[1])
+                        reverse_drive = fy > LONG_GOAL_Y_MAX or fy < LONG_GOAL_Y_MIN
+            elif is_ram_action(act):
+                _, approach, _ = _ram_pose_for_action(act, robot)
+                dist_app = float(np.linalg.norm(robot.position - approach))
+                if not self._ram_fired[ridx]:
+                    self.slam_impact_speed[ridx] = max(
+                        float(self.slam_impact_speed[ridx]), float(robot.speed),
+                    )
+                if dist_app < _SCORE_ARRIVAL_DIST:
+                    wq.clear()
+                    robot.speed = 0.0
+            elif is_score_action(act) and robot.balls_held > 0:
+                score_pos, goal_pos, *_ = self._get_scoring_target(ridx, act)
+                dist_to_score = float(np.linalg.norm(robot.position - score_pos))
+                dist_to_goal = float(np.linalg.norm(robot.position - goal_pos))
+                if (dist_to_score < _SCORE_ARRIVAL_DIST
+                        and dist_to_goal < (SCORE_RANGE - 0.25)):
+                    wq.clear()
+                    robot.speed = 0.0
+                elif wq and len(wq) <= 1:
+                    reverse_drive = (
+                        float(np.linalg.norm(np.asarray(wq[0], dtype=np.float64) - score_pos))
+                        < 1.5
+                    )
 
             # Movement: follow waypoint queue
             if wq:
-                arrived = robot.move_toward_point(wq[0])
+                if reverse_drive:
+                    arrived = robot.move_toward_point(
+                        wq[0], reverse=True, arrival_dist=_SCORE_FINAL_ARRIVAL,
+                    )
+                else:
+                    arrived = robot.move_toward_point(wq[0])
                 if arrived and len(wq) > 1:
                     wq.pop(0)
                 elif arrived:
                     wq.clear()
 
-            _resolve_goal_collisions(robot)
+            skip_long = False
+            if is_descore_action(act):
+                cache = self._descore_target_cache[ridx]
+                if cache is not None:
+                    if self._descore_dwell_left[ridx] > 0:
+                        skip_long = True
+                    else:
+                        skip_long = float(np.linalg.norm(
+                            robot.position - cache[3],
+                        )) < (_SCORE_ARRIVAL_DIST * 2.0)
+            elif is_ram_action(act):
+                _, approach, _ = _ram_pose_for_action(act, robot)
+                skip_long = float(np.linalg.norm(
+                    robot.position - approach,
+                )) < (_SCORE_ARRIVAL_DIST * 2.0)
 
-            # Effects (collect, score, eject, etc.) — same logic as RL step
+            _resolve_goal_collisions(robot, skip_long=skip_long)
+
+            # Effects (collect, score, descore, ram, etc.)
             self.decision_tick = self._manual_rl_ticks
             self._check_ally_effects(ridx, act)
 
@@ -1125,10 +1809,29 @@ class VexAIEnv(gym.Env):
 
             self._manual_rl_ticks += 1
             ticks_done = self._manual_rl_ticks >= TICKS_PER_DECISION
-            nav_done   = not wq
+            nav_done = not wq
+            if self._descore_dwell_left[ridx] > 0:
+                ticks_done = False
+            elif is_descore_action(act):
+                plan = self._get_descore_plan(ridx, act)
+                if plan is not None and not (
+                    self._descore_slide_fired[ridx] or self._descore_slam_fired[ridx]
+                ):
+                    dist = float(np.linalg.norm(robot.position - plan[2]))
+                    if dist < (_SCORE_ARRIVAL_DIST * 2.0):
+                        ticks_done = False
+            elif is_ram_action(act) and not self._ram_fired[ridx]:
+                _, approach, _ = _ram_pose_for_action(act, robot)
+                if float(np.linalg.norm(robot.position - approach)) < (_SCORE_ARRIVAL_DIST * 2.0):
+                    ticks_done = False
+            elif is_score_action(act) and robot.balls_held > 0:
+                score_pos, *_ = self._get_scoring_target(ridx, act)
+                if float(np.linalg.norm(robot.position - score_pos)) < (_SCORE_ARRIVAL_DIST * 2.0):
+                    ticks_done = False
+
             if ticks_done and nav_done:
                 self._manual_rl_action = None
-                self.decision_tick     = 0
+                self.decision_tick = 0
 
             # Expose ticks-left for the panel status line
             self._manual_rl_ticks_left = max(0, TICKS_PER_DECISION - self._manual_rl_ticks)
@@ -1378,51 +2081,55 @@ class VexAIEnv(gym.Env):
             self._decision_logger.close()
         self._decision_logger = DecisionLogger(log_dir)
 
-    def action_masks(self, robot_id: int = 0) -> np.ndarray:
-        """Boolean mask of shape (NUM_ACTIONS,) — True = action valid this decision.
+    def _descore_available_for_mask(self, action: Action) -> bool:
+        """True when descore is valid for masking (belief, confirmed by view if visible)."""
+        if _removable_count_for_long_action(self.field, action) > 0:
+            return True
+        gname = long_gname_for(action)
+        gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
+        if not _believed_descore_available(gs, action, descore_as_opponent=False):
+            if not (self.use_goal_belief and self._goal_in_view.get(gname, False)):
+                return False
+            return _believed_descore_available(
+                self.field.goal_state, action, descore_as_opponent=False,
+            )
+        if self.use_goal_belief and self._goal_in_view.get(gname, False):
+            return _believed_descore_available(
+                self.field.goal_state, action, descore_as_opponent=False,
+            )
+        return True
 
-        Rules:
-          DESCORE_OPP_LONG  only when opp's long goal has opp-colored balls
-          DESCORE_CENTER    only when center goals contain opp-colored balls
-          EJECT_WRONG_COLOR only when robot holds wrong-color balls
-          SCORE_*           always available — auto-chains to COLLECT first if empty
-          All others always available (COLLECT, DEFEND, IDLE).
-        """
+    def _ram_available_for_mask(self, action: Action) -> bool:
+        return _removable_count_for_long_action(self.field, action) > 0
+
+    def action_masks(self, robot_id: int = 0) -> np.ndarray:
+        """Boolean mask of shape (NUM_ACTIONS,) — True = action valid this decision."""
         mask = np.ones(NUM_ACTIONS, dtype=bool)
         if robot_id >= self.num_allies:
             return mask
         robot = self.field.allies[robot_id]
-        # Mask descore on the PERCEIVED goal state — the robot can only choose to
-        # descore a goal it BELIEVES holds opponent balls (what it has seen), not
-        # via omniscient truth. If its belief is stale it may drive over and find
-        # nothing (and the mid-step replanner re-routes); if it hasn't seen an
-        # opponent score yet, descore stays unavailable until it looks.
-        gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
 
-        # Descore opp long: only when their goal holds OPPONENT-colored balls.
-        # (try_descore only removes opp-scored balls, so descoring a goal full of
-        # our own balls is a no-op that just parks the robot at the wall — and
-        # with no opponents there's never anything to descore. Mirror the center
-        # rule, which already checks color.)
-        opp_in_long = any(color != BALL_BLUE for _, color in gs.opp_long)
-        if not opp_in_long:
-            mask[int(Action.DESCORE_OPP_LONG)] = False
+        if self.num_allies >= 2:
+            for act in Action:
+                if not _role_allowed_team_action(robot, act):
+                    mask[int(act)] = False
 
-        # Descore center: only when center goals hold opponent-colored balls
-        opp_in_center = (
-            any(color != BALL_BLUE for _, color in gs.center_mid) or
-            any(color != BALL_BLUE for _, color in gs.center_low)
-        )
-        if not opp_in_center:
-            mask[int(Action.DESCORE_CENTER)] = False
+        if robot.balls_held == 0:
+            for act in SCORE_ACTIONS:
+                mask[int(act)] = False
+        else:
+            for act in DESCORE_ACTIONS:
+                mask[int(act)] = False
+            for act in RAM_ACTIONS:
+                mask[int(act)] = False
 
-        # Eject wrong color: only when holding wrong-color balls
-        wrong_held = any(
-            self.field.objects[oid].color != BALL_BLUE
-            for oid in robot.held_object_ids
-        )
-        if not wrong_held:
-            mask[int(Action.EJECT_WRONG_COLOR)] = False
+        if robot.balls_held == 0:
+            for act in DESCORE_ACTIONS:
+                if not self._descore_available_for_mask(act):
+                    mask[int(act)] = False
+            for act in RAM_ACTIONS:
+                if not self._ram_available_for_mask(act):
+                    mask[int(act)] = False
 
         return mask
 
@@ -1434,7 +2141,7 @@ class VexAIEnv(gym.Env):
         raw_a0, raw_a1 = int(actions[0]), int(actions[1])
         a0, a1 = raw_a0, raw_a1
 
-        SCORE_INTENTS = (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW)
+        SCORE_INTENTS = tuple(SCORE_ACTIONS)
 
         # Scoring commitment across DECISIONS (env.step calls).
         # Goal: once the agent selects SCORE_*, don't allow thrashing to other
@@ -1452,7 +2159,7 @@ class VexAIEnv(gym.Env):
                     self._score_commit_left[idx] -= 1
                 else:
                     self._score_commit_left[idx] = 0
-                    self._score_committed_action[idx] = int(Action.IDLE)
+                    self._score_committed_action[idx] = int(Action.STOP)
 
         # Safety remap: if the chosen action is currently masked, fall back to
         # COLLECT_NEAREST_BALL. MaskablePPO won't ever send a masked action, but
@@ -1463,10 +2170,10 @@ class VexAIEnv(gym.Env):
             if _r != _a:
                 _src[_i] = "committed"
         if not self.action_masks(robot_id=0)[a0]:
-            a0 = int(Action.COLLECT_NEAREST_BALL)
+            a0 = _score_fallback_for_robot(self.field.allies[0]) if self.field.allies[0].balls_held > 0 else int(Action.COLLECT_BLOCKS)
             _src[0] = "mask_fallback"
         if not self.action_masks(robot_id=1)[a1]:
-            a1 = int(Action.COLLECT_NEAREST_BALL)
+            a1 = _score_fallback_for_robot(self.field.allies[1]) if self.field.allies[1].balls_held > 0 else int(Action.COLLECT_BLOCKS)
             _src[1] = "mask_fallback"
 
         self.current_actions = np.array([a0, a1], dtype=np.int32)
@@ -1487,9 +2194,9 @@ class VexAIEnv(gym.Env):
         if SCORE_COMMIT_UNTIL_EMPTY:
             raw_commit_a0, raw_commit_a1 = raw_a0, raw_a1
             if not self.action_masks(robot_id=0)[raw_commit_a0]:
-                raw_commit_a0 = int(Action.COLLECT_NEAREST_BALL)
+                raw_commit_a0 = int(Action.COLLECT_BLOCKS)
             if not self.action_masks(robot_id=1)[raw_commit_a1]:
-                raw_commit_a1 = int(Action.COLLECT_NEAREST_BALL)
+                raw_commit_a1 = int(Action.COLLECT_BLOCKS)
 
             for idx, act in enumerate((raw_commit_a0, raw_commit_a1)):
                 if idx >= self.num_allies:
@@ -1506,9 +2213,9 @@ class VexAIEnv(gym.Env):
         elif SCORE_COMMIT_DECISIONS > 1:
             raw_commit_a0, raw_commit_a1 = raw_a0, raw_a1
             if not self.action_masks(robot_id=0)[raw_commit_a0]:
-                raw_commit_a0 = int(Action.COLLECT_NEAREST_BALL)
+                raw_commit_a0 = int(Action.COLLECT_BLOCKS)
             if not self.action_masks(robot_id=1)[raw_commit_a1]:
-                raw_commit_a1 = int(Action.COLLECT_NEAREST_BALL)
+                raw_commit_a1 = int(Action.COLLECT_BLOCKS)
 
             for idx, act in enumerate((raw_commit_a0, raw_commit_a1)):
                 if idx >= self.num_allies:
@@ -1548,15 +2255,27 @@ class VexAIEnv(gym.Env):
         self.decision_tick = 0
         self.executing     = True
         self._eject_fired_this_decision[:] = False
+        self._descore_target_cache = [None, None]
+        self._descore_dwell_left[:] = 0
+        self._descore_slide_start = [None, None]
+        self._descore_slide_end = [None, None]
+        self._descore_slam_fired[:] = False
+        self._descore_slide_fired[:] = False
+        self._descore_align_ticks[:] = 0
+        self._ram_fired[:] = False
+        self.slam_impact_speed[:] = 0.0
+        self._opp_descore_slam_fired[:] = False
+        self._opp_slam_impact_speed[:] = 0.0
 
         fi = self.failure_injector
         if self.num_allies < 2 or fi.teammate_offline or fi.should_teammate_fail():
-            a1 = Action.IDLE
+            a1 = Action.STOP
 
         # Obstacle-aware nav queue per opponent (mirrors ally_wq). Without this the
         # opponent drives in a straight line and jams against the center X / long-goal
         # bodies, appearing to "stop" until it happens to pick an unobstructed target.
         opp_wq: list[list] = [[] for _ in range(2)]
+        opp_live_actions: list[Action] = [Action.STOP, Action.STOP]
         for oi in range(self.num_opponents):
             opp = self.field.opponents[oi]
             # Jam detection (across decisions): if the opponent barely moved AND
@@ -1581,22 +2300,40 @@ class VexAIEnv(gym.Env):
                 "us_scored_count": len(self.field.scored_by_us_indices()),
             }
             opp_action = self.opponent_policy(opp_state, self.rng)
+            opp_live_actions[oi] = opp_action
+            if is_descore_action(opp_action):
+                plan = _resolve_descore_plan(
+                    opp_action, self.field, opp, self.field.goal_state, True,
+                )
+                self._opp_descore_cache[oi] = (
+                    (int(opp_action),) + plan if plan is not None else None
+                )
+            else:
+                self._opp_descore_cache[oi] = None
             tgt = _opp_action_to_target(opp_action, self.field, opp)
             if tgt is None:
                 # Never let the opponent freeze (IDLE/EJECT, or COLLECT with no
                 # reachable ball all yield no target). Fall back to the nearest
                 # ball, or failing that the nearest goal, so it always keeps
                 # moving instead of stopping in place.
+                y_min, y_max = _half_y_bounds(opp, True, opp_action)
                 tgt = self.field.nearest_on_field_target(opp.position)
+                if tgt is not None and not (y_min <= float(tgt[1]) <= y_max):
+                    tgt = None
                 if tgt is None:
-                    tgt = min(
-                        (OPP_LONG_GOAL, OUR_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL),
-                        key=lambda g: float(np.linalg.norm(opp.position - g)),
-                    ).copy()
+                    goals = [
+                        g for g in (OPP_LONG_GOAL, OUR_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL)
+                        if y_min <= float(g[1]) <= y_max
+                    ]
+                    if not goals:
+                        goals = [OPP_LONG_GOAL, OUR_LONG_GOAL, CENTER_MID_GOAL, CENTER_LOW_GOAL]
+                    tgt = min(goals, key=lambda g: float(np.linalg.norm(opp.position - g))).copy()
             if jammed:
-                tgt = np.array([FIELD_W * 0.5, FIELD_H * 0.5])
+                tgt = _jam_recovery_for(opp, True)
+            if tgt is not None:
+                tgt = _clip_to_half(np.asarray(tgt, dtype=np.float64), opp, True, opp_action)
             self.opp_targets[oi] = tgt
-            opp_wq[oi] = _build_nav_waypoints(opp.position, tgt)
+            opp_wq[oi] = _nav_waypoints_for(opp.position, tgt, opp, True, opp_action)
 
         for idx in range(2):
             if fi.should_steal_object():
@@ -1620,22 +2357,46 @@ class VexAIEnv(gym.Env):
             elif act in SCORE_INTENTS and robot.balls_held == 0:
                 # SCORE chosen but nothing to score — navigate to collect instead
                 # so the robot finds balls rather than running empty to a goal.
-                final = _action_to_target(Action.COLLECT_NEAREST_BALL, self.field, robot)
+                final = _action_to_target(Action.COLLECT_BLOCKS, self.field, robot)
+            elif is_descore_action(act):
+                gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
+                plan = _resolve_descore_plan_with_fallback(
+                    act, self.field, robot, gs, self.use_goal_belief, False,
+                )
+                if plan is None:
+                    final = None
+                else:
+                    self._descore_target_cache[idx] = (int(act),) + plan
+                    self._observe_descore_goal(plan[1])
+                    final = plan[2].copy()
+            elif is_ram_action(act):
+                if _removable_count_for_long_action(self.field, act) <= 0:
+                    final = None
+                else:
+                    gname, approach, _entry = _ram_pose_for_action(act, robot)
+                    self._observe_descore_goal(gname)
+                    final = approach.copy()
             else:
                 final = _action_to_target(act, self.field, robot)
             if final is None:
                 return []
-            wq = _build_nav_waypoints(robot.position, final)
+            wq = _nav_waypoints_for(robot.position, final, robot, False, act)
+            # Descore/RAM: keep the intent even if routing is tight — drive straight
+            # rather than silently switching to COLLECT while the UI still shows descore.
+            if not wq and is_descore_action(act) and final is not None:
+                wq = [final.copy()]
+            elif not wq and is_ram_action(act) and final is not None:
+                wq = [final.copy()]
             # If the target is geometrically unreachable (arm / goal body blocks
             # every corridor), fall back to COLLECT so the robot explores instead
-            # of freezing. Applies to DESCORE and DEFEND — not COLLECT itself
+            # of freezing. Applies to non-descore actions — not COLLECT itself
             # (would loop) or IDLE/EJECT (those have no nav target anyway).
-            if not wq and act not in (Action.COLLECT_NEAREST_BALL,
-                                      Action.IDLE, Action.EJECT_WRONG_COLOR):
-                live_actions[idx] = int(Action.COLLECT_NEAREST_BALL)
-                fb = _action_to_target(Action.COLLECT_NEAREST_BALL, self.field, robot)
+            elif not wq and act not in (Action.COLLECT_BLOCKS, Action.STOP):
+                live_actions[idx] = int(Action.COLLECT_BLOCKS)
+                fb = _action_to_target(Action.COLLECT_BLOCKS, self.field, robot)
                 if fb is not None:
-                    wq = _build_nav_waypoints(robot.position, fb)
+                    wq = _nav_waypoints_for(robot.position, fb, robot, False,
+                                            Action.COLLECT_BLOCKS)
             return wq
 
         ally_wq: list[list] = [_build_wq(0), _build_wq(1)]
@@ -1681,8 +2442,12 @@ class VexAIEnv(gym.Env):
         stall_pos_snap   = [r.position.copy() for r in self.field.allies]
         stall_tick_count = [0, 0]
         stall_strikes    = [0, 0]
+        self._opp_live_actions = opp_live_actions
 
         for tick in range(MAX_STEP_TICKS):
+            self._match_elapsed += DT
+            _set_isolation_lanes(self._match_elapsed < ISOLATION_PERIOD)
+
             if tick >= TICKS_PER_DECISION:
                 def _busy(i: int) -> bool:
                     """Return True if robot i should keep this decision alive.
@@ -1694,18 +2459,30 @@ class VexAIEnv(gym.Env):
                     act_i = Action(live_actions[i])
                     if scoring_dwell_left[i] > 0:
                         return True
+                    if self._descore_dwell_left[i] > 0:
+                        return True
+                    if is_descore_action(act_i):
+                        if self._descore_dwell_left[i] > 0:
+                            return True
+                        plan = self._get_descore_plan(i, act_i)
+                        if plan is not None:
+                            mode = plan[0]
+                            if mode == DESCORE_MODE_SLIDE and self._descore_slide_fired[i]:
+                                return False
+                            if mode == DESCORE_MODE_SLAM and self._descore_slam_fired[i]:
+                                return False
+                            dist = float(np.linalg.norm(robot.position - plan[2]))
+                            if dist < (_SCORE_ARRIVAL_DIST * 2.0):
+                                return True
+                    if is_ram_action(act_i) and not self._ram_fired[i]:
+                        _, approach, _ = _ram_pose_for_action(act_i, robot)
+                        dist = float(np.linalg.norm(robot.position - approach))
+                        if dist < (_SCORE_ARRIVAL_DIST * 2.0):
+                            return True
                     if act_i in SCORE_INTENTS and robot.balls_held > 0:
                         score_pos, *_ = self._get_scoring_target(i, act_i)
                         dist = float(np.linalg.norm(robot.position - score_pos))
-                        # Keep sim running while we are close enough to be aligning/scoring.
                         return dist < (_SCORE_ARRIVAL_DIST * 2.0)
-
-                    if act_i == Action.EJECT_WRONG_COLOR and not self._eject_fired_this_decision[i]:
-                        wrong_held = any(
-                            self.field.objects[oid].color != BALL_BLUE
-                            for oid in robot.held_object_ids
-                        )
-                        return wrong_held
 
                     return False
 
@@ -1734,40 +2511,34 @@ class VexAIEnv(gym.Env):
             )
             our_long_count = len(_gs_dec.our_long)
             defend_worth_it = (self.num_opponents > 0) and (our_long_count > 0)
-            SCORE_INTENTS = (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID,
-                             Action.SCORE_CENTER_LOW)
+            SCORE_INTENTS = tuple(SCORE_ACTIONS)
             for idx in range(self.num_allies):
                 robot    = self.field.allies[idx]
                 act      = Action(live_actions[idx])
                 original = Action(self.current_actions[idx])
                 new_act  = None
                 force_replan = False
-                # Chain-back: SCORE intent paused for COLLECT, balls now held → resume SCORE
-                # (skipped once a score approach has been abandoned this decision).
-                if (act == Action.COLLECT_NEAREST_BALL
+                if (act == Action.COLLECT_BLOCKS
                         and original in SCORE_INTENTS
                         and robot.balls_held > 0
                         and not abandon_score[idx]):
                     new_act = original
-                # SCORE_* with no balls → auto-collect first
                 elif act in SCORE_INTENTS and robot.balls_held == 0:
-                    new_act = Action.COLLECT_NEAREST_BALL
+                    new_act = Action.COLLECT_BLOCKS
                     force_replan = True
-                # Full robot → score, unless already scoring or ejecting wrong-color
-                elif robot.balls_held >= MAX_CARRY and act not in SCORE_INTENTS + (Action.EJECT_WRONG_COLOR,):
-                    # Respect RL's SCORE intent if it had one, else default to long goal
-                    new_act = original if original in SCORE_INTENTS else Action.SCORE_LONG_GOAL
-                # DESCORE_* with nothing to descore → go collect instead of
-                # driving into the goal body
-                elif act in (Action.DESCORE_OPP_LONG, Action.DESCORE_CENTER) \
-                        and n_opp_scored == 0:
-                    new_act = Action.COLLECT_NEAREST_BALL
+                elif robot.balls_held >= MAX_CARRY and act not in SCORE_INTENTS:
+                    new_act = original if original in SCORE_INTENTS else _home_long_score_action(robot)
+                elif (is_descore_action(act)
+                      and _removable_count_for_long_action(self.field, act) <= 0):
+                    new_act = Action.COLLECT_BLOCKS
                     force_replan = True
-                # DEFEND_ZONE only makes sense when (a) an opponent exists AND
-                # (b) we have something scored worth defending. Otherwise route
-                # to COLLECT so we don't waste a decision parked uselessly.
-                elif act == Action.DEFEND_ZONE and not defend_worth_it:
-                    new_act = Action.COLLECT_NEAREST_BALL
+                elif (is_descore_action(act) and self._descore_slide_fired[idx]
+                      and self._descore_dwell_left[idx] <= 0):
+                    new_act = Action.COLLECT_BLOCKS
+                    force_replan = True
+                elif (is_descore_action(act) or is_ram_action(act)) and robot.balls_held > 0:
+                    new_act = _home_long_score_action(robot)
+                    force_replan = True
                 if new_act is not None:
                     # Replan lock: don't flip executing intent too rapidly.
                     # Still allow forced replans when the current intent is invalid.
@@ -1801,7 +2572,59 @@ class VexAIEnv(gym.Env):
                 # producing an orbiting/circling failure mode.
                 act_i = Action(live_actions[idx])
                 reverse_drive = False
-                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) and robot.balls_held > 0:
+                if is_descore_action(act_i):
+                    cache = self._descore_target_cache[idx]
+                    if cache is not None:
+                        plan = cache[1:]
+                        mode, _, approach_pos, drop_ref, *_rest = plan
+                        in_range = _in_descore_range(
+                            robot.position, approach_pos, drop_ref,
+                        )
+                        if mode == DESCORE_MODE_SLAM and not self._descore_slam_fired[idx]:
+                            self.slam_impact_speed[idx] = max(
+                                float(self.slam_impact_speed[idx]), float(robot.speed),
+                            )
+                        if self._descore_dwell_left[idx] > 0:
+                            ally_wq[idx].clear()
+                            robot.moving = False
+                            target = None
+                        elif mode == DESCORE_MODE_SLIDE and in_range:
+                            ally_wq[idx].clear()
+                            robot.moving = False
+                            robot.speed = 0.0
+                            robot.target = None
+                            target = None
+                        elif mode == DESCORE_MODE_SLAM and in_range:
+                            ally_wq[idx].clear()
+                            target = None
+                        else:
+                            target = _current_target(idx)
+                            if (mode == DESCORE_MODE_SLIDE and target is not None
+                                    and len(ally_wq[idx]) <= 1):
+                                # Back-in only for end-of-goal slide poses; mid-span
+                                # face brushes drive forward into the opening.
+                                fy = float(approach_pos[1])
+                                reverse_drive = (
+                                    fy > LONG_GOAL_Y_MAX or fy < LONG_GOAL_Y_MIN
+                                )
+                    else:
+                        target = _current_target(idx)
+                elif is_ram_action(act_i):
+                    _, approach, _ = _ram_pose_for_action(act_i, robot)
+                    dist_app = float(np.linalg.norm(robot.position - approach))
+                    if not self._ram_fired[idx]:
+                        self.slam_impact_speed[idx] = max(
+                            float(self.slam_impact_speed[idx]), float(robot.speed),
+                        )
+                    if dist_app < _SCORE_ARRIVAL_DIST:
+                        ally_wq[idx].clear()
+                        robot.moving = False
+                        robot.speed = 0.0
+                        robot.target = None
+                        target = None
+                    else:
+                        target = _current_target(idx)
+                elif is_score_action(act_i) and robot.balls_held > 0:
                     score_pos, goal_pos, *_ = self._get_scoring_target(idx, act_i)
                     dist_to_score = float(np.linalg.norm(robot.position - score_pos))
                     dist_to_goal  = float(np.linalg.norm(robot.position - goal_pos))
@@ -1845,12 +2668,24 @@ class VexAIEnv(gym.Env):
                 # Suppress center-arm push when scoring/descoring at a center tip.
                 # Suppress long-goal push when the robot has reached the long-goal
                 # scoring position so the collision margin can't kick it out mid-shot.
-                skip_center = Action(live_actions[idx]) in (
-                    Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW, Action.DESCORE_CENTER
-                )
+                skip_center = _is_center_score_action(Action(live_actions[idx]))
                 _act_i_now = Action(live_actions[idx])
                 skip_long = False
-                if _act_i_now == Action.SCORE_LONG_GOAL and robot.balls_held > 0:
+                if is_descore_action(_act_i_now):
+                    _dc = self._descore_target_cache[idx]
+                    if _dc is not None:
+                        if self._descore_dwell_left[idx] > 0:
+                            skip_long = True
+                        else:
+                            skip_long = float(np.linalg.norm(
+                                robot.position - _dc[3],
+                            )) < (_SCORE_ARRIVAL_DIST * 2.0)
+                elif is_ram_action(_act_i_now):
+                    _, _ram_app, _ = _ram_pose_for_action(_act_i_now, robot)
+                    skip_long = float(np.linalg.norm(
+                        robot.position - _ram_app,
+                    )) < (_SCORE_ARRIVAL_DIST * 2.0)
+                elif _is_long_score_action(_act_i_now) and robot.balls_held > 0:
                     _cache_i = self._score_target_cache[idx]
                     if _cache_i is not None:
                         _sp = _cache_i[1]
@@ -1871,7 +2706,7 @@ class VexAIEnv(gym.Env):
                 # only dwell after arrival AND heading alignment are both satisfied.
                 # Start (or refresh) scoring dwell once the scoring pose is achieved.
                 # Note: `robot` is the per-idx robot defined above.
-                if act_i in (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW) and robot.balls_held > 0:
+                if is_score_action(act_i) and robot.balls_held > 0:
                     score_pos, _, required_heading, _ = self._get_scoring_target(idx, act_i)
 
                     dist = float(np.linalg.norm(robot.position - score_pos))
@@ -1892,7 +2727,8 @@ class VexAIEnv(gym.Env):
             # waypoint queue is cleared so it stops fighting an unreachable target.
             for idx in range(self.num_allies):
                 # Intentional pauses: reset snapshot so pause ticks aren't counted.
-                if self.action_pause_ticks[idx] > 0 or scoring_dwell_left[idx] > 0:
+                if (self.action_pause_ticks[idx] > 0 or scoring_dwell_left[idx] > 0
+                        or self._descore_dwell_left[idx] > 0):
                     stall_pos_snap[idx]   = self.field.allies[idx].position.copy()
                     stall_tick_count[idx] = 0
                     continue
@@ -1927,9 +2763,9 @@ class VexAIEnv(gym.Env):
                                     robot_to.position - goal_pos_to)) >= SCORE_RANGE
                                 if out_of_range and robot_to.balls_held < MAX_CARRY:
                                     self._score_commit_left[idx] = 0
-                                    self._score_committed_action[idx] = int(Action.IDLE)
+                                    self._score_committed_action[idx] = int(Action.STOP)
                                     abandon_score[idx] = True
-                                    live_actions[idx]  = int(Action.COLLECT_NEAREST_BALL)
+                                    live_actions[idx]  = int(Action.COLLECT_BLOCKS)
                                     ally_wq[idx]       = _build_wq(idx)
                                     live_action_age[idx] = 0
                                     stall_pos_snap[idx] = self.field.allies[idx].position.copy()
@@ -1938,9 +2774,35 @@ class VexAIEnv(gym.Env):
 
             for oi in range(self.num_opponents):
                 opp_r = self.field.opponents[oi]
+                opp_act = opp_live_actions[oi]
+                if is_descore_action(opp_act):
+                    cache = self._opp_descore_cache[oi]
+                    if cache is not None:
+                        plan = cache[1:]
+                        if plan[0] == DESCORE_MODE_SLAM and not self._opp_descore_slam_fired[oi]:
+                            self._opp_slam_impact_speed[oi] = max(
+                                float(self._opp_slam_impact_speed[oi]),
+                                float(opp_r.speed),
+                            )
+                opp_reverse = False
+                if is_descore_action(opp_act):
+                    cache = self._opp_descore_cache[oi]
+                    if cache is not None:
+                        plan = cache[1:]
+                        mode, _, approach_pos, *_ = plan
+                        dist_app = float(np.linalg.norm(opp_r.position - approach_pos))
+                        if (mode == DESCORE_MODE_SLIDE and opp_wq[oi]
+                                and len(opp_wq[oi]) <= 1
+                                and dist_app >= _SCORE_ARRIVAL_DIST):
+                            opp_reverse = True
                 if opp_wq[oi]:
                     # Follow the obstacle-aware route, advancing waypoints on arrival.
-                    arrived = opp_r.move_toward_point(opp_wq[oi][0])
+                    if opp_reverse:
+                        arrived = opp_r.move_toward_point(
+                            opp_wq[oi][0], reverse=True, arrival_dist=_SCORE_FINAL_ARRIVAL,
+                        )
+                    else:
+                        arrived = opp_r.move_toward_point(opp_wq[oi][0])
                     if arrived and len(opp_wq[oi]) > 1:
                         opp_wq[oi].pop(0)
                     elif arrived:
@@ -1949,6 +2811,34 @@ class VexAIEnv(gym.Env):
                     # No route found (target unreachable) — straight-line fallback.
                     opp_r.move_toward_point(self.opp_targets[oi])
                 _resolve_goal_collisions(opp_r)
+
+            # Per-robot left/right x-lanes always; alliance y-side only in Isolation.
+            for idx in range(self.num_allies):
+                clamp_robot_to_half(
+                    self.field.allies[idx], False, Action(live_actions[idx]),
+                    enforce_x_lane=True,
+                )
+            for oi in range(self.num_opponents):
+                clamp_robot_to_half(
+                    self.field.opponents[oi], True, Action(opp_live_actions[oi]),
+                    enforce_x_lane=True,
+                )
+
+            # Robot–robot collision (all pairs: teammates and opponents).
+            resolve_all_robot_collisions(
+                self.field.allies[:self.num_allies],
+                self.field.opponents[:self.num_opponents],
+            )
+            for idx in range(self.num_allies):
+                clamp_robot_to_half(
+                    self.field.allies[idx], False, Action(live_actions[idx]),
+                    enforce_x_lane=True,
+                )
+            for oi in range(self.num_opponents):
+                clamp_robot_to_half(
+                    self.field.opponents[oi], True, Action(opp_live_actions[oi]),
+                    enforce_x_lane=True,
+                )
 
             # Refresh perceived goal state from camera FOV (after movement, so
             # headings are current). Scanning/driving past a goal updates what the
@@ -1959,7 +2849,7 @@ class VexAIEnv(gym.Env):
             for idx in range(self.num_allies):
                 robot = self.field.allies[idx]
                 robot.intake_active = (
-                    Action(live_actions[idx]) == Action.COLLECT_NEAREST_BALL
+                    Action(live_actions[idx]) == Action.COLLECT_BLOCKS
                     and robot.balls_held < MAX_CARRY
                 )
 
@@ -2008,7 +2898,7 @@ class VexAIEnv(gym.Env):
                 self.field.allies[idx].position - step_start_pos[idx]
             ))
             self.low_progress[idx] = (
-                self.current_actions[idx] != Action.IDLE
+                self.current_actions[idx] != Action.STOP
                 and self.field.allies[idx].moving
                 and travelled < 6.0
                 and not fi.is_stuck(idx)
@@ -2026,17 +2916,27 @@ class VexAIEnv(gym.Env):
                 robot.explore_barren = 0
                 continue
             collecting = (
-                Action(live_actions[idx]) == Action.COLLECT_NEAREST_BALL
-                or Action(self.current_actions[idx]) == Action.COLLECT_NEAREST_BALL
+                Action(live_actions[idx]) == Action.COLLECT_BLOCKS
+                or Action(self.current_actions[idx]) == Action.COLLECT_BLOCKS
             )
             if not collecting:
                 continue
+            y_min, y_max = _half_y_bounds(robot, False, Action.COLLECT_BLOCKS)
+            if _LANE_X_ENFORCED:
+                x_min, x_max = x_bounds_for_robot(robot, Action.COLLECT_BLOCKS)
+            else:
+                half_w = ROBOT_W / 2.0 + 1.0
+                x_min, x_max = half_w, FIELD_W - half_w
             route = compute_collection_route(
                 robot.position, self.field,
                 already_held=robot.balls_held, max_volley=1, robot=robot,
+                y_min=y_min, y_max=y_max, x_min=x_min, x_max=x_max,
             )
+            nav = self.field.nearest_navigable_target(robot.position)
             has_target = bool(route) or (
-                self.field.nearest_navigable_target(robot.position) is not None
+                nav is not None
+                and y_min <= float(nav[1]) <= y_max
+                and x_min <= float(nav[0]) <= x_max
             )
             if has_target:
                 robot.explore_barren = 0
@@ -2063,9 +2963,10 @@ class VexAIEnv(gym.Env):
         self.prev_ctrl_us  = ctrl_us_now
         self.prev_ctrl_opp = ctrl_opp_now
 
-        from training.reward import compute_reward
+        from training.reward import compute_reward, compute_team_reward
         r0 = compute_reward(self, robot_id=0)
         r1 = compute_reward(self, robot_id=1)
+        self.last_team_reward = compute_team_reward(self)
 
         # Snapshot scores AFTER reward computation so next step can compute delta
         self.prev_my_score  = float(self.field.my_score)
@@ -2123,17 +3024,15 @@ class VexAIEnv(gym.Env):
             _, score_pos, goal_pos, required_heading, gname = cached
             return score_pos, goal_pos, float(required_heading), gname
 
-        if action == Action.SCORE_LONG_GOAL:
-            score_pos, goal_pos, required_heading, gname = _nearest_long_goal_target(robot)
-            # Stable detour choice: route via the corridor that matches the
-            # chosen long-goal END. Top end → high corridor, bottom end → low.
-            self._score_route_hint[idx] = {"route_low": float(score_pos[1]) < _CY}
-        elif action == Action.SCORE_CENTER_MID:
-            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=False)
-            self._score_route_hint[idx] = None
-        elif action == Action.SCORE_CENTER_LOW:
-            score_pos, goal_pos, required_heading, gname = _nearest_center_tip(robot, lower=True)
-            self._score_route_hint[idx] = None
+        if is_score_action(action):
+            y_min, y_max = _half_y_bounds(robot, False, action)
+            score_pos, goal_pos, required_heading, gname = _score_pose_for_action(
+                action, robot, y_min, y_max,
+            )
+            if _is_long_score_action(action):
+                self._score_route_hint[idx] = {"route_low": float(score_pos[1]) < _CY}
+            else:
+                self._score_route_hint[idx] = None
         else:
             raise ValueError(f"Unsupported scoring action: {action}")
 
@@ -2169,7 +3068,7 @@ class VexAIEnv(gym.Env):
                 out.append(p.copy())
             return out
 
-        if action == Action.SCORE_LONG_GOAL:
+        if _is_long_score_action(action):
             hint = self._score_route_hint[idx] or {"route_low": float(robot.y) <= 72.0}
             route_low = bool(hint.get("route_low", True))
 
@@ -2179,9 +3078,6 @@ class VexAIEnv(gym.Env):
                 (_NAV_LEFT_LOW if route_low else _NAV_LEFT_HIGH).copy()
             stage = np.array([float(corridor[0]), float(score_pos[1])], dtype=np.float64)
 
-            # If the robot has already passed the corridor on its way to the goal
-            # (x-position is between the corridor and the goal), skip the corridor
-            # waypoint so the robot doesn't get sent backward on subsequent decisions.
             rx = float(robot.x)
             corr_x = float(corridor[0])
             already_past = (is_right and rx >= corr_x) or (not is_right and rx <= corr_x)
@@ -2189,7 +3085,7 @@ class VexAIEnv(gym.Env):
                 return _compact([score_pos])
             return _compact([corridor, stage, score_pos])
 
-        if action in (Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW):
+        if _is_center_score_action(action):
             pre = _NAV_ABOVE_X if float(score_pos[1]) >= _CY else _NAV_BELOW_X
             if float(score_pos[0]) >= _CX:
                 corridor = _NAV_RIGHT_HIGH if float(score_pos[1]) >= _CY else _NAV_RIGHT_LOW
@@ -2243,68 +3139,211 @@ class VexAIEnv(gym.Env):
             if seen:
                 self._observe_goal(gname)
 
+    def _cache_descore_target(self, idx: int, action: Action) -> None:
+        robot = self.field.allies[idx]
+        gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
+        plan = _resolve_descore_plan_with_fallback(
+            action, self.field, robot, gs, self.use_goal_belief, False,
+        )
+        if plan is not None:
+            self._descore_target_cache[idx] = (int(action),) + plan
+            self._observe_descore_goal(plan[1])
+        else:
+            self._descore_target_cache[idx] = None
+
+    def _get_descore_plan(self, idx: int, action: Action) -> tuple | None:
+        cache = self._descore_target_cache[idx]
+        if cache is None or cache[0] != int(action):
+            self._cache_descore_target(idx, action)
+            cache = self._descore_target_cache[idx]
+        return cache[1:] if cache else None
+
+    def _observe_descore_goal(self, gname: str) -> None:
+        self._observe_goal(gname)
+        if gname in ("center_mid", "center_low"):
+            self._observe_goal("center_mid")
+            self._observe_goal("center_low")
+
+    def _effective_slam_speed(self, robot: Robot, recorded: float,
+                              at_entry: bool) -> float:
+        """Resolve slam impact speed; use nominal ram speed when parked at entry."""
+        speed = float(recorded)
+        if speed < SLAM_MIN_SPEED:
+            speed = float(robot.speed)
+        if speed < SLAM_MIN_SPEED and at_entry:
+            speed = MAX_SPEED * robot.speed_scale * 0.85
+        return speed
+
+    def _check_ally_descore(self, idx: int, robot: Robot, action: Action) -> None:
+        plan = self._get_descore_plan(idx, action)
+        if plan is None:
+            return
+        (mode, gname, approach_pos, drop_ref, heading,
+         start_pt, end_pt, entry_end, slide_end) = plan
+        remove_ally = descore_remove_ally_scored(action)
+
+        if mode == DESCORE_MODE_SLAM:
+            if self._descore_slam_fired[idx]:
+                return
+            if not _in_descore_range(robot.position, approach_pos, drop_ref):
+                return
+            live = _resolve_descore_plan_for_execution(action, self.field, robot)
+            if live is None:
+                self._descore_slam_fired[idx] = True
+                return
+            (_, gname, approach_pos, drop_ref, heading,
+             _, _, entry_end, _) = live
+            speed = self._effective_slam_speed(
+                robot, float(self.slam_impact_speed[idx]), at_entry=True,
+            )
+            pts = self.field.try_descore_slam(
+                robot, gname, entry_end, speed, approach_pos, self.rng,
+                remove_ally_scored=remove_ally,
+            )
+            self._descore_slam_fired[idx] = True
+            if pts > 0:
+                self.descore_events[idx] += pts
+                robot.actions_succeeded += 1
+                self._observe_descore_goal(gname)
+            return
+
+        if self._descore_slide_fired[idx]:
+            return
+
+        # Post-ejection visual slide along the goal face (after balls are removed).
+        if self._descore_dwell_left[idx] > 0:
+            self._descore_dwell_left[idx] -= 1
+            if self._descore_slide_start[idx] is not None and self._descore_slide_end[idx] is not None:
+                total = max(1, DESCORE_SLIDE_DWELL_TICKS)
+                done = DESCORE_SLIDE_DWELL_TICKS - self._descore_dwell_left[idx]
+                t = min(1.0, done / total)
+                start = self._descore_slide_start[idx]
+                end = self._descore_slide_end[idx]
+                robot.position = start + t * (end - start)
+            return
+
+        if not _in_descore_range(robot.position, approach_pos, drop_ref):
+            return
+
+        # Cosmetic heading nudge only — slide ejection is position-based, not heading.
+        turn_delta = float(np.clip(
+            _wrap_angle(heading - robot.heading) * 4.0, -TURN_RATE, TURN_RATE,
+        )) * DT
+        robot.heading = _wrap_angle(robot.heading + turn_delta)
+
+        live = _resolve_descore_plan_for_execution(action, self.field, robot)
+        if live is None:
+            self._descore_slide_fired[idx] = True
+            return
+        (_, gname, approach_pos, drop_ref, _,
+         start_pt, end_pt, _, slide_end) = live
+
+        pts = self.field.try_descore_slide(
+            robot, gname, start_pt, end_pt, approach_pos, self.rng,
+            remove_ally_scored=remove_ally,
+        )
+        self._descore_slide_fired[idx] = True
+        if pts > 0:
+            self.descore_events[idx] += pts
+            robot.actions_succeeded += 1
+            self._observe_descore_goal(gname)
+            if slide_end is not None:
+                self._descore_dwell_left[idx] = DESCORE_SLIDE_DWELL_TICKS
+                self._descore_slide_start[idx] = robot.position.copy()
+                self._descore_slide_end[idx] = np.asarray(slide_end, dtype=np.float64)
+
+    def _check_opp_descore(self, oi: int, opp: Robot, action: Action) -> None:
+        cache = self._opp_descore_cache[oi]
+        if cache is None or cache[0] != int(action):
+            plan = _resolve_descore_plan(
+                action, self.field, opp, self.field.goal_state, True,
+            )
+            if plan is None:
+                return
+            cache = (int(action),) + plan
+            self._opp_descore_cache[oi] = cache
+        plan = cache[1:]
+        (mode, gname, approach_pos, drop_ref, heading,
+         start_pt, end_pt, entry_end, slide_end) = plan
+
+        if mode == DESCORE_MODE_SLAM:
+            if self._opp_descore_slam_fired[oi]:
+                return
+            dist = float(np.linalg.norm(opp.position - approach_pos))
+            if dist >= _SCORE_ARRIVAL_DIST:
+                return
+            speed = self._effective_slam_speed(
+                opp, float(self._opp_slam_impact_speed[oi]), at_entry=True,
+            )
+            pts = self.field.opp_try_descore_slam(
+                opp, gname, entry_end, speed, approach_pos, self.rng,
+                descore_remove_ally_scored(action),
+            )
+            if pts > 0:
+                self._opp_descore_slam_fired[oi] = True
+            return
+
+        dist = float(np.linalg.norm(opp.position - approach_pos))
+        if dist >= _SCORE_ARRIVAL_DIST:
+            return
+        if abs(_wrap_angle(heading - opp.heading)) >= _SCORE_HDG_TOL:
+            return
+        pts = self.field.opp_try_descore_slide(
+            opp, gname, start_pt, end_pt, approach_pos, self.rng,
+            descore_remove_ally_scored(action),
+        )
+        if pts > 0 and slide_end is not None:
+            opp.position = np.asarray(slide_end, dtype=np.float64)
+
     def _check_ally_effects(self, idx: int, action: Action):
         robot = self.field.allies[idx]
 
-        if action == Action.COLLECT_NEAREST_BALL:
-            if self.field.try_collect(robot):
+        if action == Action.COLLECT_BLOCKS:
+            collect_result = self.field.try_collect(robot)
+            if collect_result == -1:
+                self.red_collected_this_step[idx] += 1
+                self.eject_events[idx] += 1
+                robot.actions_succeeded += 1
+            elif collect_result:
                 self.collected_this_step[idx] += 1
                 robot.actions_succeeded += 1
-                # Track wrong-color (red) collections for penalty
-                if self.field.objects[robot.held_object_ids[-1]].color != BALL_BLUE:
-                    self.red_collected_this_step[idx] += 1
 
-        elif action == Action.SCORE_LONG_GOAL:
+        elif is_score_action(action):
             if robot.balls_held <= 0:
                 robot.score_timer = 0.0
                 return
             score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
+            pts = LONG_GOAL_POINTS if gname.endswith("long") else CENTER_GOAL_POINTS
             self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
-                                     required_heading, LONG_GOAL_POINTS)
+                                     required_heading, pts)
 
-        elif action == Action.SCORE_CENTER_MID:
-            if robot.balls_held <= 0:
-                robot.score_timer = 0.0
-                return
-            score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
-            self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
-                                     required_heading, CENTER_GOAL_POINTS)
+        elif is_descore_action(action):
+            self._check_ally_descore(idx, robot, action)
 
-        elif action == Action.SCORE_CENTER_LOW:
-            if robot.balls_held <= 0:
-                robot.score_timer = 0.0
-                return
-            score_pos, goal_pos, required_heading, gname = self._get_scoring_target(idx, action)
-            self._do_back_in_scoring(idx, robot, score_pos, goal_pos, gname,
-                                     required_heading, CENTER_GOAL_POINTS)
+        elif is_ram_action(action):
+            self._check_ally_ram(idx, robot, action)
 
-        elif action == Action.DESCORE_OPP_LONG:
-            pts = self.field.try_descore(robot, OPP_LONG_GOAL, self.rng)
-            if pts > 0:
-                self.descore_events[idx] += pts
-                robot.actions_succeeded += 1
-                self._observe_goal("opp_long")   # we know what we just removed
-
-        elif action == Action.DESCORE_CENTER:
-            pts = self.field.try_descore(robot, CENTER_MID_GOAL, self.rng)
-            if pts == 0:
-                pts = self.field.try_descore(robot, CENTER_LOW_GOAL, self.rng)
-            if pts > 0:
-                self.descore_events[idx] += pts
-                robot.actions_succeeded += 1
-                self._observe_goal("center_mid")
-                self._observe_goal("center_low")
-
-        elif action == Action.EJECT_WRONG_COLOR:
-            # One-shot per decision. Important: the action-change pause can
-            # suppress effects on tick 0, so gate by a flag rather than
-            # decision_tick==0.
-            if not self._eject_fired_this_decision[idx]:
-                self._eject_fired_this_decision[idx] = True
-                ejected = self._eject_wrong_color_balls(robot)
-                if ejected > 0:
-                    self.eject_events[idx] += ejected
-                    robot.actions_succeeded += 1
+    def _check_ally_ram(self, idx: int, robot: Robot, action: Action) -> None:
+        if self._ram_fired[idx]:
+            return
+        if _removable_count_for_long_action(self.field, action) <= 0:
+            return
+        gname, approach_pos, entry_end = _ram_pose_for_action(action, robot)
+        dist = float(np.linalg.norm(robot.position - approach_pos))
+        if dist >= _SCORE_ARRIVAL_DIST:
+            return
+        speed = self._effective_slam_speed(
+            robot, float(self.slam_impact_speed[idx]), at_entry=True,
+        )
+        pts = self.field.try_descore_slam(
+            robot, gname, entry_end, speed, approach_pos, self.rng,
+            remove_ally_scored=ram_remove_ally_scored(action),
+        )
+        if pts > 0:
+            self._ram_fired[idx] = True
+            self.descore_events[idx] += pts
+            robot.actions_succeeded += 1
+            self._observe_descore_goal(gname)
 
     def _do_back_in_scoring(self, idx: int, robot, score_pos: np.ndarray,
                               goal_pos: np.ndarray, gname: str,
@@ -2371,66 +3410,12 @@ class VexAIEnv(gym.Env):
         prepend=True means the ball entered from the 'start' end, so it exits
         from the 'end' end, and vice versa.
         """
-        import math
         ej_idx, ej_color = ejected
-        obj = self.field.objects[ej_idx]
-        obj.status         = OBJ_ON_FIELD
-        obj.scored_in_goal = None
-        # Subtract from whichever team earned this ball's points
         if ej_color == BALL_BLUE:
             self.field.my_score -= points
         else:
             self.field.opponent_score -= points
-
-        # Place ball just outside the exit end of each goal
-        gap = ROBOT_W + 4.0
-        if gname == "our_long":
-            if prepend:   # entered S → exits N
-                obj.x, obj.y = _RIGHT_GOAL_CX, LONG_GOAL_Y_MAX + gap
-                obj.vy = 12.0
-            else:         # entered N → exits S
-                obj.x, obj.y = _RIGHT_GOAL_CX, LONG_GOAL_Y_MIN - gap
-                obj.vy = -12.0
-            obj.vx = 0.0
-        elif gname == "opp_long":
-            if prepend:
-                obj.x, obj.y = _LEFT_GOAL_CX, LONG_GOAL_Y_MAX + gap
-                obj.vy = 12.0
-            else:
-                obj.x, obj.y = _LEFT_GOAL_CX, LONG_GOAL_Y_MIN - gap
-                obj.vy = -12.0
-            obj.vx = 0.0
-        elif gname == "center_mid":
-            exit_tip = _TIP_NE if prepend else _TIP_SW
-            d = gap / math.sqrt(2.0)
-            sign = 1.0 if prepend else -1.0
-            obj.x, obj.y = float(exit_tip[0]) + sign * d, float(exit_tip[1]) + sign * d
-            obj.vx =  sign * 8.0;  obj.vy =  sign * 8.0
-        elif gname == "center_low":
-            exit_tip = _TIP_NW if prepend else _TIP_SE
-            d = gap / math.sqrt(2.0)
-            if prepend:   # exits NW
-                obj.x, obj.y = float(exit_tip[0]) - d, float(exit_tip[1]) + d
-                obj.vx = -8.0;  obj.vy =  8.0
-            else:         # exits SE
-                obj.x, obj.y = float(exit_tip[0]) + d, float(exit_tip[1]) - d
-                obj.vx =  8.0;  obj.vy = -8.0
-        else:
-            obj.vx = obj.vy = 0.0
-
-        # Scatter each ball with a random offset + lateral velocity so
-        # consecutive overflow balls land at different spots and must be
-        # collected individually.
-        rng = getattr(self, "rng", None)
-        if rng is not None:
-            scatter = 10.0  # max scatter radius in inches
-            obj.x += float(rng.uniform(-scatter, scatter))
-            obj.y += float(rng.uniform(-scatter, scatter))
-            obj.vx += float(rng.uniform(-8.0, 8.0))
-            obj.vy += float(rng.uniform(-8.0, 8.0))
-
-        obj.x = round(float(np.clip(obj.x, ROBOT_W / 2 + 1, FIELD_W - ROBOT_W / 2 - 1)), 2)
-        obj.y = round(float(np.clip(obj.y, ROBOT_W / 2 + 1, FIELD_H - ROBOT_W / 2 - 1)), 2)
+        self.field.spill_overflow_ball(gname, ej_idx, prepend, self.rng)
 
     def _apply_opponent_profile(self) -> None:
         """Stamp the opponent physical profile onto the opponent robots.
@@ -2466,13 +3451,16 @@ class VexAIEnv(gym.Env):
                         opp.score_timer += DT
                         if opp.score_timer >= opp.score_interval:
                             opp.score_timer = 0.0
-                            self.field.opp_try_score(opp, ref, pts, gname=gname)
+                            self.field.opp_try_score(
+                                opp, ref, pts, gname=gname, rng=self.rng,
+                            )
                         break
             if not in_range:
                 opp.score_timer = 0.0   # not lined up on a goal — reset the dwell
 
-            self.field.opp_try_descore(opp, OUR_LONG_GOAL,   self.rng)
-            self.field.opp_try_descore(opp, CENTER_MID_GOAL, self.rng)
+            opp_act = self._opp_live_actions[oi]
+            if is_descore_action(opp_act):
+                self._check_opp_descore(oi, opp, opp_act)
 
     def _steal_nearest(self, robot_idx: int):
         robot  = self.field.allies[robot_idx]
@@ -2565,7 +3553,7 @@ class VexAIEnv(gym.Env):
         # the score value, which is too late for proactive descoring decisions.
         # Sourced from the PERCEIVED goal state (camera belief) so the policy acts
         # on what it has actually seen, not omniscient truth.
-        _LONG_CAP   = 14.0
+        _LONG_CAP   = float(LONG_GOAL_CAPACITY)
         _CTR_CAP    = 14.0  # center_mid (7) + center_low (7)
         gs = self.goal_belief if self.use_goal_belief else self.field.goal_state
         opp_long_fill      = len(gs.opp_long) / _LONG_CAP
@@ -2647,7 +3635,7 @@ class SingleAgentWrapper(gym.Env):
 
     def step(self, action: int):
         # Single robot: robot_0 gets the chosen action, robot_1 is idle
-        obs, rewards, done, truncated, info = self.env.step(np.array([action, Action.IDLE]))
+        obs, rewards, done, truncated, info = self.env.step(np.array([action, Action.STOP]))
         return obs["robot_0"], rewards[0], done, truncated, info
 
     def action_masks(self) -> np.ndarray:
@@ -2685,20 +3673,99 @@ class SingleAgentWrapper(gym.Env):
         renderer.training_stats.update(stats)
 
     def apply_curriculum_config(self, config: dict) -> None:
-        """Apply a curriculum stage config to the underlying VexAIEnv.
+        """Apply a curriculum stage config to the underlying VexAIEnv."""
+        _apply_curriculum_config(self.env, config)
 
-        Called by CurriculumCallback via VecEnv.env_method so it works under
-        both DummyVecEnv and SubprocVecEnv. Mutates opponent_policy,
-        num_opponents, and/or failure_config fields in place.
-        """
-        from sim.opponent import get_opponent
 
-        if "opponent_type" in config:
-            self.env.opponent_policy = get_opponent(config["opponent_type"])
-        if "num_opponents" in config:
-            self.env.num_opponents = max(0, min(int(config["num_opponents"]), 2))
-        if "all_blue_only" in config:
-            self.env.all_blue_only = bool(config["all_blue_only"])
-        if "failures" in config:
-            for key, val in config["failures"].items():
-                setattr(self.env.failure_config, key, val)
+def _apply_curriculum_config(vex_env: VexAIEnv, config: dict) -> None:
+    """Push curriculum stage fields into a VexAIEnv (shared by SB3 wrappers)."""
+    from sim.opponent import get_opponent
+
+    if "opponent_type" in config:
+        vex_env.opponent_policy = get_opponent(config["opponent_type"])
+    if "num_opponents" in config:
+        vex_env.num_opponents = max(0, min(int(config["num_opponents"]), 2))
+    if "num_allies" in config:
+        vex_env.num_allies = max(1, min(int(config["num_allies"]), 2))
+    if "all_blue_only" in config:
+        vex_env.all_blue_only = bool(config["all_blue_only"])
+    if "failures" in config:
+        for key, val in config["failures"].items():
+            setattr(vex_env.failure_config, key, val)
+
+
+class TeamAgentWrapper(gym.Env):
+    """Wraps VexAIEnv for 2-robot team SB3 training: both allies act each decision."""
+
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
+    def __init__(self, render_mode: str | None = None,
+                 num_allies: int = 2, num_opponents: int = 0,
+                 use_timer: bool = False, **kwargs):
+        super().__init__()
+        self.env         = VexAIEnv(render_mode=render_mode,
+                                    num_allies=max(2, min(num_allies, 2)),
+                                    num_opponents=num_opponents,
+                                    use_timer=use_timer,
+                                    **kwargs)
+        self.render_mode = render_mode
+
+        self.observation_space = spaces.Box(
+            -np.inf, np.inf, shape=(STATE_DIM * 2,), dtype=np.float32,
+        )
+        self.action_space = spaces.MultiDiscrete([NUM_ACTIONS, NUM_ACTIONS])
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return np.concatenate([obs["robot_0"], obs["robot_1"]]).astype(np.float32), info
+
+    def step(self, actions):
+        actions = np.asarray(actions, dtype=np.int32)
+        obs, rewards, done, truncated, info = self.env.step(actions)
+        team_obs = np.concatenate([obs["robot_0"], obs["robot_1"]]).astype(np.float32)
+        team_reward = float(getattr(self.env, "last_team_reward", float(rewards[0]) + float(rewards[1])))
+        return team_obs, team_reward, done, truncated, info
+
+    def action_masks(self) -> np.ndarray:
+        """Flat mask for MultiDiscrete([9, 9]) — robot 0 then robot 1."""
+        return np.concatenate([
+            self.env.action_masks(robot_id=0),
+            self.env.action_masks(robot_id=1),
+        ])
+
+    def render(self):
+        return self.env.render()
+
+    def close(self):
+        self.env.close()
+
+    def _get_episode_scores(self) -> tuple[float, float]:
+        return (float(self.env.field.my_score),
+                float(self.env.field.opponent_score))
+
+    def _get_reward_breakdown(self) -> dict:
+        bd = getattr(self.env, "last_reward_breakdown", None)
+        if not bd:
+            return {}
+        merged: dict = {}
+        for i, part in enumerate(bd):
+            if part:
+                for k, v in part.items():
+                    merged[f"r{i}_{k}"] = v
+        return merged
+
+    def apply_training_stats(self, stats: dict) -> None:
+        renderer = getattr(self.env, "_renderer", None)
+        if renderer is None:
+            return
+        renderer.training_stats.update(stats)
+
+    def apply_curriculum_config(self, config: dict) -> None:
+        _apply_curriculum_config(self.env, config)
+
+
+def make_training_wrapper(num_allies: int, **kwargs):
+    """Return SingleAgentWrapper (1 ally) or TeamAgentWrapper (2 allies)."""
+    if num_allies >= 2:
+        return TeamAgentWrapper(num_allies=2, **kwargs)
+    return SingleAgentWrapper(num_allies=1, **kwargs)

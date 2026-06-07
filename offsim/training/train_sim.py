@@ -1,17 +1,14 @@
-"""MaskablePPO training — single blue robot, no opponents, 60-second episodes.
+"""MaskablePPO training — 1- or 2-robot blue team, 60-second episodes.
 
 Uses sb3-contrib MaskablePPO so invalid actions (score with no balls,
 descore when nothing is scored, etc.) are never sampled by the policy.
 
 Usage:
-    python main.py train --timesteps 1000000 --n-envs 4
+    python main.py train --num-allies 2 --timesteps 2000000 --n-envs 4
+    python main.py train --num-allies 1 --timesteps 1000000 --n-envs 4
 
-The robot:
-  - Starts with randomised ball layout each episode.
-  - Has access to 10 actions (collect, score long/center, descore, eject, regions, idle).
-  - Invalid actions are masked per-step via env.action_masks().
-  - Receives per-decision reward based on blue-ball scores, avoiding red-ball
-    scores (which give the opponent points), and quadrant control.
+2-robot (2v2) training uses TeamAgentWrapper: both allies act each decision,
+team reward is the sum of per-robot rewards, obs is concat(robot_0, robot_1).
 """
 
 from __future__ import annotations
@@ -38,10 +35,10 @@ except ImportError as e:
     ) from e
 print("[train] Using MaskablePPO (sb3-contrib) — action masks active")
 
-from sim.env import SingleAgentWrapper
+from sim.env import make_training_wrapper
 from sim.config import Action
 from sim.failure import FailureConfig
-from training.curriculum import CurriculumCallback
+from training.curriculum import CurriculumCallback, stages_for_allies
 from training.callbacks import ScoreLoggingCallback
 
 
@@ -66,28 +63,34 @@ def _failure_config(level: str) -> FailureConfig:
     return FailureConfig.none()
 
 
-def make_env(render_mode=None, use_timer=True, num_opponents=0,
-             opponent_type="random", failure_level="none"):
-    """Return a callable that creates a fresh SingleAgentWrapper episode.
+def make_env(render_mode=None, use_timer=True, num_allies=2, num_opponents=0,
+             opponent_type="random", failure_level="none",
+             all_blue_only: bool = False,
+             log_decisions: bool = False, log_dir: str = "logs"):
+    """Return a callable that creates a fresh training-wrapper episode.
 
+    num_allies selects SingleAgentWrapper (1) or TeamAgentWrapper (2).
     num_opponents / opponent_type / failure_level set the FIXED regime for this
     env. Under the staged curriculum these are only the Stage-1 starting point
-    (0 opponents, no failures) and CurriculumCallback overrides them live; with
-    --no-curriculum they are the regime for the entire run.
+    and CurriculumCallback overrides them live; with --no-curriculum they are
+    the regime for the entire run.
 
     When render_mode == "human", the renderer is primed inside the worker so
     the pygame window opens on that worker's process (important for
     SubprocVecEnv where each worker is its own process and gets its own window).
     """
     def _init():
-        env = SingleAgentWrapper(
+        env = make_training_wrapper(
+            num_allies=num_allies,
             render_mode=render_mode,
             failure_config=_failure_config(failure_level),
             opponent_type=opponent_type,
-            num_allies=1,
             num_opponents=num_opponents,
             use_timer=use_timer,
+            log_decisions=log_decisions,
+            log_dir=log_dir,
         )
+        env.env.all_blue_only = bool(all_blue_only)
         if render_mode == "human":
             env.render()   # open pygame window in this worker's process
         return env
@@ -208,8 +211,18 @@ class EpisodeStatsCallback(BaseCallback):
             # Per-env action label (each subproc renders its own robot's choice)
             if actions is not None and i < len(actions):
                 try:
-                    per_env["last_action"] = Action(int(actions[i])).name[:16]
-                except ValueError:
+                    act = actions[i]
+                    if hasattr(act, "__len__") and not isinstance(act, (str, bytes)):
+                        labels = []
+                        for a in act:
+                            try:
+                                labels.append(Action(int(a)).name[:12])
+                            except (ValueError, TypeError):
+                                labels.append(str(a))
+                        per_env["last_action"] = "+".join(labels)
+                    else:
+                        per_env["last_action"] = Action(int(act)).name[:16]
+                except (ValueError, TypeError):
                     per_env["last_action"] = str(actions[i])
             # Per-env reward breakdown (each panel shows its own components)
             if breakdowns is not None and breakdowns[i]:
@@ -237,9 +250,12 @@ def train(
     render: bool = False,
     device: str = "auto",
     use_curriculum: bool = True,
+    num_allies: int = 2,
     num_opponents: int = 0,
     opponent_type: str = "random",
     failure_level: str = "none",
+    log_decisions: bool = False,
+    log_dir: str = "logs",
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -249,9 +265,14 @@ def train(
     # solo phase and an opponent phase can be run as separate, compounding
     # invocations (each --resume-ing into the same model).
     if use_curriculum:
-        start_opps, start_type, start_fail = 0, "random", "none"
+        start_stage = stages_for_allies(num_allies)[0][1]
+        start_opps = int(start_stage.get("num_opponents", 0))
+        start_type = str(start_stage.get("opponent_type", "random"))
+        start_fail = "none"
+        start_all_blue = bool(start_stage.get("all_blue_only", False))
     else:
         start_opps, start_type, start_fail = num_opponents, opponent_type, failure_level
+        start_all_blue = False
 
     # Render mode:
     #   n_envs == 1 → in-process DummyVecEnv with one pygame window
@@ -260,28 +281,35 @@ def train(
     rendered_env = None
     if render:
         if n_envs == 1:
-            rendered_env = SingleAgentWrapper(
+            rendered_env = make_training_wrapper(
+                num_allies=num_allies,
                 render_mode="human",
                 failure_config=_failure_config(start_fail),
                 opponent_type=start_type,
-                num_allies=1,
                 num_opponents=start_opps,
                 use_timer=True,
+                log_decisions=log_decisions,
+                log_dir=log_dir,
             )
+            rendered_env.env.all_blue_only = start_all_blue
             rendered_env.render()
             train_env = DummyVecEnv([lambda: rendered_env])
         else:
             train_env = make_vec_env(
                 make_env(render_mode="human", use_timer=True,
-                         num_opponents=start_opps, opponent_type=start_type,
-                         failure_level=start_fail),
+                         num_allies=num_allies, num_opponents=start_opps,
+                         opponent_type=start_type, failure_level=start_fail,
+                         all_blue_only=start_all_blue,
+                         log_decisions=log_decisions, log_dir=log_dir),
                 n_envs=n_envs,
                 vec_env_cls=SubprocVecEnv,
             )
     else:
         train_env = make_vec_env(
-            make_env(use_timer=True, num_opponents=start_opps,
-                     opponent_type=start_type, failure_level=start_fail),
+            make_env(use_timer=True, num_allies=num_allies,
+                     num_opponents=start_opps, opponent_type=start_type,
+                     failure_level=start_fail, all_blue_only=start_all_blue,
+                     log_decisions=log_decisions, log_dir=log_dir),
             n_envs=n_envs,
             vec_env_cls=SubprocVecEnv,
         )
@@ -289,14 +317,17 @@ def train(
     # Eval env — single process, timer on (always headless). Matches the run's
     # regime so the "best model" is judged under the same conditions it trains in.
     eval_env = make_vec_env(
-        make_env(use_timer=True, num_opponents=start_opps,
-                 opponent_type=start_type, failure_level=start_fail),
+        make_env(use_timer=True, num_allies=num_allies,
+                 num_opponents=start_opps, opponent_type=start_type,
+                 failure_level=start_fail, all_blue_only=start_all_blue),
         n_envs=1,
     )
 
     callbacks = []
     if use_curriculum:
-        callbacks.append(CurriculumCallback(verbose=1))
+        callbacks.append(CurriculumCallback(
+            stages=stages_for_allies(num_allies), eval_env=eval_env, verbose=1,
+        ))
     callbacks += [
         CheckpointCallback(
             save_freq=max(checkpoint_freq // n_envs, 1),
@@ -403,15 +434,20 @@ def train(
     except ImportError:
         use_pbar = False
 
+    team_label = f"{num_allies} ally/allies vs {start_opps} opponent(s)"
     if use_curriculum:
-        regime = "staged curriculum (solo -> opponents over time)"
+        regime = f"staged curriculum ({team_label}, ramping over time)"
     else:
-        regime = f"fixed regime: {start_opps} opponent(s)"
+        regime = f"fixed regime: {team_label}"
         if start_opps > 0:
             regime += f" [{start_type}]"
         regime += f", failures={start_fail}"
     print(f"\nTraining {n_envs} env(s) x {total_timesteps:,} new timesteps -- {regime}"
           f"{' [render]' if render else ''}")
+    if render and use_curriculum and start_opps == 0:
+        print("[train] Curriculum starts all-blue/no-opponent, adds a random opponent "
+              "at ~500K steps, then full 2v2 at ~800K. Use --opponents 2 "
+              "for a full 2v2 stress test from the start.")
     print(f"Checkpoints every {checkpoint_freq:,} steps -> {os.path.join(output_dir, 'checkpoints')}")
     print(f"Ctrl+C at any time saves current model to {os.path.join(output_dir, 'interrupted_model.zip')}\n")
 

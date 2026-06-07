@@ -30,6 +30,7 @@ the last decision earned what it did.
 
 import math
 from sim.config import Action, BALL_BLUE, BALL_RED, CONTROL_BONUS_PTS, MATCH_DURATION, OBJ_ON_FIELD
+from sim.action_helpers import SCORE_ACTIONS, DESCORE_ACTIONS, is_ram_action, is_chassis_only
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +40,10 @@ REWARD_WEIGHTS: dict[str, float] = {
     # ── Scoring (the actual game goal — generous per-action shaping) ─────
     "score_blue":           +2.0,    # +6.0 per blue ball scored (3 pts)
     "score_red":            -3.0,    # -9.0 per red ball scored — opp's points hurt
-    "center_bonus":         +0.5,    # +1.5 extra per ball scored in mid/low goal
+    "center_bonus":         +0.15,   # small center encouragement, not a dominant strategy
     # ── Field activity ──────────────────────────────────────────────────
-    "collect":              +0.10,   # per blue ball collected (try_collect skips red)
-    "collect_red":          -0.50,   # safety: penalty if a red ball is held anyway
+    "collect":              +0.35,   # per blue ball collected: dense early learning signal
+    "collect_red":          -0.05,   # rejected by auto color-sort; light event cost only
     # ── Quadrant control — VEX endgame is decided here ─────────────────
     "ctrl_us":              +0.20,   # +2.0 per held quadrant per decision
     "ctrl_opp":             -0.15,   # opp holding a quadrant hurts
@@ -66,7 +67,8 @@ REWARD_WEIGHTS: dict[str, float] = {
     # ── Goal spread — reward diversifying into multiple goal areas ──────────
     "goal_diversity":       +0.30,   # per extra distinct goal zone with ≥1 blue ball
     # ── Opponent goal threat — continuous pressure to descore proactively ──
-    "opp_goal_threat":      -0.20,   # per decision: -(opp_balls_opp_long + opp_balls_center)
+    "opp_goal_threat":      -0.08,   # lighter early pressure; descore comes after scoring skill
+    "home_long_score":      +0.20,   # lane-role bonus per point scored into each robot's long goal
     # ── Phase objectives — "win early and decisively" ───────────────────
     "margin_milestone_10":  +5.0,    # one-time at margin ≥ 10 with > 50% time left
     "margin_milestone_20":  +10.0,   # one-time at margin ≥ 20 with > 25% time left
@@ -125,6 +127,13 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     # Center-goal bonus
     center_pts = float(getattr(env, "center_score_events", [0, 0])[robot_id])
     comps["center_bonus"] = center_pts * w["center_bonus"]
+    action = env.current_actions[robot_id]
+    home_long_pts = 0.0
+    if robot_id == 0 and action == Action.SCORE_LEFT_LONG_GOAL_ALLIANCE:
+        home_long_pts = float(getattr(env, "score_events", [0, 0])[robot_id])
+    elif robot_id == 1 and action == Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE:
+        home_long_pts = float(getattr(env, "score_events", [0, 0])[robot_id])
+    comps["home_long_score"] = home_long_pts * w["home_long_score"]
 
     # Collection signal (blue only — try_collect filters red at the action level)
     red_collected  = int(getattr(env, "red_collected_this_step", [0, 0])[robot_id])
@@ -158,8 +167,11 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     comps["opp_goal_threat"] = threat * w["opp_goal_threat"]
 
     # Scoring volume — linear ramp: negative below 8 blue balls in goals, positive above.
+    # Includes the left long goal: blue balls there are valuable for left-side
+    # contest/control, not merely "opponent goal" noise.
     # Gives per-decision pressure to keep scoring rather than stopping at a thin lead.
     blue_in_goals = (
+        sum(1 for _, c in gs.opp_long   if c == BALL_BLUE) +
         sum(1 for _, c in gs.our_long   if c == BALL_BLUE) +
         sum(1 for _, c in gs.center_mid if c == BALL_BLUE) +
         sum(1 for _, c in gs.center_low if c == BALL_BLUE)
@@ -167,9 +179,10 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     comps["scoring_volume"] = (blue_in_goals - 8) * w["scoring_volume"]
 
     # Goal diversity — extra reward for having blue balls in multiple distinct goal areas.
-    # Spreading across our_long / center_mid / center_low populates the outer-end tips
+    # Spreading across long / center goals populates the outer-end tips
     # that determine control-zone ownership, so this directly incentivises zone control.
     zones_with_blue = (
+        (1 if any(c == BALL_BLUE for _, c in gs.opp_long)    else 0) +
         (1 if any(c == BALL_BLUE for _, c in gs.our_long)    else 0) +
         (1 if any(c == BALL_BLUE for _, c in gs.center_mid)  else 0) +
         (1 if any(c == BALL_BLUE for _, c in gs.center_low)  else 0)
@@ -177,8 +190,7 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     comps["goal_diversity"] = max(0, zones_with_blue - 1) * w["goal_diversity"]
 
     # Context-aware idle penalty
-    action = env.current_actions[robot_id]
-    if action == Action.IDLE:
+    if action == Action.STOP:
         comps["idle"] = w["idle"]
         # Extra penalty when idling while losing (including control-zone score)
         effective_my  = float(env.field.my_score)       + our_ctrl
@@ -208,28 +220,20 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     )
 
     # Wasted-action penalty
-    score_actions   = (Action.SCORE_LONG_GOAL, Action.SCORE_CENTER_MID, Action.SCORE_CENTER_LOW)
-    descore_actions = (Action.DESCORE_OPP_LONG, Action.DESCORE_CENTER)
+    score_actions   = tuple(SCORE_ACTIONS)
+    descore_actions = tuple(DESCORE_ACTIONS)
     held_at_start = int(getattr(env, "balls_held_at_step_start", [0, 0])[robot_id])
     scored   = float(env.score_events[robot_id])
     descored = float(env.descore_events[robot_id])
     wasted = 0.0
-    # SCORE penalty only fires if no collect happened either (chain-back didn't get a ball)
     if action in score_actions and held_at_start == 0 and scored == 0:
         collected = int(getattr(env, "collected_this_step", [0, 0])[robot_id])
         if collected == 0:
             wasted += w["wasted_action"]
     if action in descore_actions and descored == 0:
         wasted += w["wasted_action"]
-    if action == Action.DEFEND_ZONE:
-        num_opp = int(getattr(env, "num_opponents", 0))
-        our_long_balls = len(getattr(env.field.goal_state, "our_long", []))
-        if num_opp == 0 or our_long_balls == 0:
-            wasted += w["wasted_action"]
-    if action == Action.EJECT_WRONG_COLOR:
-        ejected = float(getattr(env, "eject_events", [0, 0])[robot_id])
-        if ejected == 0:
-            wasted += w["wasted_action"]
+    if is_ram_action(action) or is_chassis_only(action):
+        pass
     comps["wasted_action"] = wasted
 
     # Holding urgency
@@ -306,3 +310,40 @@ def compute_reward(env, robot_id: int) -> float:
     comps = _reward_components(env, robot_id)
     env.last_reward_breakdown[robot_id] = comps
     return float(sum(comps.values()))
+
+
+_GLOBAL_TEAM_KEYS = frozenset({
+    "score_blue",
+    "score_red",
+    "ctrl_us",
+    "ctrl_opp",
+    "ctrl_gain",
+    "ctrl_loss",
+    "all_quadrants",
+    "opp_goal_threat",
+    "scoring_volume",
+    "goal_diversity",
+    "margin_milestone",
+    "episode_end",
+    "episode_end_zero",
+})
+
+
+def compute_team_reward(env) -> float:
+    """Team reward for TeamAgentWrapper: global terms once, robot terms per robot."""
+    breakdowns = getattr(env, "last_reward_breakdown", None)
+    if not breakdowns or not breakdowns[0] or not breakdowns[1]:
+        return float(sum(sum(part.values()) for part in (breakdowns or []) if part))
+
+    team_total = 0.0
+    # Global components are identical team-state signals. Count them once to
+    # avoid doubling value targets in the centralized 2-robot policy.
+    for key in _GLOBAL_TEAM_KEYS:
+        team_total += float(breakdowns[0].get(key, 0.0))
+
+    for part in breakdowns[:2]:
+        for key, value in part.items():
+            if key not in _GLOBAL_TEAM_KEYS:
+                team_total += float(value)
+
+    return float(team_total)

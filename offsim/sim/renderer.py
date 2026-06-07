@@ -207,6 +207,7 @@ class PygameRenderer:
         self.wasd_intake_on      = False   # I toggles intake on/off
         self.wasd_score_on       = False   # F toggles scoring on/off
         self.queued_manual_action: int | None = None  # set by clicking an action button
+        self.action_panel_scroll  = 0              # scroll offset for full action list
 
         # State editor
         self.selected_ball = -1           # index into field.objects, -1 = none
@@ -326,6 +327,10 @@ class PygameRenderer:
                     signals["mouse_left"] = event.pos
                 elif event.button == 3: # right click
                     signals["mouse_right"] = event.pos
+                elif event.button == 4 and self.wasd_mode:  # scroll up
+                    self.action_panel_scroll = max(0, self.action_panel_scroll - 1)
+                elif event.button == 5 and self.wasd_mode:  # scroll down
+                    self.action_panel_scroll += 1
 
         # Read held keys for WASD movement + F score (updated every frame)
         if self.wasd_mode:
@@ -921,13 +926,24 @@ class PygameRenderer:
             pygame.draw.line(self.screen, (90, 90, 90), (sx, sy), (tx, ty), 1)
             pygame.draw.circle(self.screen, (140, 140, 140), (tx, ty), 3)
 
-        # Label (below robot)
+        # Label (below robot) — current action for allies and opponents
         action_name = ""
-        if hasattr(env, "current_actions") and is_ally:
+        if is_ally and hasattr(env, "current_actions"):
             for i, ally in enumerate(env.field.allies):
                 if ally is robot:
-                    action_name = Action(env.current_actions[i]).name[:12]
+                    action_name = Action(int(env.current_actions[i])).name[:12]
                     break
+        elif not is_ally:
+            opp_actions = getattr(env, "_opp_live_actions", None)
+            if opp_actions is not None:
+                for i, opp in enumerate(env.field.opponents):
+                    if opp is robot and i < len(opp_actions):
+                        act = opp_actions[i]
+                        action_name = (
+                            act.name[:12] if isinstance(act, Action)
+                            else Action(int(act)).name[:12]
+                        )
+                        break
         intake_sym = ">" if getattr(robot, "intake_active", False) else "|"
         lbl = f"{label_prefix}{intake_sym}({robot.balls_held}) {action_name}"
         surf = self.font_sm.render(lbl, True, WHITE)
@@ -1979,7 +1995,7 @@ class PygameRenderer:
             # Context line (what robot is doing)
             ctx = ""
             col2 = LIGHT_GRAY
-            if act == Act.SCORE_LONG_GOAL:
+            if act is not None and act.name.startswith("SCORE"):
                 from sim.config import OUR_LONG_GOAL, OPP_LONG_GOAL
                 if robot.x >= FIELD_W / 2:
                     goal_pos, goal_name = OUR_LONG_GOAL, "R.Goal"
@@ -1993,7 +2009,7 @@ class PygameRenderer:
                     col2 = YELLOW
                 else:
                     ctx = f"-> {goal_name} {dist:.0f}\"  (navigating)"
-            elif act == Act.COLLECT_NEAREST_BALL:
+            elif act == Act.COLLECT_BLOCKS:
                 route = compute_collection_route(
                     robot.position, env.field,
                     already_held=held, max_volley=1, robot=robot,
@@ -2007,10 +2023,62 @@ class PygameRenderer:
                 else:
                     ctx = "no accessible balls"
                     col2 = LIGHT_RED
-            elif act == Act.IDLE:
+            elif act == Act.STOP:
                 ctx = "idle"
             else:
                 ctx = act_name.lower()
+            self.screen.blit(self.font_sm.render(ctx, True, col2), (px + 6, y + 34))
+
+            y += 56
+
+        num_opponents = getattr(env, "num_opponents", 0)
+        opp_actions = getattr(env, "_opp_live_actions", [Act.STOP, Act.STOP])
+        for i in range(num_opponents):
+            robot = env.field.opponents[i]
+            r_col = LIGHT_RED if i == 0 else (255, 180, 180)
+
+            act = opp_actions[i] if i < len(opp_actions) else Act.STOP
+            if isinstance(act, int):
+                act = Act(act)
+            act_name = act.name
+
+            card = pygame.Rect(px, y, bw, 52)
+            pygame.draw.rect(self.screen, SECTION_BG, card, border_radius=4)
+            pygame.draw.rect(self.screen, r_col, card, 1, border_radius=4)
+
+            held = robot.balls_held
+            held_str = f"{held} ball{'s' if held != 1 else ''}" if held > 0 else "empty"
+            hdr = f"O{i}  ({held_str})"
+            self.screen.blit(self.font.render(hdr, True, r_col), (px + 6, y + 3))
+            act_surf = self.font_sm.render(act_name, True, YELLOW)
+            self.screen.blit(act_surf, (card.right - act_surf.get_width() - 8, y + 4))
+
+            pos_line = f"({robot.x:.0f}, {robot.y:.0f})  {_user_heading_label(robot.heading)}"
+            self.screen.blit(self.font_sm.render(pos_line, True, LIGHT_GRAY), (px + 6, y + 19))
+
+            ctx = ""
+            col2 = LIGHT_GRAY
+            if act is not None and act.name.startswith("SCORE"):
+                from sim.config import OUR_LONG_GOAL, OPP_LONG_GOAL
+                if robot.x >= FIELD_W / 2:
+                    goal_pos, goal_name = OPP_LONG_GOAL, "L.Goal"
+                else:
+                    goal_pos, goal_name = OUR_LONG_GOAL, "R.Goal"
+                dist = float(np.linalg.norm(robot.position - goal_pos))
+                if robot.score_timer > 0 and held > 0:
+                    fill = int(robot.score_timer / (1.5 / max(held, 1)) * 5)
+                    bar = "\u2593" * fill + "\u2591" * (5 - fill)
+                    ctx = f"-> {goal_name} {dist:.0f}\"  [{bar}]"
+                    col2 = YELLOW
+                else:
+                    ctx = f"-> {goal_name} {dist:.0f}\"  (navigating)"
+            elif act == Act.COLLECT_BLOCKS:
+                ctx = "collecting" if robot.moving else "searching"
+                col2 = GREEN if robot.moving else LIGHT_GRAY
+            elif act == Act.STOP:
+                ctx = "idle"
+            else:
+                ctx = act_name.lower().replace("_", " ")
             self.screen.blit(self.font_sm.render(ctx, True, col2), (px + 6, y + 34))
 
             y += 56
@@ -2022,7 +2090,7 @@ class PygameRenderer:
 
         Order: left = lst[0] (south/SW/SE end), right = lst[-1] (north/NE/NW end).
         Direction label shows which end is the 'entry' for each goal type.
-        Capacity: long goals = 14, center goals = 7.
+        Capacity: long goals = 12, center goals = 7.
         """
         y  = y_start
         px = FIELD_PX + 10
@@ -2036,8 +2104,8 @@ class PygameRenderer:
         GAP = 1     # gap between squares
 
         all_goals = [
-            ("our_long",   "R.Long",    LIGHT_BLUE, "S", "N",  14),
-            ("opp_long",   "L.Long",    LIGHT_RED,  "S", "N",  14),
+            ("our_long",   "R.Long",    LIGHT_BLUE, "S", "N",  12),
+            ("opp_long",   "L.Long",    LIGHT_RED,  "S", "N",  12),
             ("center_mid", "Mid Goal",  ORANGE,     "SW","NE",  7),
             ("center_low", "Low Goal",  YELLOW,     "SE","NW",  7),
         ]
@@ -2230,43 +2298,49 @@ class PygameRenderer:
         return y
 
     def _draw_panel_wasd_actions(self, env, y_start: int, mouse) -> int:
-        """Clickable RL action buttons for WASD manual testing mode."""
-        from sim.config import Action as _Action
+        """Clickable RL action buttons for WASD manual testing mode (full 23-action space)."""
+        from sim.config import Action as _Action, ACTION_NAMES, NUM_ACTIONS
         px = FIELD_PX + 10
         bw = PANEL_W - 20
         y  = y_start
+        row_h = 18
+        panel_bottom = SCREEN_H - 120
 
         running_act = getattr(env, "_manual_rl_action", None)
+        all_actions = [(_Action(i), ACTION_NAMES[i]) for i in range(NUM_ACTIONS)]
+        max_scroll = max(0, len(all_actions) * row_h - max(0, panel_bottom - y))
+        self.action_panel_scroll = int(np.clip(self.action_panel_scroll, 0, max_scroll))
 
-        _ACTIONS = [
-            (_Action.COLLECT_NEAREST_BALL, "COLLECT NEAREST BLUE"),
-            (_Action.SCORE_LONG_GOAL,      "SCORE LONG GOAL"),
-            (_Action.SCORE_CENTER_MID,     "SCORE CENTER MID"),
-            (_Action.SCORE_CENTER_LOW,     "SCORE CENTER LOW"),
-            (_Action.DESCORE_OPP_LONG,     "DESCORE OPP LONG"),
-            (_Action.DESCORE_CENTER,       "DESCORE CENTER"),
-            (_Action.DEFEND_ZONE,          "DEFEND ZONE"),
-            (_Action.EJECT_WRONG_COLOR,    "EJECT WRONG COLOR"),
-            (_Action.IDLE,                 "IDLE"),
-        ]
+        if max_scroll > 0:
+            hint = self.font_sm.render("Scroll wheel for more actions", True, (110, 110, 120))
+            self.screen.blit(hint, (px, y))
+            y += 14
 
-        for act, label in _ACTIONS:
-            rect = pygame.Rect(px, y, bw, 22)
+        draw_y = y - self.action_panel_scroll
+        for act, label in all_actions:
+            rect = pygame.Rect(px, draw_y, bw, row_h - 2)
+            if draw_y + row_h < y or draw_y > panel_bottom:
+                draw_y += row_h
+                continue
+            short = label if len(label) <= 34 else (label[:31] + "...")
             is_running = (running_act == int(act))
             col = GREEN if is_running else None
-            self._draw_btn(rect, label, active=True, color_override=col, mouse=mouse)
+            self._draw_btn(rect, short, active=True, color_override=col, mouse=mouse)
             if self._click_this_frame and rect.collidepoint(self._click_this_frame):
                 self.queued_manual_action = int(act)
-                self._click_this_frame = None   # consume the click
-            y += 26
+                self._click_this_frame = None
+            draw_y += row_h
 
-        # Status line: show remaining ticks if an action is running
+        y = min(draw_y + self.action_panel_scroll, panel_bottom)
+
         ticks_left = getattr(env, "_manual_rl_ticks_left", 0)
         if running_act is not None:
-            status = f"Running... {ticks_left} ticks left"
+            from sim.config import ACTION_NAMES as _NAMES
+            name = _NAMES[int(running_act)]
+            status = f"Running {name[:28]}... {ticks_left}t"
             col = GREEN
         else:
-            status = "Click an action to test it"
+            status = "Click any of 23 actions to test"
             col = LIGHT_GRAY
         self.screen.blit(self.font_sm.render(status, True, col), (px, y))
         y += 16
