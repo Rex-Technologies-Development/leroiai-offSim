@@ -68,7 +68,10 @@ REWARD_WEIGHTS: dict[str, float] = {
     "goal_diversity":       +0.30,   # per extra distinct goal zone with ≥1 blue ball
     # ── Opponent goal threat — continuous pressure to descore proactively ──
     "opp_goal_threat":      -0.08,   # lighter early pressure; descore comes after scoring skill
-    "home_long_score":      +0.20,   # lane-role bonus per point scored into each robot's long goal
+    "home_long_score":      +0.30,   # lane-role bonus per point scored into each robot's lane-home long
+    # ── Long-goal emphasis + descore (strategic shaping) ─────────────────
+    "long_volume":          +0.10,   # per blue ball RESTING in this robot's lane-home long (keep blocks in long)
+    "descore":              +0.25,   # per opponent point descored (clear invaders, esp. from an owned long)
     # ── Phase objectives — "win early and decisively" ───────────────────
     "margin_milestone_10":  +5.0,    # one-time at margin ≥ 10 with > 50% time left
     "margin_milestone_20":  +10.0,   # one-time at margin ≥ 20 with > 25% time left
@@ -189,6 +192,17 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     )
     comps["goal_diversity"] = max(0, zones_with_blue - 1) * w["goal_diversity"]
 
+    # Long-goal volume — reward blue balls RESTING in this robot's lane-home long
+    # (R0 = left/opp_long, R1 = right/our_long). Tilts the default strategy toward
+    # stuffing the long goal rather than spreading for control.
+    home_long = "opp_long" if robot_id == 0 else "our_long"
+    blue_in_home_long = sum(1 for _, c in getattr(gs, home_long) if c == BALL_BLUE)
+    comps["long_volume"] = blue_in_home_long * w["long_volume"]
+
+    # Descore reward — clearing opponent balls (the sanctioned move when they own a long).
+    descored_pts = float(getattr(env, "descore_events", [0, 0])[robot_id])
+    comps["descore"] = descored_pts * w["descore"]
+
     # Context-aware idle penalty
     if action == Action.STOP:
         comps["idle"] = w["idle"]
@@ -297,6 +311,18 @@ def _reward_components(env, robot_id: int) -> dict[str, float]:
     else:
         comps["episode_end"] = 0.0
         comps["episode_end_zero"] = 0.0
+
+    # --- Strategic gating: modulate control-zone pursuit by the opponent's long-goal activity ---
+    #   owns  (opp holds >7 balls in either lane-home long) -> SUPPRESS control; descore + stuff long.
+    #   stall (opp added to NEITHER long for >=2 decisions)  -> BOOST control; go take mid/low.
+    #   else  -> baseline 1.0 (control still rewarded; long_volume/home_long tilt the default to long).
+    owns    = bool(getattr(env, "team_opp_owns_long", False))
+    stalled = bool(getattr(env, "team_opp_stalled", False))
+    control_gate = 0.0 if owns else (1.5 if stalled else 1.0)
+    for _k in ("ctrl_us", "ctrl_gain", "all_quadrants", "goal_diversity"):
+        comps[_k] = comps.get(_k, 0.0) * control_gate
+    # Mid/low scoring bonus only while actively pursuing control (no random mid otherwise).
+    comps["center_bonus"] = comps.get("center_bonus", 0.0) * (1.0 if control_gate > 1.0 else 0.0)
 
     return comps
 

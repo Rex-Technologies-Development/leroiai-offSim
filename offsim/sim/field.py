@@ -657,15 +657,18 @@ class Field:
         diff = abs(((robot.heading - angle_to + math.pi) % (2 * math.pi)) - math.pi)
         return diff <= _TUBE_FACE_TOL
 
-    def try_collect(self, robot: Robot) -> int | bool:
-        """Pick up a blue ball or automatically reject a wrong-color ball.
+    def _collect_into(self, robot: Robot, my_color: int) -> int | bool:
+        """Shared intake for EITHER alliance — collect a ball of `my_color`,
+        auto color-sort REJECT the opposite color out the back face.
 
-        The real robot color-sorts at the intake. In sim, a red ball that enters
-        the blue robot's intake is dropped just behind the robot with a small
-        spill velocity instead of being held or requiring a separate action.
+        Both real robots color-sort at the intake; a wrong-color ball is dropped
+        just behind the robot with a small spill velocity rather than held. Only
+        the front face (full width, _INTAKE_DEPTH reach) collects; tube balls
+        still require facing the tube within 30°.
 
-        Only the front face of the robot (full width, _INTAKE_DEPTH reach) can
-        collect. Tube balls still require the robot to face the tube within 30°.
+        Returns True on pickup, -1 on a color-sort reject, False otherwise. Blue
+        (allies) and red (opponents) both route through here so their intake
+        rules can never silently drift apart.
         """
         if robot.balls_held >= robot.capacity:
             return False
@@ -684,7 +687,7 @@ class Field:
             if tube is not None and not self._facing_toward(robot, tube):
                 return False   # must face the tube head-on
 
-            if obj.color != BALL_BLUE:
+            if obj.color != my_color:
                 # Automatic color-sort reject: drop the ball out the back face.
                 back_x = -math.cos(robot.heading)
                 back_y = -math.sin(robot.heading)
@@ -706,6 +709,10 @@ class Field:
             robot.held_object_ids.append(best_idx)
             return True
         return False
+
+    def try_collect(self, robot: Robot) -> int | bool:
+        """Allied (blue) intake — collects blue balls, rejects red."""
+        return self._collect_into(robot, BALL_BLUE)
 
     def try_score_one(self, robot: Robot, goal_pos: np.ndarray, points: int,
                        gname: str | None = None,
@@ -909,22 +916,13 @@ class Field:
     # ------------------------------------------------------------------
     # Opponent action effects
     # ------------------------------------------------------------------
-    def opp_try_collect(self, robot: Robot, rng: np.random.Generator) -> bool:
-        if robot.balls_held >= robot.capacity:
-            return False
-        best_idx, best_dist = -1, float("inf")
-        for i, obj in enumerate(self.objects):
-            if obj.status == OBJ_ON_FIELD and _in_intake_zone(robot, obj.position):
-                d = np.linalg.norm(obj.position - robot.position)
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = i
-        if best_idx >= 0:
-            self.objects[best_idx].status = OBJ_HELD
-            robot.balls_held += 1
-            robot.held_object_ids.append(best_idx)
-            return True
-        return False
+    def opp_try_collect(self, robot: Robot, rng: np.random.Generator | None = None) -> int | bool:
+        """Opponent (red) intake — collects red balls, rejects blue.
+
+        Symmetric with the allied intake: red color-sorts to its own color, so it
+        can no longer hoard blue balls (which previously got banked as red points).
+        """
+        return self._collect_into(robot, BALL_RED)
 
     def opp_try_score(self, robot: Robot, goal_pos: np.ndarray, points: int,
                        gname: str | None = None, rng: np.random.Generator | None = None,
@@ -937,14 +935,19 @@ class Field:
             gname = _goal_name(goal_pos)
         if prepend is None:
             prepend = infer_scoring_prepend(gname, goal_pos)
-        n = robot.balls_held
         scored = 0
         for idx in list(robot.held_object_ids):
-            self.objects[idx].status = OBJ_SCORED_OPP
+            color = self.objects[idx].color
+            # Status + points follow BALL COLOR (symmetric with try_score_one):
+            # a blue ball is always blue's point, a red ball always red's — no
+            # matter which alliance physically deposited it.
+            self.objects[idx].status = OBJ_SCORED_US if color == BALL_BLUE else OBJ_SCORED_OPP
             self.objects[idx].scored_in_goal = gname
-            ejected = self.goal_state.score_ball(
-                gname, idx, self.objects[idx].color, prepend=prepend,
-            )
+            ejected = self.goal_state.score_ball(gname, idx, color, prepend=prepend)
+            if color == BALL_BLUE:
+                self.my_score += points
+            else:
+                self.opponent_score += points
             scored += points
             if ejected is not None and rng is not None:
                 ej_idx, ej_color = ejected
@@ -953,7 +956,6 @@ class Field:
                     self.my_score = max(0, self.my_score - points)
                 else:
                     self.opponent_score = max(0, self.opponent_score - points)
-        self.opponent_score += scored
         robot.held_object_ids.clear()
         robot.balls_held = 0
         return scored

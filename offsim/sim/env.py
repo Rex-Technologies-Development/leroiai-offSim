@@ -152,10 +152,12 @@ def _is_center_intent(action: Action) -> bool:
     return action in _CENTER_INTENT_ACTIONS
 
 
-# Set each physics tick by VexAIEnv — True during VAIRC Isolation Period only.
-_ALLIANCE_HALF_ENFORCED: bool = True
-# Left/right x-lanes (role 0 = left, role 1 = right) — always enforced.
-_LANE_X_ENFORCED: bool = True
+# Alliance top/bottom halves are NOT confined — robots roam the full field.
+# (Kept as a flag so the VAIRC isolation rule could be re-enabled later if needed.)
+_ALLIANCE_HALF_ENFORCED: bool = False
+# Left/right x-lanes are a SOFT preference (see _action_to_target collect routing),
+# not a hard position wall — so this hard clamp stays OFF.
+_LANE_X_ENFORCED: bool = False
 
 
 def _set_isolation_lanes(enforced: bool) -> None:
@@ -1167,22 +1169,28 @@ def _action_to_target(action: Action, field: Field, robot: Robot) -> np.ndarray 
     if is_chassis_only(action):
         return _clip_to_half(_jam_recovery_for(robot, False), robot, False, action)
     if is_collect(action):
-        # Priority 1: route planner with full vision cone + LOS + strategic scoring
+        # Priority 1: route planner with full vision cone + LOS + strategic scoring.
+        # SOFT left/right preference: search this robot's OWN lane first, then the
+        # whole field if its lane has nothing reachable. So R0 (left) and R1 (right)
+        # divide the field by default, but either may cross to reach its color's balls.
         from sim.route_planner import compute_collection_route
-        route = compute_collection_route(
-            robot.position, field,
-            already_held=robot.balls_held,
-            max_volley=1,
-            robot=robot,
-            y_min=y_min, y_max=y_max,
-            x_min=x_min, x_max=x_max,
-        )
-        if route:
-            return _clip_to_half(route[0][1].copy(), robot, False, action)
-        # Priority 2: nearest ball with LOS check (ball not behind a goal)
+        lane_x_min, lane_x_max = x_bounds_for_robot(robot, action)
+        full_lo = ROBOT_W / 2.0 + 1.0
+        full_hi = FIELD_W - full_lo
+        for cx_min, cx_max in ((lane_x_min, lane_x_max), (full_lo, full_hi)):
+            route = compute_collection_route(
+                robot.position, field,
+                already_held=robot.balls_held,
+                max_volley=1,
+                robot=robot,
+                y_min=y_min, y_max=y_max,
+                x_min=cx_min, x_max=cx_max,
+            )
+            if route:
+                return _clip_to_half(route[0][1].copy(), robot, False, action)
+        # Priority 2: nearest navigable ball anywhere (x is full-field; soft lanes).
         nav = field.nearest_navigable_target(robot.position)
-        if (nav is not None and y_min <= float(nav[1]) <= y_max
-                and x_min <= float(nav[0]) <= x_max):
+        if nav is not None and y_min <= float(nav[1]) <= y_max:
             return _clip_to_half(nav, robot, False, action)
 
         # Priority 3 — no accessible target in vision cone or via LOS.
@@ -1510,6 +1518,8 @@ class VexAIEnv(gym.Env):
         # Phase-objective milestones (one-time bonuses per episode)
         # Key = margin threshold, value = already-awarded flag.
         self.score_milestones_hit: dict[int, bool] = {10: False, 20: False}
+        # Opponent long-goal occupancy tracker -> drives reward descore-vs-control gating.
+        self._reset_opp_long_tracking()
         self.done = False
 
         # Decision progress — updated each tick so renderer can show a progress bar
@@ -1585,6 +1595,7 @@ class VexAIEnv(gym.Env):
         self.prev_my_score           = 0.0
         self.prev_opp_score          = 0.0
         self.score_milestones_hit    = {10: False, 20: False}
+        self._reset_opp_long_tracking()
         self.action_pause_ticks[:]   = 0
         self.prev_action_for_pause[:] = Action.STOP
         self.done          = False
@@ -1647,6 +1658,7 @@ class VexAIEnv(gym.Env):
         self.ctrl_gain_us            = 0
         self.ctrl_gain_opp           = 0
         self.score_milestones_hit    = {10: False, 20: False}
+        self._reset_opp_long_tracking()
         self.action_pause_ticks[:]   = 0
         self.prev_action_for_pause[:] = Action.STOP
         self.done          = False
@@ -2109,10 +2121,9 @@ class VexAIEnv(gym.Env):
             return mask
         robot = self.field.allies[robot_id]
 
-        if self.num_allies >= 2:
-            for act in Action:
-                if not _role_allowed_team_action(robot, act):
-                    mask[int(act)] = False
+        # Soft left/right lanes: both robots may choose any scoring goal — a robot
+        # that crosses to collect can score where it ends up. Division of labor comes
+        # from the soft collect-routing preference, not a hard per-lane action mask.
 
         if robot.balls_held == 0:
             for act in SCORE_ACTIONS:
@@ -2446,7 +2457,9 @@ class VexAIEnv(gym.Env):
 
         for tick in range(MAX_STEP_TICKS):
             self._match_elapsed += DT
-            _set_isolation_lanes(self._match_elapsed < ISOLATION_PERIOD)
+            # Full-field play: no alliance top/bottom confinement (left/right is a
+            # soft preference handled in collect routing, not a hard y/x wall).
+            _set_isolation_lanes(False)
 
             if tick >= TICKS_PER_DECISION:
                 def _busy(i: int) -> bool:
@@ -2812,17 +2825,17 @@ class VexAIEnv(gym.Env):
                     opp_r.move_toward_point(self.opp_targets[oi])
                 _resolve_goal_collisions(opp_r)
 
-            # Per-robot left/right x-lanes always; alliance y-side only in Isolation.
+            # Keep robots on the field. _clip_to_half honors the (now-off) half/lane
+            # flags, so with full-field play this is just a wall clamp — but unlike
+            # field.clamp_robot_to_half it does NOT permanently pin allies to the
+            # bottom half (that mismatch was a bug). Re-applied after collisions,
+            # which can shove a robot past a wall.
             for idx in range(self.num_allies):
-                clamp_robot_to_half(
-                    self.field.allies[idx], False, Action(live_actions[idx]),
-                    enforce_x_lane=True,
-                )
+                a = self.field.allies[idx]
+                a.position = _clip_to_half(a.position, a, False, Action(live_actions[idx]))
             for oi in range(self.num_opponents):
-                clamp_robot_to_half(
-                    self.field.opponents[oi], True, Action(opp_live_actions[oi]),
-                    enforce_x_lane=True,
-                )
+                o = self.field.opponents[oi]
+                o.position = _clip_to_half(o.position, o, True, Action(opp_live_actions[oi]))
 
             # Robot–robot collision (all pairs: teammates and opponents).
             resolve_all_robot_collisions(
@@ -2830,15 +2843,11 @@ class VexAIEnv(gym.Env):
                 self.field.opponents[:self.num_opponents],
             )
             for idx in range(self.num_allies):
-                clamp_robot_to_half(
-                    self.field.allies[idx], False, Action(live_actions[idx]),
-                    enforce_x_lane=True,
-                )
+                a = self.field.allies[idx]
+                a.position = _clip_to_half(a.position, a, False, Action(live_actions[idx]))
             for oi in range(self.num_opponents):
-                clamp_robot_to_half(
-                    self.field.opponents[oi], True, Action(opp_live_actions[oi]),
-                    enforce_x_lane=True,
-                )
+                o = self.field.opponents[oi]
+                o.position = _clip_to_half(o.position, o, True, Action(opp_live_actions[oi]))
 
             # Refresh perceived goal state from camera FOV (after movement, so
             # headings are current). Scanning/driving past a goal updates what the
@@ -2962,6 +2971,9 @@ class VexAIEnv(gym.Env):
         self.ctrl_gain_opp = max(0, ctrl_opp_now - self.prev_ctrl_opp)
         self.prev_ctrl_us  = ctrl_us_now
         self.prev_ctrl_opp = ctrl_opp_now
+
+        # Update opponent long-goal occupancy + stall trackers (reward gating reads these).
+        self._update_opp_long_tracking()
 
         from training.reward import compute_reward, compute_team_reward
         r0 = compute_reward(self, robot_id=0)
@@ -3471,6 +3483,39 @@ class VexAIEnv(gym.Env):
                     obj.status = OBJ_SCORED_OPP
                     self.field.opponent_score += CENTER_GOAL_POINTS
                     break
+
+    def _reset_opp_long_tracking(self) -> None:
+        """Reset the opponent long-goal occupancy tracker (used by reward shaping)."""
+        self._opp_long_red_prev = [0, 0]   # red in [left/opp_long, right/our_long] last decision
+        self._opp_long_stall    = [0, 0]   # decisions since opp last grew [left, right] long
+        self.opp_owns_home_long = [False, False]
+        self.opp_long_stalled   = [False, False]
+        self.team_opp_owns_long = False
+        self.team_opp_stalled   = False
+
+    def _update_opp_long_tracking(self) -> None:
+        """Track opponent occupancy of each lane-home long goal across decisions.
+
+        Lane-home: R0 = left long (opp_long), R1 = right long (our_long). Drives the
+        reward's descore-vs-control gating: an opponent owning a long (>7 red balls)
+        suppresses control pursuit; an opponent idle on BOTH longs for >=2 decisions
+        boosts it. Call once per decision, before computing rewards.
+        """
+        gs = self.field.goal_state
+        red_now = [
+            sum(1 for _, c in gs.opp_long if c == BALL_RED),
+            sum(1 for _, c in gs.our_long if c == BALL_RED),
+        ]
+        for li in range(2):
+            if red_now[li] > self._opp_long_red_prev[li]:
+                self._opp_long_stall[li] = 0       # opponent just added a ball this decision
+            else:
+                self._opp_long_stall[li] += 1
+        self._opp_long_red_prev = red_now
+        self.opp_owns_home_long = [red_now[0] > 7, red_now[1] > 7]
+        self.opp_long_stalled   = [self._opp_long_stall[0] >= 2, self._opp_long_stall[1] >= 2]
+        self.team_opp_owns_long = bool(red_now[0] > 7 or red_now[1] > 7)
+        self.team_opp_stalled   = bool(self._opp_long_stall[0] >= 2 and self._opp_long_stall[1] >= 2)
 
     # ------------------------------------------------------------------
     # Observation builder
