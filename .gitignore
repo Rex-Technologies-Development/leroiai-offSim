@@ -26,7 +26,10 @@ offsim/models/logs/
 offsim/models/onnx/*
 !offsim/models/onnx/.gitkeep
 
-# Intentionally TRACKED (do not ignore) — these travel between machines:
-#   offsim/models/final_model.zip
-#   offsim/models/interrupted_model.zip
-#   offsim/models/best/best_model.zip
+# Override checkpoints are intentionally local/regenerable. Old Push Back model
+# artifacts were removed because their observation/action contracts are incompatible.
+models/**/*.zip
+models/*.zip
+models_stress_2m/
+offsim/models/**/*.zip
+offsim/models/*.zip

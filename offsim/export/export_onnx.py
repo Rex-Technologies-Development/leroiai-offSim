@@ -1,62 +1,23 @@
-"""Export trained SB3 policy to ONNX for Jetson deployment."""
-
+"""Export a centralized Override MaskablePPO actor to ONNX."""
 from __future__ import annotations
-import os
-import sys
-import numpy as np
+import os, sys
 import torch
 import onnx
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from sb3_contrib import MaskablePPO
-from sim.config import STATE_DIM
-
+try:
+    from ..sim.config import TEAM_STATE_DIM
+except ImportError:
+    from sim.config import TEAM_STATE_DIM
 
 class SB3PolicyWrapper(torch.nn.Module):
-    """Extracts just the actor forward pass for ONNX export.
-
-    Outputs raw, UNMASKED action logits. Action masking is applied outside the
-    graph at inference time (see validate_onnx.py / the deployment notes) — the
-    consumer sets invalid actions' logits to -inf before argmax.
-    """
-
-    def __init__(self, sb3_policy):
-        super().__init__()
-        self.features_extractor = sb3_policy.features_extractor
-        self.mlp_extractor = sb3_policy.mlp_extractor
-        self.action_net = sb3_policy.action_net
-
+    def __init__(self, policy):
+        super().__init__(); self.features_extractor=policy.features_extractor; self.mlp_extractor=policy.mlp_extractor; self.action_net=policy.action_net
     def forward(self, state):
-        features = self.features_extractor(state)
-        latent_pi, _ = self.mlp_extractor(features)
-        return self.action_net(latent_pi)
-
+        features=self.features_extractor(state); latent,_=self.mlp_extractor(features); return self.action_net(latent)
 
 def export_to_onnx(model_path: str, output_path: str):
-    print(f"Loading model from {model_path}...")
-    model = MaskablePPO.load(model_path)
-    policy = model.policy
-    policy.eval()
-
-    # Single-robot observation — matches SingleAgentWrapper used in training.
-    # (The policy controls one robot; an opponent affects the world but not the
-    # observation width.)
-    input_dim = STATE_DIM
-    dummy = torch.randn(1, input_dim, dtype=torch.float32)
-
-    wrapper = SB3PolicyWrapper(policy)
-    wrapper.eval()
-
-    print(f"Exporting to {output_path}...")
-    torch.onnx.export(
-        wrapper, dummy, output_path,
-        input_names=["state"],
-        output_names=["action_logits"],
-        dynamic_axes={"state": {0: "batch"}, "action_logits": {0: "batch"}},
-        opset_version=17,
-    )
-
-    onnx_model = onnx.load(output_path)
-    onnx.checker.check_model(onnx_model)
-    print(f"ONNX check passed. Saved to {output_path}")
+    model=MaskablePPO.load(model_path); wrapper=SB3PolicyWrapper(model.policy).eval(); dummy=torch.zeros(1,TEAM_STATE_DIM,dtype=torch.float32)
+    os.makedirs(os.path.dirname(output_path) or ".",exist_ok=True)
+    torch.onnx.export(wrapper,dummy,output_path,input_names=["team_state"],output_names=["action_logits"],dynamic_axes={"team_state":{0:"batch"},"action_logits":{0:"batch"}},opset_version=17)
+    exported=onnx.load(output_path); onnx.checker.check_model(exported); print(f"saved {output_path}; input={TEAM_STATE_DIM}, output={exported.graph.output[0].name}")

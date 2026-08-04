@@ -1,602 +1,116 @@
-"""VEX AI RL — single entry point for all operations.
-
-Usage:
-    python main.py demo                                    # visual sim with random actions
-    python main.py train --timesteps 2000000               # PPO training with curriculum
-    python main.py train-offline --data data/matches/      # offline RL (CQL/IQL)
-    python main.py eval --model models/final_model         # evaluate a trained policy
-    python main.py eval --model models/final_model --render # evaluate with Pygame
-    python main.py export --model models/final_model       # export to ONNX
-    python main.py validate --onnx models/onnx/model.onnx  # validate ONNX output
-"""
-
+"""Command-line entry point for the Override 2D prototype."""
+from __future__ import annotations
 import argparse
 import os
 import sys
 import numpy as np
-
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-def _home_long_score_action(robot) -> int:
-    """Default long-goal score for this robot's lane (R0=left, R1=right)."""
-    from sim.env import _home_long_score_action as _env_home_long
-    from sim.config import Action
-    return int(_env_home_long(robot))
-
-
-def _greedy_score_action(robot, env) -> int:
-    """Pick the SCORE action for the nearest reachable non-full goal."""
-    import numpy as np
-    from sim.config import Action, LONG_GOAL_CAPACITY
-    from sim.env import _score_pose_for_action
-    from sim.field import x_bounds_for_robot, y_bounds_for_robot
-
-    gs = getattr(env, "goal_belief", None) if getattr(env, "use_goal_belief", False) \
-        else None
-    if gs is None:
-        gs = env.field.goal_state
-
-    candidates = [
-        Action.SCORE_LEFT_LONG_GOAL_ALLIANCE,
-        Action.SCORE_RIGHT_LONG_GOAL_ALLIANCE,
-        Action.SCORE_MID_LEFT,
-        Action.SCORE_MID_RIGHT,
-        Action.SCORE_LOW_LEFT,
-        Action.SCORE_LOW_RIGHT,
-    ]
-    y_min, y_max = y_bounds_for_robot(robot, False, None)
-    options: list[tuple[float, int]] = []
-    for act in candidates:
-        approach, _, _, gname = _score_pose_for_action(act, robot, y_min, y_max)
-        x_min, x_max = x_bounds_for_robot(robot, act)
-        ax, ay = float(approach[0]), float(approach[1])
-        if not (x_min <= ax <= x_max and y_min <= ay <= y_max):
-            continue
-        cap = LONG_GOAL_CAPACITY if gname.endswith("long") else 7
-        if len(getattr(gs, gname)) >= cap:
-            continue
-        options.append((float(np.linalg.norm(robot.position - approach)), int(act)))
-
-    if not options:
-        return _home_long_score_action(robot)
-    options.sort(key=lambda o: o[0])
-    return options[0][1]
-
-
-def _greedy_descore_action(robot, env) -> int | None:
-    """Return a descore action when the robot is empty and opponent balls are scored."""
-    from sim.config import Action
-    from sim.env import _opponent_ball_color, _removable_count_for_long_action
-
-    if robot.balls_held > 0:
-        return None
-    gs = env.field.goal_state
-    opp_color = _opponent_ball_color(descore_as_opponent=False)
-    opp_left = sum(1 for _, c in gs.opp_long if c == opp_color)
-    opp_right = sum(1 for _, c in gs.our_long if c == opp_color)
-    if opp_left <= 0 and opp_right <= 0:
-        return None
-    if opp_left >= 2:
-        act = Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
-    elif opp_right >= 2:
-        act = Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
-    elif opp_left >= 1:
-        act = Action.DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
-    else:
-        act = Action.DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
-    if _removable_count_for_long_action(env.field, act) <= 0:
-        return None
-    return int(act)
-
-
-def _greedy_demo_action(robot_idx: int, env) -> int:
-    """Greedy demo policy: collect until full, then score the nearest goal."""
-    from sim.route_planner import compute_collection_route
-    from sim.config import Action, MAX_CARRY
-
-    robot = env.field.allies[robot_idx]
-
-    descore = _greedy_descore_action(robot, env)
-    if descore is not None:
-        return descore
-
-    if robot.balls_held >= MAX_CARRY:
-        return _greedy_score_action(robot, env)
-
-    route = compute_collection_route(
-        robot.position, env.field,
-        already_held=robot.balls_held,
-        max_volley=1,
-        robot=robot,
-    )
-    if route:
-        return int(Action.COLLECT_BLOCKS)
-    if robot.balls_held > 0:
-        return _greedy_score_action(robot, env)
-    return int(Action.COLLECT_BLOCKS)
-
-
 def cmd_demo(args):
-    """Run the sim with greedy (or random) actions and Pygame visualization."""
-    from sim.env import VexAIEnv
-    from sim.config import Action, NUM_ACTIONS
-    from sim.failure import FailureConfig
-
-    num_opponents = args.num_robots if args.num_robots >= 2 else 0
-    env = VexAIEnv(
-        render_mode="human",
-        failure_config=FailureConfig.none(),
-        opponent_type=args.opponent,
-        num_allies=args.num_robots,
-        num_opponents=num_opponents,
-    )
-    env.enable_logging(args.log_dir)
-    # No fixed seed → the ball layout (positions + colors) is randomized fresh on
-    # every run and on every reset, so no two demos start the same.
-    obs, _ = env.reset()
-    rng = np.random.default_rng()
-    episode = 1
-    total_reward = 0.0
-
-    if num_opponents > 0:
-        print(f"VEX Push Back Sim Demo — {args.num_robots} allied vs "
-              f"{num_opponents} opponent robot(s) ({args.opponent})")
-    else:
-        print(f"VEX Push Back Sim Demo — {args.num_robots} allied robot(s)")
-    print("Controls: Space=pause  S=step  H=heatmap  R=reset  +/-=speed  1/2=robot")
-    print("          Panel: AUTO PLAY = greedy policy  SCORE = force scoring")
-
-    while True:
+    from sim.env import OverrideStrategyEnv
+    render_mode = None if args.headless else "human"
+    env = OverrideStrategyEnv(chassis=args.chassis, render_mode=render_mode, opponent=args.opponent)
+    obs, info = env.reset(seed=args.seed)
+    if render_mode:
         env.render()
-        renderer = env._renderer
-
-        # On the very first tick, start running in greedy (auto-collect) mode so
-        # the demo uses the same env.step() → _build_wq → _action_to_target code
-        # path as training — features, nav logic, and logging all work identically.
-        if renderer and not getattr(renderer, "_demo_init_done", False):
-            renderer.auto_collect = True
-            renderer.paused       = False
-            renderer._demo_init_done = True
-
-        # Reset always takes priority
-        if renderer and renderer.should_reset:
-            renderer.should_reset = False
-            obs, _ = env.reset()
-            total_reward = 0.0
-            episode += 1
-            continue
-
-        if renderer and renderer.paused and not renderer.step_once:
-            continue
-        if renderer:
-            renderer.step_once = False
-
-        if renderer and renderer.demo_score:
-            # Demo scoring: force scoring (nearest non-full goal — long / mid / low)
-            # until robots have emptied all balls.
-            from sim.config import Action
-            actions = np.array([
-                _greedy_score_action(env.field.allies[0], env),
-                _greedy_score_action(env.field.allies[min(1, env.num_allies - 1)], env),
-            ])
-            # Auto-exit demo mode once all robots have finished scoring
-            all_done = all(env.field.allies[i].balls_held == 0
-                           for i in range(env.num_allies))
-            if all_done:
-                renderer.demo_score = False
-                renderer.paused = True
-        elif renderer and renderer.auto_collect:
-            # Greedy policy: collect → fill → score nearest goal → repeat
-            actions = np.array([
-                _greedy_demo_action(0, env),
-                _greedy_demo_action(min(1, env.num_allies - 1), env),
-            ])
-        else:
-            actions = np.array([rng.integers(0, NUM_ACTIONS) for _ in range(2)])
-
-        obs, rewards, done, _, _ = env.step(actions)
-        total_reward += rewards[0]
-        if args.num_robots >= 2:
-            total_reward += rewards[1]
-
-        if done:
-            print(f"Ep {episode}: Us={env.field.my_score} Opp={env.field.opponent_score} "
-                  f"Reward={total_reward:.1f}")
-            obs, _ = env.reset()
-            total_reward = 0.0
-            episode += 1
-
-    env.close()
+        env._renderer.speed = args.speed
+    matches = 0; decisions = 0
+    print(f"Override autoplay: blue 2v2 red, chassis={args.chassis}, opponent={args.opponent}")
+    if render_mode:
+        print(f"Playback: {args.speed:g}x (Space pause, S step, R reset, +/- speed)")
+    try:
+        while matches < args.matches:
+            if env._renderer:
+                if not env._renderer.running: break
+                if env._renderer.should_reset:
+                    env._renderer.should_reset = False; obs, info = env.reset(seed=args.seed); decisions = 0
+                if env._renderer.paused and not env._renderer.step_once:
+                    env.render(); continue
+                env._renderer.step_once = False
+            obs, reward, done, _, info = env.step(env.autoplay_actions()); decisions += 1
+            if args.max_decisions and decisions >= args.max_decisions: done = True
+            if done:
+                matches += 1
+                print(f"match {matches}: blue={info['blue_score']} red={info['red_score']} bonus={info['opening_bonus']} awp={info['blue_awp']}/{info['red_awp']}")
+                if matches < args.matches: obs, info = env.reset(seed=None if args.seed is None else args.seed+matches); decisions = 0
+    finally:
+        env.close()
 
 
 def cmd_train(args):
-    """PPO training in sim. Staged curriculum by default, or a fixed manual
-    regime via --no-curriculum / --opponents so you can compound your own solo
-    and opponent phases into one model with --resume."""
     from training.train_sim import train
-
-    resume_path = args.resume
-    if resume_path == "latest":
-        resume_path = _resolve_model_path("latest", output_dir=args.output_dir)
-
-    # Passing --opponents (or --no-curriculum) takes this run off the staged
-    # schedule and trains the whole run at one fixed setup.
-    manual = args.no_curriculum or (args.opponents is not None)
-    if args.opponents is not None and not args.no_curriculum:
-        print("[train] --opponents set -> disabling staged curriculum for this run.")
-    if args.failures != "none" and not manual:
-        print("[train] Note: --failures applies only with --no-curriculum/--opponents.")
-    num_opponents = args.opponents if args.opponents is not None else 0
-
-    train(
-        total_timesteps=args.timesteps,
-        n_envs=args.n_envs,
-        lr=args.lr,
-        checkpoint_freq=args.checkpoint_freq,
-        eval_freq=args.eval_freq,
-        eval_episodes=args.eval_episodes,
-        output_dir=args.output_dir,
-        resume=resume_path,
-        render=args.render,
-        device=args.device,
-        use_curriculum=not manual,
-        num_allies=args.num_allies,
-        num_opponents=num_opponents,
-        opponent_type=args.opponent_type,
-        failure_level=args.failures,
-        log_decisions=args.log_decisions,
-        log_dir=args.log_dir,
-    )
+    train(total_timesteps=args.timesteps, n_envs=args.n_envs, learning_rate=args.lr,
+          output_dir=args.output_dir, chassis=args.chassis, opponent=args.opponent,
+          device=args.device, resume=args.resume, n_steps=args.n_steps)
 
 
-def cmd_train_offline(args):
-    """Phase 3: Offline RL from match data."""
-    from training.train_offline import train
-    train(
-        data=args.data,
-        algo=args.algo,
-        n_epochs=args.n_epochs,
-        steps_per_epoch=args.steps_per_epoch,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        save_interval=args.save_interval,
-        device=args.device,
-        output_dir=args.output_dir,
-    )
-
-
-def _resolve_model_path(arg: str, output_dir: str = "models") -> str:
-    """Resolve --model arg. If 'latest', pick the freshest known model.
-
-    Search order (newest first):
-      1. models/interrupted_model.zip   (Ctrl+C save)
-      2. models/final_model.zip         (completed training)
-      3. models/checkpoints/*.zip       (most recent checkpoint by mtime)
-      4. models/best/best_model.zip     (best by eval reward)
-    """
-    import glob
-    if arg != "latest":
-        return arg
-
-    candidates = []
-    for path in [
-        os.path.join(output_dir, "interrupted_model.zip"),
-        os.path.join(output_dir, "final_model.zip"),
-    ]:
-        if os.path.exists(path):
-            candidates.append((os.path.getmtime(path), path))
-    ckpts = sorted(
-        glob.glob(os.path.join(output_dir, "checkpoints", "*.zip")),
-        key=os.path.getmtime, reverse=True,
-    )
-    if ckpts:
-        candidates.append((os.path.getmtime(ckpts[0]), ckpts[0]))
-    best = os.path.join(output_dir, "best", "best_model.zip")
-    if os.path.exists(best):
-        candidates.append((os.path.getmtime(best), best))
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"No models found under {output_dir}/. Train a model first with "
-            f"`python offsim/main.py train` or pass an explicit --model path."
-        )
-    candidates.sort(reverse=True)
-    return candidates[0][1]
-
-
-def _infer_num_allies_from_model(model_path: str) -> int:
-    """Return 1 or 2 based on saved observation space (90 vs 180 with heatmap off)."""
-    from sim.config import STATE_DIM
-
-    model = None
-    try:
-        from sb3_contrib import MaskablePPO
-        model = MaskablePPO.load(model_path, env=None, print_system_info=False)
-    except Exception:
-        pass
-    if model is None:
-        from stable_baselines3 import PPO
-        model = PPO.load(model_path, env=None, print_system_info=False)
-
-    dim = int(model.observation_space.shape[0])
-    if dim == STATE_DIM * 2:
-        return 2
-    if dim == STATE_DIM:
-        return 1
-    raise ValueError(
-        f"Model observation dim {dim} does not match STATE_DIM={STATE_DIM} "
-        f"(solo={STATE_DIM}, team={STATE_DIM * 2}). Retrain or check config."
-    )
+def _resolve_model(path, output_dir="models"):
+    if path != "latest": return path
+    candidates = [os.path.join(output_dir, name) for name in ("final_model.zip", "interrupted_model.zip")]
+    candidates = [p for p in candidates if os.path.exists(p)]
+    if not candidates: raise FileNotFoundError(f"no Override model found in {output_dir}")
+    return max(candidates, key=os.path.getmtime)
 
 
 def cmd_eval(args):
-    """Evaluate a trained policy (solo or 2-robot team)."""
-    from stable_baselines3 import PPO
-    from sim.env import make_training_wrapper
-    from sim.failure import FailureConfig
-
-    model_path = _resolve_model_path(args.model)
-    failure_config = FailureConfig(
-        teammate_fail_rate=args.failure_rate,
-        object_stolen_rate=args.failure_rate * 0.5,
-        stuck_rate=args.failure_rate * 0.25,
-        teammate_offline_rate=args.teammate_offline,
-    )
-
-    num_allies = args.num_allies
-    if num_allies is None:
-        num_allies = _infer_num_allies_from_model(model_path)
-        print(f"Auto-detected {num_allies} allied robot(s) from model observation space")
-
-    render_mode = "human" if args.render else None
-    env = make_training_wrapper(
-        num_allies=num_allies,
-        render_mode=render_mode,
-        failure_config=failure_config,
-        opponent_type=args.opponent,
-        num_opponents=args.opponents,
-        use_timer=True,
-    )
-    if args.log_decisions:
-        env.env.enable_logging(args.log_dir)
-    if render_mode:
-        env.render()
-        # The renderer starts paused by default; auto-run so the policy plays
-        # immediately instead of stopping after the first decision. (Space/RUN
-        # still toggles pause, S steps one decision.)
-        if getattr(env.env, "_renderer", None) is not None:
-            env.env._renderer.paused = False
-
-    print(f"Loading model from {model_path}...")
-
-    # Prefer MaskablePPO (sb3-contrib) for action-masked training; fall back to
-    # plain PPO for older checkpoints.
-    model = None
-    is_maskable = False
-    load_err: Exception | None = None
-    try:
-        from sb3_contrib import MaskablePPO
-        try:
-            model = MaskablePPO.load(model_path, env=env)
-            is_maskable = True
-        except Exception as e:
-            load_err = e
-    except Exception:
-        pass
-
-    if model is None:
-        try:
-            model = PPO.load(model_path)
-        except ValueError as e:
-            if "Observation spaces do not match" in str(e):
-                print(f"\n[!] Observation-space mismatch loading {model_path}.")
-                print(f"    Current env expects shape={env.observation_space.shape}.")
-                print(f"    This model was trained with a different STATE_DIM (e.g. heatmap")
-                print(f"    on/off or other observation changes). Retrain from scratch:")
-                print(f"      python offsim/main.py train --timesteps 200000")
-                raise SystemExit(1)
-            raise
-        except Exception as e:
-            if load_err is not None:
-                raise load_err
-            raise e
-
-    wins, losses, ties = 0, 0, 0
-    all_rewards, all_scores, all_opp = [], [], []
-
-    for ep in range(args.episodes):
-        obs, _ = env.reset()
-        done = False
-        ep_reward = 0.0
-
+    from sb3_contrib import MaskablePPO
+    from sb3_contrib.common.maskable.utils import get_action_masks
+    from sim.env import OverrideStrategyEnv
+    model_path = _resolve_model(args.model, args.output_dir)
+    env = OverrideStrategyEnv(chassis=args.chassis, render_mode="human" if args.render else None, opponent=args.opponent)
+    model = MaskablePPO.load(model_path, env=env, device=args.device)
+    results = []
+    for episode in range(args.episodes):
+        obs, _ = env.reset(seed=args.seed+episode); done = False; total = 0.0
         while not done:
-            if is_maskable:
-                from sb3_contrib.common.maskable.utils import get_action_masks
-                masks = get_action_masks(env)
-                action, _ = model.predict(obs, deterministic=True, action_masks=masks)
-            else:
-                action, _ = model.predict(obs, deterministic=True)
-            step_action = (
-                np.asarray(action, dtype=np.int32)
-                if num_allies >= 2 else int(action)
-            )
-            obs, reward, done, _, _ = env.step(step_action)
-            ep_reward += float(reward)
-
-            if render_mode:
-                env.render()
-                renderer = env.env._renderer
-                if renderer and renderer.paused:
-                    while renderer.paused and not renderer.step_once:
-                        renderer.handle_events()
-                    renderer.step_once = False
-
-        inner_field = env.env.field
-        diff = inner_field.my_score - inner_field.opponent_score
-        result = "WIN" if diff > 0 else ("LOSS" if diff < 0 else "TIE")
-        if diff > 0: wins += 1
-        elif diff < 0: losses += 1
-        else: ties += 1
-
-        all_rewards.append(ep_reward)
-        all_scores.append(inner_field.my_score)
-        all_opp.append(inner_field.opponent_score)
-
-        print(f"  Ep {ep+1:3d}: Us={inner_field.my_score:3d} Opp={inner_field.opponent_score:3d} "
-              f"Reward={ep_reward:7.1f} {result}")
-
-    print(f"\n{'='*50}")
-    print(f"Results ({args.episodes} episodes, opponent={args.opponent}, "
-          f"failure={args.failure_rate:.0%}):")
-    print(f"  W/L/T: {wins}/{losses}/{ties}  Win rate: {wins/args.episodes*100:.1f}%")
-    print(f"  Avg reward:  {np.mean(all_rewards):.1f} +/- {np.std(all_rewards):.1f}")
-    print(f"  Avg score:   Us={np.mean(all_scores):.1f}  Opp={np.mean(all_opp):.1f}")
-    print(f"  Avg margin:  {np.mean(all_scores)-np.mean(all_opp):.1f}")
-
+            action, _ = model.predict(obs, deterministic=True, action_masks=get_action_masks(env))
+            obs, reward, done, _, info = env.step(action); total += float(reward)
+            if args.render: env.render()
+        results.append((info["blue_score"], info["red_score"], total))
+        print(f"episode {episode+1}: blue={results[-1][0]} red={results[-1][1]} reward={total:.2f}")
     env.close()
 
 
 def cmd_export(args):
-    """Export trained model to ONNX."""
     from export.export_onnx import export_to_onnx
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    export_to_onnx(args.model, args.output)
+    export_to_onnx(_resolve_model(args.model, args.output_dir), args.output)
 
 
 def cmd_validate(args):
-    """Validate ONNX model."""
     from export.validate_onnx import validate
-    validate(args.onnx, args.model)
+    validate(args.onnx, None if args.model is None else _resolve_model(args.model, args.output_dir))
 
 
-# ======================================================================
-# Argument parser
-# ======================================================================
-def main():
-    parser = argparse.ArgumentParser(
-        description="VEX AI RL — Sim & Trainer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Override 2D simulator and MaskablePPO trainer")
     sub = parser.add_subparsers(dest="command", required=True)
+    demo = sub.add_parser("demo", help="run deterministic 2v2 autoplay")
+    demo.add_argument("--chassis", choices=["tank", "mecanum"], default="tank")
+    demo.add_argument("--opponent", choices=["greedy", "toggle", "mixed"], default="mixed")
+    demo.add_argument("--matches", type=int, default=1); demo.add_argument("--seed", type=int, default=None)
+    demo.add_argument("--speed", type=float, choices=[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0], default=1.0,
+                      help="visual playback multiplier (default: real-time 1x)")
+    demo.add_argument("--headless", action="store_true"); demo.add_argument("--max-decisions", type=int, default=0)
+    demo.set_defaults(func=cmd_demo)
+    train = sub.add_parser("train", help="train centralized two-allied strategy policy")
+    train.add_argument("--chassis", choices=["tank", "mecanum"], default="tank")
+    train.add_argument("--opponent", choices=["greedy", "toggle", "mixed"], default="mixed")
+    train.add_argument("--timesteps", type=int, default=1_000_000); train.add_argument("--n-envs", type=int, default=4)
+    train.add_argument("--n-steps", type=int, default=256); train.add_argument("--lr", type=float, default=3e-4)
+    train.add_argument("--output-dir", default="models"); train.add_argument("--resume", default=None)
+    train.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto"); train.set_defaults(func=cmd_train)
+    evaluate = sub.add_parser("eval", help="evaluate a trained Override policy")
+    evaluate.add_argument("--model", default="latest"); evaluate.add_argument("--output-dir", default="models")
+    evaluate.add_argument("--episodes", type=int, default=1); evaluate.add_argument("--seed", type=int, default=0)
+    evaluate.add_argument("--chassis", choices=["tank", "mecanum"], default="tank")
+    evaluate.add_argument("--opponent", choices=["greedy", "toggle", "mixed"], default="mixed")
+    evaluate.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto"); evaluate.add_argument("--render", action="store_true")
+    evaluate.set_defaults(func=cmd_eval)
+    export = sub.add_parser("export", help="export centralized policy logits to ONNX")
+    export.add_argument("--model", default="latest"); export.add_argument("--output-dir", default="models"); export.add_argument("--output", default="models/onnx/override.onnx"); export.set_defaults(func=cmd_export)
+    validate = sub.add_parser("validate", help="validate ONNX inference and optional SB3 parity")
+    validate.add_argument("--onnx", required=True); validate.add_argument("--model", default=None); validate.add_argument("--output-dir", default="models"); validate.set_defaults(func=cmd_validate)
+    args = parser.parse_args(argv); args.func(args)
 
-    # --- demo ---
-    p = sub.add_parser("demo", help="Visual sim with random actions")
-    p.add_argument("--opponent", default="mixed",
-                   choices=["random", "greedy", "defensive", "mixed"])
-    p.add_argument("--num-robots", type=int, default=1, choices=[1, 2],
-                   help="Number of allied robots (default: 1)")
-    p.add_argument("--log-dir", default="logs",
-                   help="Directory for decision log CSV (default: logs/)")
-    p.set_defaults(func=cmd_demo)
-
-    # --- train ---
-    p = sub.add_parser("train", help="PPO training — 1- or 2-robot team, 60s episodes")
-    p.add_argument("--timesteps", type=int, default=1_000_000)
-    p.add_argument("--n-envs", type=int, default=4)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--num-allies", "--num-robots", dest="num_allies",
-                   type=int, default=2, choices=[1, 2],
-                   help="Allied robots controlled by the policy (default: 2). "
-                        "--num-robots is accepted as a deprecated alias.")
-    p.add_argument("--checkpoint-freq", type=int, default=10_000,
-                   help="Save a checkpoint every N timesteps (default: 10000)")
-    p.add_argument("--eval-freq", type=int, default=25_000)
-    p.add_argument("--eval-episodes", type=int, default=10,
-                   help="Number of episodes per evaluation run (default: 10)")
-    p.add_argument("--output-dir", default="models")
-    p.add_argument("--resume", default=None, help="Resume from checkpoint path")
-    # Quality-of-life: allow continuing from the freshest known model.
-    # Equivalent to passing the resolved path from models/.
-    # Example: python offsim/main.py train --resume latest --timesteps 200000
-    # (still writes new checkpoints/final_model.zip into output-dir)
-    # --- Manual phase control (alternative to the staged curriculum) ---------
-    # Drive your own curriculum by hand: run a solo phase, then --resume into the
-    # SAME model for an opponent phase, etc. Phases compound because --resume
-    # loads prior weights + optimizer and continues the step counter.
-    p.add_argument("--no-curriculum", action="store_true",
-                   help="Disable the staged curriculum; train the WHOLE run at the "
-                        "fixed regime from --opponents/--opponent-type/--failures.")
-    p.add_argument("--opponents", type=int, default=None, choices=[0, 1, 2],
-                   help="Opponent count for a fixed run (0/1/2). Passing this implies "
-                        "--no-curriculum.")
-    p.add_argument("--opponent-type", default="mixed",
-                   choices=["random", "greedy", "defensive", "mixed"],
-                   help="Opponent strategy for a fixed run (default: mixed). Only used "
-                        "with --no-curriculum/--opponents.")
-    p.add_argument("--failures", default="none",
-                   choices=["none", "light", "medium"],
-                   help="Failure-injection level for a fixed run (default: none). Only "
-                        "used with --no-curriculum/--opponents.")
-    p.add_argument("--render", action="store_true",
-                   help="Show the pygame window while training. If n_envs>1, each SubprocVecEnv worker opens its own window.")
-    p.add_argument("--log-decisions", action="store_true",
-                   help="Write per-decision CSV logs for training envs (best with --n-envs 1).")
-    p.add_argument("--log-dir", default="logs",
-                   help="Directory for decision log CSV files (default: logs/).")
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
-                   help="PyTorch device for PPO. 'auto' uses CUDA if available "
-                        "(default: auto). Note: for this workload, env stepping "
-                        "is the bottleneck so CUDA only gives a modest speedup.")
-    p.set_defaults(func=cmd_train)
-
-    # --- train-offline ---
-    p = sub.add_parser("train-offline", help="Offline RL from match data")
-    p.add_argument("--data", nargs="+", required=True,
-                   help=".npz/.h5 files or directories")
-    p.add_argument("--algo", choices=["cql", "iql"], default="cql")
-    p.add_argument("--n-epochs", type=int, default=100)
-    p.add_argument("--steps-per-epoch", type=int, default=1000)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--save-interval", type=int, default=10)
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--output-dir", default="models")
-    p.set_defaults(func=cmd_train_offline)
-
-    # --- eval ---
-    p = sub.add_parser("eval", help="Evaluate trained policy")
-    p.add_argument("--model", default="latest",
-                   help="SB3 model path, or 'latest' to auto-pick the freshest "
-                        "from models/ (default: latest)")
-    p.add_argument("--episodes", type=int, default=1,
-                   help="Number of matches to play (default: 1)")
-    p.add_argument("--render", action="store_true",
-                   help="Show the match in the pygame window")
-    p.add_argument("--failure-rate", type=float, default=0.0,
-                   help="Failure-injection rate during eval (default: 0.0)")
-    p.add_argument("--teammate-offline", type=float, default=0.0)
-    p.add_argument("--opponents", type=int, default=0, choices=[0, 1, 2],
-                   help="Number of opponent robots on the field during eval "
-                        "(default: 0). Use 1 to watch the policy play against an opponent.")
-    p.add_argument("--opponent", default="mixed",
-                   choices=["random", "greedy", "defensive", "mixed"],
-                   help="Opponent strategy when --opponents > 0 (default: mixed).")
-    p.add_argument("--num-allies", type=int, default=None, choices=[1, 2],
-                   help="Allied robots controlled by the policy (default: auto-detect "
-                        "from model — use 2 for 2v2 team checkpoints).")
-    p.add_argument("--log-decisions", action="store_true",
-                   help="Write per-decision CSV log while evaluating.")
-    p.add_argument("--log-dir", default="logs",
-                   help="Directory for decision log CSV files (default: logs/).")
-    p.set_defaults(func=cmd_eval)
-
-    # --- export ---
-    p = sub.add_parser("export", help="Export to ONNX")
-    p.add_argument("--model", required=True, help="SB3 model path")
-    p.add_argument("--output", default="models/onnx/model.onnx")
-    p.set_defaults(func=cmd_export)
-
-    # --- validate ---
-    p = sub.add_parser("validate", help="Validate ONNX model")
-    p.add_argument("--onnx", required=True, help="ONNX file path")
-    p.add_argument("--model", default=None, help="SB3 model for parity check")
-    p.set_defaults(func=cmd_validate)
-
-    args = parser.parse_args()
-    args.func(args)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

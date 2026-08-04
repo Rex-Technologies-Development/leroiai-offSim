@@ -1,349 +1,64 @@
-"""Field dimensions, action IDs, state dims, timing constants.
-
-Game: VEX Push Back 2025-2026
-Field: 144.00in x 144.00in (12ft x 12ft)
-Robot: 15in x 15in footprint, tank drive
-Position precision: 2 decimal places in inches (matches real localization)
-
-Goals (top-down view):
-  OUR_LONG_GOAL  — right wall L-bracket (blue alliance, x≈138)
-  OPP_LONG_GOAL  — left wall L-bracket  (red alliance,  x≈6)
-  CENTER_MID_GOAL — center field, upper half (y≈84)
-  CENTER_LOW_GOAL — center field, lower half (y≈60)
-
-Ball colors:
-  BALL_RED  = 0 (22 red balls, start near left/opp side)
-  BALL_BLUE = 1 (22 blue balls, start near right/our side)
-  Note: color is for display and strategic awareness.
-  Either color can be scored in any goal in this sim.
-
-NOTE: The robot base is mecanum in real life, but we model it as tank drive
-for now. Strafing can be added later by modifying Robot.move_toward_point()
-in robot.py to support lateral movement.
-"""
-
-import enum
+"""Override simulator configuration loaded from the shared YAML contract."""
+from __future__ import annotations
+from enum import Enum, IntEnum
+from pathlib import Path
 import yaml
-import os
-import numpy as np
 
-# ---------------------------------------------------------------------------
-# Load shared config
-# ---------------------------------------------------------------------------
-_SHARED_CFG_PATH = os.path.join(os.path.dirname(__file__), "..", "shared", "config.yaml")
-with open(_SHARED_CFG_PATH, "r") as f:
-    SHARED_CFG = yaml.safe_load(f)
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared" / "config.yaml"
+with _CONFIG_PATH.open(encoding="utf-8") as stream:
+    SHARED_CONFIG = yaml.safe_load(stream)
 
-# ---------------------------------------------------------------------------
-# Ball colors
-# ---------------------------------------------------------------------------
-BALL_RED  = 0   # red alliance balls
-BALL_BLUE = 1   # blue alliance balls (our team)
+class Alliance(str, Enum):
+    BLUE = "blue"
+    RED = "red"
 
-# ---------------------------------------------------------------------------
-# Actions — RL decides WHERE to go, not HOW to move
-# ---------------------------------------------------------------------------
-class Action(enum.IntEnum):
-    STOP = 0
-    MOVE_CHASSIS_ONLY = 1
-    COLLECT_BLOCKS = 2
-    SCORE_LEFT_LONG_GOAL_ALLIANCE = 3
-    SCORE_LEFT_LONG_GOAL_OPPONENT = 4
-    SCORE_RIGHT_LONG_GOAL_ALLIANCE = 5
-    SCORE_RIGHT_LONG_GOAL_OPPONENT = 6
-    SCORE_MID_LEFT = 7
-    SCORE_MID_RIGHT = 8
-    SCORE_LOW_LEFT = 9
-    SCORE_LOW_RIGHT = 10
-    DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD = 11
-    DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL = 12
-    DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD = 13
-    DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL = 14
-    DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD = 15
-    DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL = 16
-    DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD = 17
-    DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL = 18
-    RAM_RIGHT_LONG_GOAL_OPPONENT = 19
-    RAM_RIGHT_LONG_GOAL_ALLIANCE = 20
-    RAM_LEFT_LONG_GOAL_OPPONENT = 21
-    RAM_LEFT_LONG_GOAL_ALLIANCE = 22
+    @property
+    def opponent(self) -> "Alliance":
+        return Alliance.RED if self is Alliance.BLUE else Alliance.BLUE
 
+class ChassisType(str, Enum):
+    TANK = "tank"
+    MECANUM = "mecanum"
 
-ACTION_NAMES: dict[int, str] = {
-    0: "STOP",
-    1: "MOVE_CHASSIS_ONLY",
-    2: "COLLECT_BLOCKS",
-    3: "SCORE_LEFT_LONG_GOAL_ALLIANCE",
-    4: "SCORE_LEFT_LONG_GOAL_OPPONENT",
-    5: "SCORE_RIGHT_LONG_GOAL_ALLIANCE",
-    6: "SCORE_RIGHT_LONG_GOAL_OPPONENT",
-    7: "SCORE_MID_LEFT",
-    8: "SCORE_MID_RIGHT",
-    9: "SCORE_LOW_LEFT",
-    10: "SCORE_LOW_RIGHT",
-    11: "DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD",
-    12: "DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL",
-    13: "DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD",
-    14: "DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL",
-    15: "DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD",
-    16: "DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL",
-    17: "DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD",
-    18: "DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL",
-    19: "RAM_RIGHT_LONG_GOAL_OPPONENT",
-    20: "RAM_RIGHT_LONG_GOAL_ALLIANCE",
-    21: "RAM_LEFT_LONG_GOAL_OPPONENT",
-    22: "RAM_LEFT_LONG_GOAL_ALLIANCE",
-}
+class Phase(str, Enum):
+    OPENING = "opening"
+    INTERACTION = "interaction"
+    FINISHED = "finished"
 
-NUM_ACTIONS = len(Action)
-assert NUM_ACTIONS == 23, f"expected 23 actions, got {NUM_ACTIONS}"
-assert all(Action(i).name == ACTION_NAMES[i] for i in ACTION_NAMES), (
-    "Action enum names must match ACTION_NAMES"
-)
-assert NUM_ACTIONS == len(Action), (
-    f"NUM_ACTIONS={NUM_ACTIONS} but len(Action)={len(Action)} — action enum drift"
-)
+_ACTION_MAP = {int(k): str(v) for k, v in SHARED_CONFIG["actions"].items()}
+Action = IntEnum("Action", {name: idx for idx, name in _ACTION_MAP.items()})
+ACTION_NAMES = dict(_ACTION_MAP)
+NUM_ACTIONS = int(SHARED_CONFIG["num_actions"])
+if list(_ACTION_MAP) != list(range(NUM_ACTIONS)) or [a.name for a in Action] != list(_ACTION_MAP.values()):
+    raise ValueError("shared/config.yaml actions must be contiguous and match num_actions")
 
-# ---------------------------------------------------------------------------
-# Field (inches, origin bottom-left, 2 decimal precision)
-# ---------------------------------------------------------------------------
-FIELD_W: float = SHARED_CFG["field"]["width"]    # 144.00
-FIELD_H: float = SHARED_CFG["field"]["height"]   # 144.00
+PROFILE = SHARED_CONFIG["profile"]
+FIELD = SHARED_CONFIG["field"]
+ROBOT = SHARED_CONFIG["robot"]
+OBJECTS = SHARED_CONFIG["objects"]
+SCORING = SHARED_CONFIG["scoring"]
 
-# Goal positions — center of each goal body (scoring target for robots).
-# Long goals are FREE-STANDING (~14" alley between goal and nearest wall).
-# Outer face at ~129.6 / ~14.4" from wall; inner face ~10.9" further in.
-OUR_LONG_GOAL    = np.array([119.00, 72.00])  # center of right goal body (23" alley from wall)
-OPP_LONG_GOAL    = np.array([ 25.00, 72.00])  # center of left goal body
-CENTER_MID_GOAL  = np.array([ 72.00, 80.94])  # center field, upper X half
-CENTER_LOW_GOAL  = np.array([ 72.00, 63.06])  # center field, lower X half
-
-# Long goal physical extents
-# Goals are FREE-STANDING with a ~23" alley between the wall and the outer goal face.
-# Goal body is ~4.125" wide (tray depth).
-LONG_GOAL_Y_MIN    = 47.61   # bottom of goal bar
-LONG_GOAL_Y_MAX    = 96.39   # top of goal bar
-LONG_GOAL_WALL_GAP = 21.50   # alley width: gap between wall and outer face of goal
-LONG_GOAL_WIDTH    =  4.125  # goal tray width (outer → inner/scoring face)
-LONG_GOAL_CAPACITY = 12       # max scored balls per long goal before spill
-
-# Center goal X-structure — two crossing rectangular bars forming an X.
-# The upper two arms = MID goal; lower two arms = LOW goal.
-# ARM_LEN is the half-length from center to each arm tip.
-CENTER_GOAL_ARM_LEN = 23.18   # half-diagonal from center to arm tip (scaled from spec)
-CENTER_GOAL_ARM_W   =  4.00   # arm width (bar thickness)
-
-# Matchload tubes — stand along the TOP and BOTTOM walls at the
-# tile-1/tile-2 seam (x=24" and x=120" from each side wall).
-MATCHLOAD_TUBE_RADIUS = 2.00
-MATCHLOAD_TUBES = np.array([
-    [ 24.0,   2.0],   # bottom wall, 1-tile seam from left
-    [120.0,   2.0],   # bottom wall, 1-tile seam from right
-    [ 24.0, 142.0],   # top wall, 1-tile seam from left
-    [120.0, 142.0],   # top wall, 1-tile seam from right
-], dtype=np.float64)
-
-# Parking zones — raised platforms centered on the top and bottom walls.
-# ~25" wide (centered at x=72), 24" deep (1 tile) against each wall.
-PARK_ZONE_X_MIN  = 59.5    # left edge  (72 - 12.5)
-PARK_ZONE_X_MAX  = 84.5    # right edge (72 + 12.5)
-PARK_ZONE_BOTTOM = 24.0    # top edge of bottom park zone
-PARK_ZONE_TOP    = 120.0   # bottom edge of top park zone
-
-# VAIRC Section 7: blue below midfield, red above. Within each alliance, R0 starts
-# on the left wall and R1 on the right wall (opposite sides of the field).
-ALLY_START_R0 = np.array([24.00, 18.00])
-ALLY_START_R1 = np.array([108.00, 18.00])
-OPP_START_R0  = np.array([24.00, 126.00])
-OPP_START_R1  = np.array([108.00, 126.00])
-ALLY_START_HEADING_R0 = 0.0          # face east into field (left wall)
-ALLY_START_HEADING_R1 = np.pi        # face west into field (right wall)
-OPP_START_HEADING_R0  = 0.0
-OPP_START_HEADING_R1  = np.pi
-
-# Vision cone — wide-angle camera in front of robot
-VISION_HALF_ANGLE = np.radians(34.5)   # ±34.5° → 69° total HFOV (OAK-D Lite Auto Focus)
-VISION_RANGE      = 72.0               # max depth in inches
-
-# VAIRC Isolation Period — alliance sides split at y=72 (midfield tape).
-# Robots stay on their side during Isolation only; Interaction Period is full-field.
-HALF_FIELD_Y: float = 72.0
-CENTER_STRIP_HALF_W: float = 8.0
-HALF_BOTTOM_Y_MAX: float = HALF_FIELD_Y - CENTER_STRIP_HALF_W   # exclusive bottom ceiling
-HALF_TOP_Y_MIN: float = HALF_FIELD_Y + CENTER_STRIP_HALF_W      # exclusive top floor
-HALF_SHARED_STRIP_Y_LO: float = HALF_BOTTOM_Y_MAX
-HALF_SHARED_STRIP_Y_HI: float = HALF_TOP_Y_MIN
-HALF_FIELD_X: float = 72.0
-HALF_LEFT_X_MAX: float = HALF_FIELD_X - CENTER_STRIP_HALF_W
-HALF_RIGHT_X_MIN: float = HALF_FIELD_X + CENTER_STRIP_HALF_W
-HALF_SHARED_STRIP_X_LO: float = HALF_LEFT_X_MAX
-HALF_SHARED_STRIP_X_HI: float = HALF_RIGHT_X_MIN
-
-# Per-side defend / jam positions (role 0 = left, role 1 = right)
-DEFEND_ZONE_ALLY_LEFT   = np.array([42.00,  36.00])
-DEFEND_ZONE_ALLY_RIGHT  = np.array([102.00, 36.00])
-DEFEND_ZONE_OPP_LEFT    = np.array([42.00,  108.00])
-DEFEND_ZONE_OPP_RIGHT   = np.array([102.00, 108.00])
-JAM_RECOVERY_ALLY_LEFT  = np.array([54.00,  54.00])
-JAM_RECOVERY_ALLY_RIGHT = np.array([90.00,  54.00])
-JAM_RECOVERY_OPP_LEFT   = np.array([54.00,  90.00])
-JAM_RECOVERY_OPP_RIGHT  = np.array([90.00,  90.00])
-# Legacy aliases (lane naming from earlier half-field model)
-DEFEND_ZONE_ALLY_BOTTOM = DEFEND_ZONE_ALLY_LEFT
-DEFEND_ZONE_ALLY_TOP    = DEFEND_ZONE_ALLY_RIGHT
-DEFEND_ZONE_OPP_BOTTOM  = DEFEND_ZONE_OPP_LEFT
-DEFEND_ZONE_OPP_TOP     = DEFEND_ZONE_OPP_RIGHT
-JAM_RECOVERY_BOTTOM     = JAM_RECOVERY_ALLY_LEFT
-JAM_RECOVERY_TOP        = JAM_RECOVERY_OPP_LEFT
-
-# Legacy alias (midline); prefer per-half constants above
-DEFEND_ZONE_POS  = np.array([102.00,  72.00])
-
-# ---------------------------------------------------------------------------
-# Game rules
-# ---------------------------------------------------------------------------
-MATCH_DURATION: float    = SHARED_CFG["game"]["match_duration"]       # 120s
-ISOLATION_PERIOD: float  = SHARED_CFG["game"]["isolation_period"]     # 15s VAIRC
-DT: float                = SHARED_CFG["game"]["dt"]                   # 0.05s
-DECISION_INTERVAL: float = SHARED_CFG["game"]["decision_interval"]    # 3.0s
-TICKS_PER_DECISION: int  = int(DECISION_INTERVAL / DT)                # 60
-MAX_CARRY: int           = SHARED_CFG["game"]["max_carry"]            # 3
-
-# Mid-step replanning lockout (prevents rapid per-tick objective flipping)
-REPLAN_LOCK_S: float     = float(SHARED_CFG["game"].get("replan_lock_s", 1.0))
-REPLAN_LOCK_TICKS: int   = max(0, int(REPLAN_LOCK_S / DT))
-
-# Post-arrival scoring dwell: once a robot is in-scoring-position and aligned,
-# keep the decision running long enough for score timers to fire.
-SCORING_DWELL_S: float   = float(SHARED_CFG["game"].get("scoring_dwell_s", 1.5))
-SCORING_DWELL_TICKS: int = max(0, int(SCORING_DWELL_S / DT))
-
-# Action persistence for scoring intents (per env.step decision).
-SCORE_COMMIT_DECISIONS: int = int(SHARED_CFG["game"].get("score_commit_decisions", 2))
-
-SCORE_COMMIT_UNTIL_EMPTY: bool = bool(SHARED_CFG["game"].get("score_commit_until_empty", True))
-SCORE_COMMIT_MAX_S: float = float(SHARED_CFG["game"].get("score_commit_max_s", 9.0))
-SCORE_COMMIT_MAX_DECISIONS: int = max(1, int(SCORE_COMMIT_MAX_S / max(DECISION_INTERVAL, 1e-6)))
-
-# Descore mechanics — long-goal vertical partition (P0..P3) and slide/slam tuning
-_LONG_GOAL_SPAN = LONG_GOAL_Y_MAX - LONG_GOAL_Y_MIN
-LONG_GOAL_PARTITION_Y: tuple[float, float, float, float] = (
-    LONG_GOAL_Y_MIN,
-    LONG_GOAL_Y_MIN + _LONG_GOAL_SPAN / 3.0,
-    LONG_GOAL_Y_MIN + 2.0 * _LONG_GOAL_SPAN / 3.0,
-    LONG_GOAL_Y_MAX,
-)
-DESCORE_P0, DESCORE_P1, DESCORE_P2, DESCORE_P3 = 0, 1, 2, 3
-DESCORE_MODE_SLIDE = "slide"
-DESCORE_MODE_SLAM = "slam"
-SLAM_SPEED_DIVISOR: float = 10.0
-SLAM_MIN_SPEED: float = 6.0
-DESCORE_SLIDE_DWELL_S: float = 1.0
-DESCORE_SLIDE_DWELL_TICKS: int = max(1, int(DESCORE_SLIDE_DWELL_S / DT))
-
-# ---------------------------------------------------------------------------
-# Game objects
-# ---------------------------------------------------------------------------
-MAX_GAME_OBJECTS: int = SHARED_CFG["state"]["max_game_objects"]  # 44
-OBJ_FEATURES: int    = SHARED_CFG["state"]["object_features"]   # 4
-
-# Status codes
-OBJ_ON_FIELD   = 0
-OBJ_HELD       = 1
-OBJ_SCORED_US  = 2
-OBJ_SCORED_OPP = 3
-OBJ_REMOVED    = 4   # deleted via state editor
-
-# Scoring values — all balls are worth 3 pts regardless of goal type.
-# Ball COLOR determines which alliance earns the points (blue ball = blue score, red = red).
-LONG_GOAL_POINTS   = 3
-CENTER_GOAL_POINTS = 3
-CONTROL_BONUS_PTS  = 10   # points per controlled quadrant
-
-# ---------------------------------------------------------------------------
-# Initial ball layout — 22 red (color=0) + 22 blue (color=1) = 44 total
-# Format: [x, y, color]
-# We are BLUE (right side); opponent is RED (left side)
-# ---------------------------------------------------------------------------
-INITIAL_OBJECTS = np.array([
-    # === RED BALLS (color=0) — clustered left/center ===
-    # Top-left corner cluster
-    [12.00, 120.00, 0], [18.00, 126.00, 0], [24.00, 120.00, 0],
-    # Bottom-left corner cluster
-    [12.00,  24.00, 0], [18.00,  18.00, 0], [24.00,  24.00, 0],
-    # Left wall singles
-    [12.00,  96.00, 0], [12.00,  72.00, 0], [12.00,  48.00, 0],
-    # Left zone column
-    [30.00, 108.00, 0], [30.00,  72.00, 0], [30.00,  36.00, 0],
-    # Center-left column
-    [48.00, 108.00, 0], [48.00,  72.00, 0], [48.00,  36.00, 0],
-    # Inner center-left
-    [60.00,  96.00, 0], [60.00,  60.00, 0],
-    # Upper center (red side)
-    [68.00, 108.00, 0], [72.00, 120.00, 0],
-    # Extra left zone
-    [36.00, 108.00, 0], [36.00,  36.00, 0], [36.00,  72.00, 0],
-
-    # === BLUE BALLS (color=1) — clustered right/center ===
-    # Top-right corner cluster
-    [132.00, 120.00, 1], [126.00, 126.00, 1], [120.00, 120.00, 1],
-    # Bottom-right corner cluster
-    [132.00,  24.00, 1], [126.00,  18.00, 1], [120.00,  24.00, 1],
-    # Right wall singles
-    [132.00,  96.00, 1], [132.00,  72.00, 1], [132.00,  48.00, 1],
-    # Right zone column
-    [114.00, 108.00, 1], [114.00,  72.00, 1], [114.00,  36.00, 1],
-    # Center-right column
-    [ 96.00, 108.00, 1], [ 96.00,  72.00, 1], [ 96.00,  36.00, 1],
-    # Inner center-right
-    [ 84.00,  96.00, 1], [ 84.00,  60.00, 1],
-    # Lower center (blue side)
-    [ 76.00,  36.00, 1], [ 72.00,  24.00, 1],
-    # Extra right zone
-    [108.00, 108.00, 1], [108.00,  36.00, 1], [108.00,  72.00, 1],
-], dtype=np.float64)
-
-assert len(INITIAL_OBJECTS) == 44, f"Expected 44 balls, got {len(INITIAL_OBJECTS)}"
-
-# ---------------------------------------------------------------------------
-# Heatmap
-# ---------------------------------------------------------------------------
-HEATMAP_W: int = SHARED_CFG["state"]["heatmap_grid_w"]  # 12
-HEATMAP_H: int = SHARED_CFG["state"]["heatmap_grid_h"]  # 12
-
-# Whether the 12x12 heatmap is appended to the RL state vector.
-INCLUDE_HEATMAP: bool = bool(SHARED_CFG["state"].get("include_heatmap", False))
-
-# ---------------------------------------------------------------------------
-# State vector dimension (flat)
-# Base scalar features = 13:
-#   role_id(1) + alliance_color(1) + time(1) + my_score(1) + opp_score(1)
-#   + x(1) + y(1) + sin_heading(1) + cos_heading(1) + balls_held(1) + balls_nearby(1)
-#   + ctrl_us_quadrants(1) + ctrl_opp_quadrants(1)
-# Relative nearest-object features = 68:
-#   8 nearest BLUE balls × 5 features (dx, dy, dist, bearing_sin, bearing_cos) = 40
-#   4 nearest RED  balls × 5 features                                          = 20
-#   4 goals × 2 features (relative dx, dy)                                     = 8
-# Heatmap = 144  (kept for global spatial density awareness)
-# Goal state = 6 (fill level + opp-color count for opp long, our long, center)
-# Extras = 3     (expected_state_delta, success_ratio, wrong_color_held)
-# Total = 13 + 68 + 144 + 6 + 3 = 234
-# ---------------------------------------------------------------------------
-N_NEAREST_BLUE   = 8
-N_NEAREST_RED    = 4
-OBJ_REL_FEATURES = 5
-_REL_OBJ_TOTAL = (N_NEAREST_BLUE + N_NEAREST_RED) * OBJ_REL_FEATURES + 4 * 2  # = 68
-_GOAL_STATE_FEATURES = 6   # fill + opp-ball-count for opp_long, our_long, center
-STATE_DIM = 13 + _REL_OBJ_TOTAL + (HEATMAP_W * HEATMAP_H if INCLUDE_HEATMAP else 0) + _GOAL_STATE_FEATURES + 3
-
-# ---------------------------------------------------------------------------
-# Robot physics
-# ---------------------------------------------------------------------------
-ROBOT_W: float       = SHARED_CFG["robot"]["width"]           # 15.00 in
-ROBOT_H: float       = SHARED_CFG["robot"]["height"]          # 15.00 in
-MAX_SPEED: float     = SHARED_CFG["robot"]["max_speed"]       # 30.00 in/s
-TURN_RATE: float     = SHARED_CFG["robot"]["turn_rate"]       # 3.14 rad/s
-COLLECT_RANGE: float = SHARED_CFG["robot"]["collect_range"]   # 8.00 in
-SCORE_RANGE: float   = SHARED_CFG["robot"]["score_range"]     # 10.00 in
-
-MAX_SCORE = 200  # normalisation ceiling (44 balls * 5pts max)
+FIELD_WIDTH = float(FIELD["width"])
+FIELD_HEIGHT = float(FIELD["height"])
+AUTONOMOUS_LINES = tuple(float(v) for v in FIELD["autonomous_lines"])
+LOAD_ZONE_DEPTH = float(FIELD["load_zone_depth"])
+LOAD_ZONE_SPAN = float(FIELD.get("load_zone_span", FIELD["load_zone_depth"]))
+MATCH_DURATION = float(PROFILE["match_duration"])
+OPENING_DURATION = float(PROFILE["opening_duration"])
+DT = float(PROFILE["dt"])
+DECISION_INTERVAL = float(PROFILE["decision_interval"])
+ROBOT_RADIUS = float(ROBOT["radius"])
+MAX_FORWARD_SPEED = float(ROBOT["max_forward_speed"])
+MAX_LATERAL_SPEED = float(ROBOT["max_lateral_speed"])
+MAX_YAW_RATE = float(ROBOT["max_yaw_rate"])
+LINEAR_ACCEL = float(ROBOT["linear_accel"])
+LINEAR_DECEL = float(ROBOT["linear_decel"])
+YAW_ACCEL = float(ROBOT["yaw_accel"])
+INTERACTION_RANGE = float(ROBOT["interaction_range"])
+GOAL_CAPACITY = int(OBJECTS["goal_capacity"])
+STATE_DIM = int(SHARED_CONFIG["state"]["per_robot_dim"])
+TEAM_STATE_DIM = STATE_DIM * 2
+ALLIANCE_HALF_POINTS = int(SCORING["alliance_half"])
+OWNED_YELLOW_POINTS = int(SCORING["owned_yellow_half"])
+MIDFIELD_ROBOT_POINTS = int(SCORING["midfield_robot"])
+OPENING_BONUS_POINTS = int(SCORING["opening_bonus"])

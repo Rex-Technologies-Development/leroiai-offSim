@@ -1,75 +1,56 @@
-# Shared contract between training repo and ROS 2 deployment repo.
-# Both repos must agree on action IDs and state vector shape.
-# Game: VEX Push Back 2025-2026
-
-actions:
-  0: STOP
-  1: MOVE_CHASSIS_ONLY
-  2: COLLECT_BLOCKS
-  3: SCORE_LEFT_LONG_GOAL_ALLIANCE
-  4: SCORE_LEFT_LONG_GOAL_OPPONENT
-  5: SCORE_RIGHT_LONG_GOAL_ALLIANCE
-  6: SCORE_RIGHT_LONG_GOAL_OPPONENT
-  7: SCORE_MID_LEFT
-  8: SCORE_MID_RIGHT
-  9: SCORE_LOW_LEFT
-  10: SCORE_LOW_RIGHT
-  11: DESCORE_LEFT_LONG_GOAL_ALLIANCE_FIELD
-  12: DESCORE_LEFT_LONG_GOAL_ALLIANCE_WALL
-  13: DESCORE_LEFT_LONG_GOAL_OPPONENT_FIELD
-  14: DESCORE_LEFT_LONG_GOAL_OPPONENT_WALL
-  15: DESCORE_RIGHT_LONG_GOAL_ALLIANCE_FIELD
-  16: DESCORE_RIGHT_LONG_GOAL_ALLIANCE_WALL
-  17: DESCORE_RIGHT_LONG_GOAL_OPPONENT_FIELD
-  18: DESCORE_RIGHT_LONG_GOAL_OPPONENT_WALL
-  19: RAM_RIGHT_LONG_GOAL_OPPONENT
-  20: RAM_RIGHT_LONG_GOAL_ALLIANCE
-  21: RAM_LEFT_LONG_GOAL_OPPONENT
-  22: RAM_LEFT_LONG_GOAL_ALLIANCE
-
-num_actions: 23
-
-# VEX field — 12ft x 12ft = 144in x 144in
+# Override 2D prototype contract.
+# Provisional VEX AI profile using the VEX U Override field/setup as a proxy.
+game: override
+profile:
+  robots: 4
+  robots_per_alliance: 2
+  match_duration: 120.0
+  opening_duration: 30.0
+  drivers: false
+  dt: 0.05
+  decision_interval: 2.0
 field:
-  width: 144.00    # inches
-  height: 144.00   # inches
-
-game:
-  match_duration: 120    # seconds (VAIRC: 15s Isolation + 105s Interaction)
-  isolation_period: 15   # VAIRC Section 7 — robots stay on alliance side
-  dt: 0.05               # seconds per sim tick (fine-grained for movement animation)
-  decision_interval: 3.0 # seconds between RL re-queries (40 decisions per match)
-  # Minimum time before mid-step auto-replanning is allowed to swap the
-  # currently executing action (prevents rapid objective thrashing).
-  replan_lock_s: 1.0
-  # Once the robot reaches a scoring pose (arrived + heading aligned), keep the
-  # decision alive for at least this long so score timers can actually fire.
-  scoring_dwell_s: 1.5
-  # When the policy chooses a SCORE_* action, stick with it for this many
-  # consecutive RL decisions (prevents thrashing between long vs center goals
-  # while the robot is still aligning/finishing the scoring sequence).
-  score_commit_decisions: 2
-  # Stronger variant: if true, once a SCORE_* action is chosen, keep that same
-  # SCORE_* intent until the robot has no balls left OR the timeout expires.
-  score_commit_until_empty: true
-  # Timeout for score_commit_until_empty (seconds). Prevents getting stuck
-  # scoring forever if the robot can't align/reach the scoring pose.
-  score_commit_max_s: 9.0
-  max_carry: 7
-
-state:
-  max_game_objects: 44   # VEX Push Back: 22 red + 22 blue balls
-  object_features: 4     # x, y, status, color
-  heatmap_grid_w: 12
-  heatmap_grid_h: 12
-  # If true, append a 12x12 (=144) potential heatmap to the flat state.
-  # This is expensive and makes the observation contract larger.
-  include_heatmap: false
-
+  width: 144.0
+  height: 144.0
+  # Coarse 2D proxy boundaries expressed as x+y sums around the shared tape/Midfield band.
+  autonomous_lines: [120.0, 168.0]
+  # Load Zones are rectangles, not corner squares: depth from the alliance wall
+  # sits on the half-tile midpoint (~12"); span along the N/S wall is longer (~26").
+  load_zone_depth: 12.0
+  load_zone_span: 26.0
 robot:
-  width: 15.00       # inches (top-down square footprint)
-  height: 15.00      # inches
-  max_speed: 16.00   # inches per second
-  turn_rate: 3.14    # radians per second (~180 deg/s)
-  collect_range: 8.00   # inches — how close to pick up a ball
-  score_range: 12.00    # inches — how close to a goal to score (bumped from 10 to accommodate wider center approach gap)
+  radius: 7.5
+  max_forward_speed: 30.0
+  max_lateral_speed: 26.0
+  max_yaw_rate: 3.141592653589793
+  linear_accel: 48.0
+  linear_decel: 64.0
+  yaw_accel: 7.0
+  interaction_range: 10.0
+objects:
+  # VEX U: 33 field Pins total including the center-Goal Pin, plus 36 field Cups.
+  loose_pins: 32
+  loose_cups: 36
+  match_load_pins_per_alliance: 13
+  match_load_yellow_pins_per_alliance: 3
+  match_load_cups_per_alliance: 10
+  goal_capacity: 8
+scoring:
+  alliance_half: 5
+  owned_yellow_half: 10
+  midfield_robot: 8
+  opening_bonus: 12
+actions:
+  0: IDLE
+  1: COLLECT_PIN
+  2: COLLECT_CUP
+  3: SCORE_NEAREST_GOAL
+  4: SCORE_ALLIANCE_GOAL
+  5: SCORE_MIDFIELD_GOAL
+  6: USE_LOADER
+  7: CLAIM_TOGGLE
+  8: DEFEND_MIDFIELD
+  9: REMOVE_OWN_PIN
+num_actions: 10
+state:
+  per_robot_dim: 80

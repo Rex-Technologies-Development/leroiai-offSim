@@ -1,370 +1,155 @@
-# leroiai-offSim
+# leroiai-offSim — Override 2D prototype
 
-A reinforcement-learning **simulator and trainer** for a VEX AI **Push Back (2025–2026)** robot.
-The agent learns *high-level strategy* — which objective to pursue — while deterministic
-motion controllers handle *how* to drive, collect, and score. Policies are trained in the
-sim, exported to ONNX, and intended for deployment on the real robot via ROS 2 (see
-[Transferring the policy to ROS 2](#transferring-the-policy-to-ros-2)).
+A deterministic, fast top-down simulator for experimenting with centralized autonomous strategy in a **provisional VEX AI Override profile**. It provides a low-level continuous-control Gymnasium environment, a high-level masked objective environment for `sb3-contrib` MaskablePPO, scripted 2v2 autoplay, and a Pygame renderer.
 
----
+This repository is a pragmatic strategy prototype, **not an official rules engine**. It uses the VEX U Override field/setup concepts as a proxy where a final VEX AI format or subjective ruling is unavailable. The assumptions below are part of the simulator contract.
 
-## Overview
+## Implemented match profile
 
-- **Game:** VEX Push Back, 144" × 144" field, 44 balls (22 red / 22 blue), two long goals
-  (left/right walls) and a center "X" structure with a mid goal (NE–SW bar) and low goal
-  (NW–SE bar). Either color can be scored in any goal in this sim.
-- **Control hierarchy:** the RL policy picks one of **9 discrete actions** every ~3 s
-  ("collect", "score long", "score mid", …). The environment then executes that intent with
-  deterministic planners — vision-cone route planning, obstacle-avoiding navigation, and a
-  back-in scoring approach — over fine-grained 0.05 s ticks.
-- **Partial observability:** the robot only *knows* what its camera FOV has seen. Goal
-  contents are tracked as a **belief** that can go stale when an opponent changes a goal
-  out of view — the policy never assumes a scored ball stays forever.
-- **Algorithms:** online PPO with action masking (`sb3-contrib MaskablePPO`) and offline
-  RL (`d3rlpy` CQL/IQL) from logged match data.
-- **Visualization:** a Pygame renderer with an interactive field editor, live training
-  panel, and a heatmap overlay.
+- Four robots: two blue and two red; all four are autonomous and use the same globally selected `tank` or `mecanum` chassis model.
+- 120-second match with no drivers: a 30-second opening/autonomous phase followed by a 90-second interaction phase.
+- 144 × 144 inch nominal coordinate frame with a 6×6 tile grid. Official GPS coordinates are centered into this frame; the physical field's wall-to-wall dimension is slightly smaller.
+- The white 2.5-inch tape is drawn as the official large diagonal X with paired Autonomous Line branches around the central Midfield diamond. Opening uses a coarse southwest/red versus northeast/blue diagonal-side proxy around this shared region.
+- Nine GPS-positioned octagonal Goals: two red Alliance Goals in the southwest, two blue Alliance Goals in the northeast, four neutral Short Goals, and one neutral Tall Goal at center.
+- Four 25.8-inch Toggles are mounted at the center of the field walls. Four Loaders and colored Load Zones occupy the corners, with two per alliance.
+- The VEX U setup has 32 loose field Pins plus one yellow/yellow Pin in the Tall center Goal, 36 field Cups, and one alliance/yellow Pin Preload per Robot. Each alliance has 10 alliance/yellow plus 3 yellow/yellow Match Load Pins and 10 Match Load Cups. A Robot may possess at most one Pin and one Cup.
 
----
+### Symbolic Goal and scoring proxy
 
-## How it works
+Goal geometry is represented as an ordered bottom-to-top stack of Pin/Cup entries. A Cup placed directly above a Pin records `nested_on=<pin id>`. The simulator does not solve 3D contact geometry.
 
-### Action space (9 discrete actions)
-| ID | Action | Meaning |
-|----|--------|---------|
-| 0 | `COLLECT_NEAREST_BALL` | Drive to and intake the best reachable blue ball |
-| 1 | `SCORE_LONG_GOAL` | Back into the nearest long goal and deposit |
-| 2 | `SCORE_CENTER_MID` | Back into the mid (NE–SW) center goal |
-| 3 | `SCORE_CENTER_LOW` | Back into the low (NW–SE) center goal |
-| 4 | `DESCORE_OPP_LONG` | Descore the opponent's long goal (slide or slam) |
-| 5 | `DESCORE_CENTER` | Descore center goals (slide and/or slam) |
-| 6 | `DEFEND_ZONE` | Hold a defensive position |
-| 7 | `EJECT_WRONG_COLOR` | Dump held wrong-color balls out the back |
-| 8 | `IDLE` | Do nothing this decision |
+- A Pin has two colored halves (`blue`, `red`, or neutral `yellow`).
+- **Placed halves** include both halves of every Pin in a Goal.
+- **Visible halves** are the two halves of the highest Pin in that Goal. Cups preserve symbolic nesting but do not create a second Pin visibility layer.
+- Every placed alliance-colored half scores **5 points** for that alliance.
+- A placed yellow half in a perimeter Goal scores **10 points** for the alliance owning that Goal's wall/quadrant Toggle. Yellow halves in the Tall center Goal use the alliance with more Robots in Midfield; a tie has no owner.
+- Toggles do not directly score. Each alliance Robot whose center is inside the Midfield diamond scores **8 points** for its own alliance.
+- The opening winner is the alliance with the higher raw score at 30 seconds and receives the official **12-point Autonomous Bonus**; ties receive no bonus in this prototype.
+- **AWP proxy:** by 30 seconds, the alliance must have placed at least one matching alliance half, own at least two Toggles, and both alliance Robots must have placed their Pin Preloads. AWP is telemetry only and does not add match points.
 
-Invalid actions are masked (e.g. descore is only offered for a goal the robot *believes*
-holds opponent balls).
+### Protected/removal proxy
 
-**Descore mechanics** (same two actions; nav picks slide vs slam from belief):
+A robot cannot remove a Pin from an opponent-protected alliance Goal. Cups and mixed/yellow Pins are treated as neutral placed objects and cannot be removed. The only supported removal is a top, fully alliance-colored Pin from a neutral or own Goal while the robot's Pin slot is empty. Prevented protected/neutral removals increment robot counters and append deterministic telemetry rather than asking for subjective referee input.
 
-- **Long goals** are split into three equal segments (four partition points: south exterior,
-  two interior points, north exterior). **Slide** from an interior point toward the south
-  exterior ejects all opponent balls in that span (`P1→P0` or `P2→P0`). A ceiling between
-  `P2` and `P3` blocks sliding the full length. **Slam** from a south or north entry ejects
-  `floor(speed / K)` balls from the opposite end (`K = 10` in/s per ball by default).
-- **Center mid** (NE–SW bar): slide across the full goal (no ceiling) or slam from NE/SW tips.
-- **Center low** (NW–SE bar): **slam only** from NW or SE tips.
+## Physics and drivetrains
 
-Minimum slam speed is 6 in/s. Slide runs a short dwell animation along the goal axis before
-balls eject. Ejected balls **spill out the correct end** (south vs north) with velocity so
-they roll onto the field.
+### Field visualization and Goal-status key
 
-Long goals hold **12 balls** max; scoring a 13th pushes the ball out the **opposite end**
-from the entry side (same spill physics as descore).
+The renderer uses the official Override GPS coordinates and Appendix A descriptions for Goal, Toggle, Loader, tile, tape, and Load Zone placement. The right panel includes a north-oriented compass and a live Goal key:
 
-### Observation
-A flat per-robot vector (`STATE_DIM = 90` with the heatmap off; 234 with it on):
-- 13 scalars — role, alliance, clock, scores, pose `(x, y, sinθ, cosθ)`, balls held/nearby,
-  perceived quadrant control.
-- 68 relative features — 8 nearest blue + 4 nearest red balls `(dx, dy, dist, sinβ, cosβ)`
-  and 4 goal `(dx, dy)`.
-- 6 **perceived** goal-state features — fill level + opponent-ball count for each goal group.
-- 3 extras — expected score delta, success ratio, wrong-color held.
-- (optional) 12×12 potential heatmap.
+- **Base color** identifies a red/blue protected Alliance Goal or a dark neutral Goal.
+- **T** marks the Tall center Goal; other dark Goals are neutral Short Goals.
+- **Colored halo** identifies the alliance currently owning yellow Pin halves for that Goal.
+- **Two pips** show the simulator's current visible Pin-half colors.
+- **Center number** is the symbolic Pin/Cup stack-entry count; `G0`–`G8` match labels on the field.
 
-**Training wrappers:**
-- **1-robot** (`SingleAgentWrapper`): policy controls robot 0 with a `STATE_DIM` observation
-  and `Discrete(9)` action; robot 1 idles.
-- **2-robot / 2v2** (`TeamAgentWrapper`, default): both allies act each decision. Observation
-  is `concat(robot_0, robot_1)` → `STATE_DIM × 2`; action is `MultiDiscrete([9, 9])`; reward
-  is the sum of both robots' per-decision rewards. Spawns follow **VAIRC Section 7**: blue
-  below midfield, red above; within each alliance R0 starts on the **left wall** and R1 on
-  the **right wall**.
+References: [official Override manual](https://www.vexrobotics.com/override-manual) and [official VEX Override GPS coordinates](https://api.vex.com/vr/home/playgrounds/v5rc_override.html).
 
-### Decision cycle
-Every RL decision runs for `decision_interval` (3 s) of simulated time, sub-stepped at
-`dt` (0.05 s). Within a decision the environment may **adaptively re-plan** (e.g. chain
-COLLECT → SCORE once full), commits to a scoring goal so it doesn't thrash, and **times
-out** stuck actions.
+Simulation ticks are 0.05 seconds. Robots use circular top-down footprints with acceleration/deceleration, bounded yaw acceleration, walls, circular static Goal/Loader obstacles, and pairwise robot collision separation.
 
-### Notable behaviors
-- **Back-in scoring** — the robot drives *rear-first* onto the scoring pose so its scoring
-  face feeds the goal on arrival (no 180° spin at the mouth). Applies to long, mid, and low
-  goals.
-- **Creeping exploration** — when it cleans out an area and stops finding balls, an
-  exploration frontier sweeps up and down the field so it expands into new territory (e.g.
-  the top half) instead of oscillating in place.
-- **Side-lane navigation** — corridor waypoints (including lanes between each long goal and
-  the center X) let the planner route the robot between the bottom and top halves.
-- **Perceived goal state (FOV belief)** — goal contents update only from the robots' camera
-  cone (and their own scoring/descoring); unseen goals keep their last-seen contents.
-- **Park-zone soft avoidance** — the planner prefers routes that don't drive through the
-  top/bottom park platforms and deprioritizes balls sitting on them, but still crosses (or
-  enters for an in-park ball) as a last resort rather than stranding the robot. Tunable via
-  `_PARK_AVOID` / `_PARK_MARGIN` in `route_planner.py`.
-- **VAIRC Isolation Period (15 s)** — robots stay on their alliance side of midfield (y=72).
-  Blue below, red above. After Isolation, the **Interaction Period** allows full **y** movement.
-- **Per-robot field halves (always)** — R0 stays on the left (x ≤ 64), R1 on the right (x ≥ 80),
-  with a shared center strip for center-goal actions. Teammates never cross into each other's half.
-- **Robot–robot collision** — all robots physically collide (teammates and opponents).
-  Policies do **not** observe other robots in the state vector.
-- **Randomized layouts** — each run/episode jitters and permutes ball positions/colors.
-- **Failure injection** — optional stuck/offline/steal events for sim-to-real robustness.
+- **Tank:** normalized forward and yaw controls; lateral input is ignored.
+- **Mecanum:** normalized body-frame forward, lateral, and yaw controls.
+- High-level objectives use a deterministic chassis-aware point controller. This is intentionally simple and fast; it is not trajectory optimization.
 
----
+## Gymnasium environments
 
-## Project layout
+Both classes live in `offsim/sim/env.py` and expose a centralized two-blue-robot observation of 160 floats (80 per robot). The observation includes normalized robot state, all robot relatives, Goal relative/visible ownership state, Toggle state, nearest loose Pin/Cup, score, inventories, phase, and time.
 
-```
-.
-├── README.md
-├── vex-rl-design-doc.md            # design notes
-├── vex-rl-sim-and-trainer.md       # sim/trainer notes
-└── offsim/
-    ├── main.py                     # unified CLI (demo / train / eval / export / validate / train-offline)
-    ├── requirements.txt
-    ├── shared/
-    │   └── config.yaml             # CONTRACT shared with the ROS 2 repo (action IDs, state shape, physics)
-    ├── sim/
-    │   ├── env.py                  # VexAIEnv — Gymnasium env, decision loop, masks, scoring, FOV belief
-    │   ├── field.py                # field state, GoalState, balls, collisions, physics
-    │   ├── robot.py                # tank-drive motion model (move_toward_point, back-in/reverse)
-    │   ├── route_planner.py        # vision-cone collection routing, LOS, goal FOV checks
-    │   ├── renderer.py             # Pygame visualization + interactive editor + training panel
-    │   ├── opponent.py             # scripted opponents (random / greedy / defensive / mixed)
-    │   ├── config.py               # constants derived from shared/config.yaml
-    │   ├── failure.py              # failure injection
-    │   ├── heatmap.py              # potential-field heatmap
-    │   ├── decision_logger.py      # per-decision CSV logging
-    │   └── game_object.py          # ball model
-    ├── training/
-    │   ├── train_sim.py            # online PPO (MaskablePPO) + curriculum
-    │   ├── train_offline.py        # offline RL (CQL / IQL) from match data
-    │   ├── reward.py               # reward shaping (ground-truth based)
-    │   ├── curriculum.py           # curriculum stages
-    │   └── callbacks.py            # eval / stats / checkpoint callbacks
-    ├── export/
-    │   ├── export_onnx.py          # SB3 policy → ONNX
-    │   └── validate_onnx.py        # ONNX vs SB3 parity check
-    ├── scripts/                    # train.sh / deploy.sh / visual_scoring_check.py
-    ├── tests/                      # pytest (e.g. test_scoring.py)
-    ├── data/                       # match data for offline RL
-    └── models/                     # checkpoints, best, final_model.zip, onnx/, tb_logs/
-```
+### `OverrideContinuousEnv`
 
----
+- Action space: `Box(-1, 1, shape=(2, 6))`.
+- Per robot: `[forward, lateral, yaw, pin_intake, cup_intake, interact]`.
+- `pin_intake > 0.5` and `cup_intake > 0.5` attempt collection.
+- `interact > 0.5` attempts nearby Goal placement, Toggle claim, then Loader use; `< -0.5` attempts a legal Pin removal.
+- One Gym step advances one 0.05-second physics tick. Both red robots use scripted objectives.
+
+### `OverrideStrategyEnv`
+
+- Action space: `MultiDiscrete([10, 10])`, one objective for each allied robot.
+- One Gym step executes both objectives deterministically for 2 simulated seconds while two scripted red robots act.
+- `action_masks()` returns the flattened 20-entry boolean mask expected by MaskablePPO for the two branches.
+
+| ID | Objective |
+|---:|---|
+| 0 | `IDLE` |
+| 1 | `COLLECT_PIN` |
+| 2 | `COLLECT_CUP` |
+| 3 | `SCORE_NEAREST_GOAL` |
+| 4 | `SCORE_ALLIANCE_GOAL` |
+| 5 | `SCORE_MIDFIELD_GOAL` |
+| 6 | `USE_LOADER` |
+| 7 | `CLAIM_TOGGLE` |
+| 8 | `DEFEND_MIDFIELD` |
+| 9 | `REMOVE_OWN_PIN` |
+
+Invalid sampled actions are defensively converted to `IDLE`; MaskablePPO normally prevents them from being sampled. Reward is `(blue score delta - red score delta) / 5`, plus `+10` for a terminal win or `-10` for a terminal loss.
 
 ## Installation
 
-Requires Python 3.10+.
+Python 3.10+ is recommended. No dependencies beyond the existing requirements are needed.
 
 ```bash
-cd offsim
-pip install -r requirements.txt
-```
-
-For GPU training, install a CUDA-enabled PyTorch build from the official PyTorch selector
-(`pip install torch` may pull a CPU-only wheel).
-
----
-
-## Usage
-
-All commands run through `offsim/main.py`:
-
-```bash
-# Visual sim — greedy auto-play; randomized layout each run
-python offsim/main.py demo
-python offsim/main.py demo --num-robots 2 --opponent mixed   # 2v2 greedy demo
-# AUTO PLAY (default): collect → score → descore when opponent balls are in goals.
-# Mixed opponents descore your goals once you have scored; use panel DESCORE buttons to force it.
-
-# Train — 2v2 by default (2 allies, curriculum ramps to 2 opponents)
-python offsim/main.py train --num-allies 2 --timesteps 2000000 --n-envs 4
-python offsim/main.py train --num-allies 1 --timesteps 1000000 --n-envs 4   # legacy 1-robot
-python offsim/main.py train --resume latest --no-curriculum --num-allies 2 --opponents 2 --timesteps 600000
-
-# Evaluate (auto-detects 1v1 vs 2v2 model shape; --num-allies can override)
-python offsim/main.py eval --model latest --num-allies 2 --episodes 10
-python offsim/main.py eval --model latest --render --num-allies 2 --opponents 2 --opponent mixed
-
-# Offline RL from logged matches
-python offsim/main.py train-offline --data data/matches/ --algo cql
-
-# Export to ONNX and validate parity
-python offsim/main.py export   --model models/final_model --output models/onnx/model.onnx
-python offsim/main.py validate --onnx models/onnx/model.onnx --model models/final_model
-```
-
-**Demo controls:** `Space` pause · `S` step · `R` reset · `H` heatmap · `+/-` speed ·
-`Tab`/`WASD` manual drive · `RClick` add ball · panel buttons for auto-play / force-score /
-setup mode / training.
-
----
-
-## Training workflows
-
-Two ways to schedule difficulty. Both write into `--output-dir` (default `models/`), and
-**any run can `--resume` a prior model and compound into it** — weights, optimizer state,
-and the step counter all carry over, so training accumulates instead of restarting.
-
-### A) Staged curriculum (default)
-With no regime flags, training runs a fixed 4-stage schedule keyed off the global step
-counter (`training/curriculum.py`): 2-ally solo → solo + failures → 2v1 (1 opponent) →
-full 2v2 (2 opponents, mixed strategy). Good for a single long, hands-off run:
-
-```bash
-python offsim/main.py train --num-allies 2 --timesteps 2000000 --n-envs 4
-```
-
-### B) Manual phases (you control the schedule)
-The curriculum's thresholds (300k / 600k / 1M) are guesses. To decide phase lengths
-yourself by watching the score curve, drive your own regime — **any of these flags turns
-the curriculum off for that run:**
-
-| Flag | Meaning |
-|---|---|
-| `--no-curriculum` | Train the whole run at one fixed regime. |
-| `--num-allies {1,2}` | Allied robots (default `2` for 2v2 team training). |
-| `--opponents {0,1,2}` | Opponent count (passing this implies `--no-curriculum`). |
-| `--opponent-type {random,greedy,defensive,mixed}` | Opponent strategy (default `mixed`). |
-| `--failures {none,light,medium}` | Failure-injection level (default `none`). |
-
-Because each phase resumes into the same model, the phases stack into one policy:
-
-```bash
-# Phase 1 — solo fundamentals, for as long as the reward keeps climbing
-python offsim/main.py train --no-curriculum --timesteps 400000
-
-# Phase 2 — add an opponent, picking up the SAME model
-python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
-
-# Phase 3 — keep going (or go harder); still the same model
-python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 300000
-```
-
-> **`--timesteps` on resume means *additional* steps.** SB3 adds it to the loaded counter,
-> so Phase 2 above trains 1.0M → 1.6M, not "until 600k". Watch `[ep …] blue=…` in the
-> console (or `tensorboard --logdir models/tb_logs`, curve `game/avg_score`); when a phase
-> plateaus, move to the next. Expect a brief dip right after a regime change while the
-> policy adapts — give each phase enough steps to re-plateau.
-
-### Evaluating
-```bash
-python offsim/main.py eval --model latest --episodes 10                           # solo
-python offsim/main.py eval --model latest --render --opponents 1 --opponent mixed  # vs opponent
-```
-`--model latest` picks the freshest model under `models/` by modification time
-(interrupted / final / newest checkpoint / best). `--opponents 1` puts a live opponent on
-the field so you can watch contested play.
-
-### Continuing training on another machine
-The policy is tiny (~278 KB), so git carries it fine — no LFS or cloud needed. Two things
-must travel, and they travel differently:
-
-- **Code** (`offsim/`) via git — **mandatory, and it must match.** A resume fails if the
-  env's observation/action shape differs, so the other machine must be on the **same commit**
-  that produced the model. Don't edit `STATE_DIM` or the action set between save and resume.
-- **The model `.zip`** — committed alongside the code. `models/final_model.zip` (and
-  `best/`, `interrupted_model.zip`) are tracked; checkpoints, TensorBoard logs, and eval
-  logs are git-ignored to keep history small, so `git add -A` stays clean.
-
-```bash
-# Machine A — after a phase finishes
-git add -A && git commit -m "training phase + model" && git push
-
-# Machine B
-git pull
 pip install -r offsim/requirements.txt
-python offsim/main.py train --resume latest --opponents 1 --opponent-type mixed --timesteps 600000
 ```
 
-The `.zip` is device-agnostic: a model saved on CPU loads on GPU and vice-versa (`--device
-auto|cpu|cuda`). To snapshot a model before a risky phase, copy `models/final_model.zip`
-aside or point that phase at a different `--output-dir`.
+All commands below run from the repository root.
 
----
+## Commands
 
-## Configuration
+```bash
+# Visual deterministic 2v2 autoplay (1x is real-time)
+python offsim/main.py demo --chassis tank
+python offsim/main.py demo --chassis mecanum --opponent toggle
+python offsim/main.py demo --chassis tank --speed 0.5  # slow motion
 
-`offsim/shared/config.yaml` is the single source of truth for the **action IDs, observation
-contract, field, and robot physics**. It is intentionally the file shared with the
-deployment repo so the trained policy's inputs/outputs mean the same thing on the robot.
-`sim/config.py` loads it and derives the rest (e.g. `STATE_DIM`, tick counts, scoring
-geometry). Change a contract value here, retrain, and re-export.
+# Headless complete match / short smoke
+python offsim/main.py demo --headless --matches 1 --seed 7
+python offsim/main.py demo --headless --max-decisions 3
 
----
+# Centralized MaskablePPO training
+python offsim/main.py train --chassis tank --timesteps 1000000 --n-envs 4
+python offsim/main.py train --chassis mecanum --timesteps 100000 --n-envs 1
 
-## Transferring the policy to ROS 2
+# Evaluate, export, and validate a newly trained Override checkpoint
+python offsim/main.py eval --model models/final_model.zip --episodes 5 --chassis tank
+python offsim/main.py export --model models/final_model.zip --output models/onnx/override.onnx
+python offsim/main.py validate --onnx models/onnx/override.onnx --model models/final_model.zip
 
-> **Status: planned — not implemented yet.** This section is a roadmap for moving a trained
-> policy onto the physical robot under ROS 2. No deployment code lives in this repo yet.
-
-The policy itself is small and portable (action selection from a fixed-length state vector).
-The hard part of sim-to-real here is that **most of the behavior is deterministic logic that
-currently lives in the simulator** — perception → state vector, route/scoring planners, and
-the motion model. Those must be re-created (or ported) on the robot so the *same action ID*
-produces the *same behavior* it did in training.
-
-### What already bridges to the robot
-- **`shared/config.yaml`** — the agreed contract (action IDs, state shape, physics). The
-  ROS 2 repo should load the *same file* so both sides never drift.
-- **ONNX export** (`export/export_onnx.py`) — produces `model.onnx` (`state` float32 →
-  `action_logits`), to run on the robot with `onnxruntime` (CPU or Jetson GPU);
-  `validate_onnx.py` checks ONNX↔PyTorch parity. ⚠️ The export script currently assumes a
-  two-robot concatenated input (`STATE_DIM × 2`), while training uses the single-agent
-  wrapper (`STATE_DIM`) — reconcile the export's input shape with your trained policy before
-  deploying.
-- **Partial observability** — the sim already restricts goal knowledge to the camera FOV
-  (the perceived `goal_belief`), so the policy is trained to act on real perception rather
-  than omniscient state. This is exactly what a real camera provides.
-
-### What needs to be built on the ROS 2 side (proposed nodes)
-1. **Perception → world state.** Fuse VEX AI camera / OAK-D detections + localization into
-   the same world model the sim uses: ball positions+colors, robot pose, and a **perceived
-   goal-contents tracker** mirroring `env.goal_belief` (update a goal only when it's in the
-   camera FOV; otherwise keep last-seen).
-2. **State-vector builder.** Reproduce `env._build_obs()` *exactly* — same feature order,
-   same normalization constants, same nearest-N selection, same relative encodings. This is
-   the highest-risk parity surface; pin it to the shared contract and add a golden-vector
-   test (sim and robot must produce identical vectors for identical world inputs).
-3. **Policy inference node.** Load `model.onnx`, run at the decision interval (~3 s),
-   apply the **same action mask** logic as `env.action_masks()`, and `argmax` the logits.
-4. **Action → motion executor.** Port the deterministic controllers the action selects
-   among — `_action_to_target` (vision-cone collection routing, nav waypoints / corridors,
-   scan/explore frontier) and `robot.move_toward_point` (drive + **back-in scoring**) — onto
-   the real drivetrain (likely Nav2 or a custom controller). Note the real base is
-   **mecanum**; the sim models tank drive, so the executor can exploit strafing.
-5. **Scoring/intake interface.** Map the scoring/eject sequences to the real intake +
-   alignment routines, including the back-in approach and dwell.
-
-### Suggested package shape
-```
-ros2_ws/src/leroiai_deploy/
-├── config/          # symlink or copy of shared/config.yaml
-├── models/          # model.onnx
-├── perception/      # detections + localization → world state + goal-belief tracker
-├── state_builder/   # world state → STATE_DIM observation (mirrors env._build_obs)
-├── policy/          # onnxruntime inference + action masking
-├── executor/        # action ID → nav goals / intake / scoring controllers
-└── bringup/         # launch files, params
+# Tests
+python -m pytest -q
 ```
 
-### Parity checklist before trusting the robot
-- [ ] ROS 2 loads the identical `shared/config.yaml`; action IDs and `STATE_DIM` match.
-- [ ] ONNX input shape reconciled with the trained policy (single-agent `STATE_DIM` vs the
-      export script's `STATE_DIM × 2`).
-- [ ] Golden test: identical world inputs → identical state vectors (sim vs robot), within tol.
-- [ ] ONNX argmax matches SB3 `predict(deterministic=True)` on recorded observations.
-- [ ] Action masking on the robot matches `env.action_masks()`.
-- [ ] Each action's executor reproduces the sim's intent (collect / score long-mid-low /
-      descore / eject / defend / idle), including back-in alignment.
-- [ ] Goal-belief tracker goes stale/updates from FOV the same way the sim does.
-- [ ] Decision cadence and commit/timeout behavior match the sim's decision loop.
+Old Push Back checkpoints were removed and are incompatible with the 160-float observation and centralized two-branch action contract. ONNX export emits 20 unmasked logits; a consumer must split them into two 10-action branches and apply the corresponding mask before selection.
 
----
+**Renderer controls:** `Space` pause/resume, `S` single strategy step while paused, `R` reset, `+/-` halve/double playback speed from `0.25x` through `16x`. Visual mode draws every 0.05-second physics tick; `1x` runs in real time, while headless demos and training remain uncapped. The current renderer intentionally has no field editor or manual driving mode.
 
-## Notes
-- `MaskablePPO` policies require action masks at inference; `eval`/export account for this.
-- Changing the observation layout changes `STATE_DIM` and invalidates old checkpoints — the
-  loader detects the mismatch and asks you to retrain.
+## Project layout
+
+```text
+offsim/
+├── main.py                 # Override CLI
+├── shared/config.yaml      # action/profile/physics/scoring contract
+├── sim/
+│   ├── config.py           # strict shared-contract loader
+│   ├── robot.py            # tank/mecanum kinematics
+│   ├── field.py            # domain, stacks, scoring, collisions, phases
+│   ├── env.py              # continuous and strategy Gym environments
+│   ├── opponent.py         # scripted opponent objective selection
+│   └── renderer.py         # Pygame renderer
+├── training/
+│   ├── train_sim.py        # MaskablePPO integration
+│   ├── reward.py           # reward contract helper
+│   └── callbacks.py        # score logging
+├── export/                 # centralized actor ONNX export/parity validation
+└── tests/                  # focused Override behavior and match tests
+```
+
+## Honest limitations
+
+- Field element placement, tape, Goal colors/types, and VEX U starting counts follow Override Manual v1.0 and official GPS references. The 144-inch coordinate frame, dense cluster offsets, collision radii, opening-side enforcement, Goal protection behavior, and AWP condition remain explicit simulator proxies and must not be treated as referee-accurate.
+- Pins/Cups are points or symbolic Goal entries; there is no rigid-body object physics, tipping, Pin rotation, Cup volume, stack stability, entanglement, or 3D occlusion.
+- Subjective referee rules (possession nuance, incidental vs intentional contact, trapping, damage, match affecting violations, and field reset tolerances) are not adjudicated. Supported illegal removals are prevented and telemetered.
+- Static navigation is a reactive point controller and can stall in congestion. Collisions are deterministic circular separation, not momentum/traction simulation.
+- Scripted opponents provide full-match activity but are not competitive strategy benchmarks.
+- Offline CQL/IQL and physical-robot/ROS deployment are not implemented for the centralized `MultiDiscrete` Override contract.
+- The policy sees complete simulator state; perception noise, localization error, communications, actuator failures, and sim-to-real transfer are outside this prototype.

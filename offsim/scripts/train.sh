@@ -1,4 +1,3 @@
-#!/bin/bash
-# Convenience wrapper: train PPO with default args
-cd "$(dirname "$0")/.."
-python main.py train --timesteps 2000000 --n-envs 4 "$@"
+#!/usr/bin/env bash
+set -euo pipefail
+python offsim/main.py train --chassis "${CHASSIS:-tank}" --timesteps "${TIMESTEPS:-1000000}" "$@"
