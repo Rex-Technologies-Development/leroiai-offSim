@@ -7,11 +7,12 @@ from gymnasium import spaces
 import numpy as np
 from .config import (
     Action, Alliance, ChassisType, DECISION_INTERVAL, DT, FIELD_HEIGHT,
-    FIELD_WIDTH, MATCH_DURATION, NUM_ACTIONS, OBJECTS, Phase, STATE_DIM, TEAM_STATE_DIM,
+    FIELD_WIDTH, GOAL_CAPACITY, INTERACTION_RANGE, MATCH_DURATION, NUM_ACTIONS,
+    OBJECTS, Phase, STATE_DIM, TEAM_STATE_DIM,
 )
 from .field import OverrideField, Goal
 from .opponent import ScriptedOpponent
-from .robot import wrap_angle
+from .robot import ESCAPE_TICKS, STUCK_MIN_DIST, wrap_angle
 
 
 def _nearest(items, robot, predicate=lambda _: True):
@@ -19,10 +20,78 @@ def _nearest(items, robot, predicate=lambda _: True):
     return min(choices, key=lambda item: math.hypot(item.x-robot.x, item.y-robot.y), default=None)
 
 
-def _body_command(robot, target: tuple[float, float]) -> tuple[float, float, float]:
+def _avoid_obstacles(robot, tx, ty, ux, uy, obstacles, look=22.0, gain=2.2):
+    """Forward look-ahead 'vision' sensor: steer the unit heading (ux, uy) around any
+    static obstacle blocking the path to the target. The destination obstacle itself
+    is skipped so the robot can still dock at its target Goal/Loader."""
+    steer_x = steer_y = 0.0
+    for ox, oy, orad in obstacles:
+        if math.hypot(ox - tx, oy - ty) < orad + INTERACTION_RANGE:      # this obstacle IS the destination
+            continue
+        vx, vy = ox - robot.x, oy - robot.y
+        dist = math.hypot(vx, vy)
+        clearance = robot.radius + orad + 2.0
+        if dist < 1e-6 or dist > look + clearance:
+            continue
+        along = vx * ux + vy * uy                                        # forward distance (inside the vision cone)
+        if along <= 0:
+            continue                                                     # obstacle is behind us
+        perp = vx * (-uy) + vy * ux                                      # signed lateral offset (left positive)
+        if abs(perp) >= clearance:
+            continue                                                     # not actually in the path
+        sgn = -1.0 if perp >= 0 else 1.0                                 # steer toward the clearer side
+        strength = (clearance - abs(perp)) / clearance * max(0.0, 1.0 - dist / (look + clearance))
+        steer_x += sgn * (-uy) * strength
+        steer_y += sgn * (ux) * strength
+    ax, ay = ux + gain * steer_x, uy + gain * steer_y
+    norm = math.hypot(ax, ay)
+    return (ax / norm, ay / norm) if norm > 1e-6 else (ux, uy)
+
+
+def _escape_heading(robot, ux, uy, obstacles) -> tuple[float, float]:
+    """Stuck-breaker heading: the robot is pinned. Return a unit heading along the TANGENT of the
+    nearest BLOCKING obstacle, on whichever side better progresses toward the goal (ux, uy), so the
+    robot slides free instead of grinding. If nothing is blocking ahead (pinned on a wall), slide
+    toward the field centre."""
+    best, best_d = None, 1e18
+    for ox, oy, orad in obstacles:
+        vx, vy = ox - robot.x, oy - robot.y
+        d = math.hypot(vx, vy)
+        if d < 1e-6 or (vx * ux + vy * uy) <= 0:                         # skip self / obstacles behind us
+            continue
+        if d <= robot.radius + orad + 4.0 and d < best_d:                # in contact range, nearest
+            best_d, best = d, (vx / d, vy / d)
+    if best is None:                                                     # not an obstacle -> off a wall, toward centre
+        nx, ny = FIELD_WIDTH / 2 - robot.x, FIELD_HEIGHT / 2 - robot.y
+        t = (-uy, ux)
+        return t if (t[0] * nx + t[1] * ny) >= 0 else (uy, -ux)
+    nx, ny = best
+    t1, t2 = (-ny, nx), (ny, -nx)                                        # tangents perpendicular to robot->obstacle
+    return t1 if (t1[0] * ux + t1[1] * uy) >= (t2[0] * ux + t2[1] * uy) else t2   # goal-ward side
+
+
+def _body_command(robot, target: tuple[float, float], obstacles=(), escape: bool = True) -> tuple[float, float, float]:
     dx, dy = target[0]-robot.x, target[1]-robot.y
     distance = math.hypot(dx, dy)
-    if distance < 0.5: return (0.0, 0.0, 0.0)
+    if distance < 0.5:
+        robot._escape_ticks = 0                                          # arrived: cancel any escape
+        return (0.0, 0.0, 0.0)
+    ux, uy = dx/distance, dy/distance
+    if obstacles:
+        # engage the stuck-breaker only when FAR from target (a non-target obstacle); a robot pressed
+        # against its OWN target goal to score is grinding productively and must be left alone. Scoped
+        # to the policy-controlled allies (escape=True): it fixes their long persistent grinds; the
+        # scripted opponent's short corner bumps are self-resolving and the committed escape only
+        # lengthens them, so the red controller keeps the plain reactive avoider (escape=False).
+        if escape and distance > STUCK_MIN_DIST and (robot._escape_ticks > 0 or robot.is_grinding()):
+            if robot._escape_ticks <= 0:
+                robot._escape_ticks = ESCAPE_TICKS                       # commit to a tangential escape
+            robot._escape_ticks -= 1
+            ux, uy = _escape_heading(robot, ux, uy, obstacles)
+        else:                                                            # normal reactive avoidance
+            robot._escape_ticks = 0
+            ux, uy = _avoid_obstacles(robot, target[0], target[1], ux, uy, obstacles)
+        dx, dy = ux*distance, uy*distance
     desired = math.atan2(dy, dx); error = wrap_angle(desired-robot.heading)
     if robot.chassis is ChassisType.MECANUM:
         c, s = math.cos(robot.heading), math.sin(robot.heading)
@@ -39,6 +108,12 @@ def _legal_removal_goal(field: OverrideField, robot, goal: Goal) -> bool:
         return False
     pin = field.pins[goal.stack[-1].object_id]
     return pin.halves == (robot.alliance.value, robot.alliance.value)
+
+
+def _removable_goal(field: OverrideField, robot, goal: Goal) -> bool:
+    """The generalized REMOVE/DESCORE target: remove your own top Pin, OR descore the
+    opponent's top Pin (from any Goal that is not their protected Alliance Goal)."""
+    return _legal_removal_goal(field, robot, goal) or field.can_descore(robot, goal)
 
 
 def _robot_observation(field: OverrideField, robot_id: int) -> np.ndarray:
@@ -131,7 +206,7 @@ class ObjectiveController:
     def target(self, robot_id: int, action: Action):
         robot = self.field.robots[robot_id]
         if action is Action.COLLECT_PIN:
-            return self.field.nearest_object(robot, "pin")
+            return self.field.nearest_object(robot, "pin", robot.alliance)
         if action is Action.COLLECT_CUP:
             return self.field.nearest_object(robot, "cup")
         if action is Action.USE_LOADER:
@@ -142,26 +217,33 @@ class ObjectiveController:
             goals = self.field.goals
             if action is Action.SCORE_ALLIANCE_GOAL: goals = [g for g in goals if g.protected_by is robot.alliance]
             if action is Action.SCORE_MIDFIELD_GOAL: goals = [g for g in goals if g.y == 72.0]
-            return _nearest(goals, robot, lambda g: len(g.stack) < 8)
+            return _nearest(goals, robot, lambda g: len(g.stack) < GOAL_CAPACITY)
         if action is Action.REMOVE_OWN_PIN:
-            return _nearest(self.field.goals, robot, lambda g: _legal_removal_goal(self.field, robot, g))
+            return _nearest(self.field.goals, robot, lambda g: _removable_goal(self.field, robot, g))
         if action is Action.DEFEND_MIDFIELD:
             return type("Target", (), {"x": 64.0 if robot_id % 2 == 0 else 80.0, "y": 72.0})()
         return None
 
     def command(self, robot_id: int, action: Action) -> tuple[float, float, float]:
         target = self.target(robot_id, action)
-        return (0.0, 0.0, 0.0) if target is None else _body_command(self.field.robots[robot_id], (target.x, target.y))
+        if target is None:
+            return (0.0, 0.0, 0.0)
+        # scripted-navigation path (the red opponent): plain reactive avoider, no ally stuck-breaker
+        return _body_command(self.field.robots[robot_id], (target.x, target.y),
+                             self.field.static_obstacles(), escape=False)
 
     def interact(self, robot_id: int, action: Action) -> bool:
         robot = self.field.robots[robot_id]; target = self.target(robot_id, action)
-        if action is Action.COLLECT_PIN: return self.field.collect(robot, "pin")
+        if action is Action.COLLECT_PIN: return self.field.collect(robot, "pin", robot.alliance)
         if action is Action.COLLECT_CUP: return self.field.collect(robot, "cup")
         if action is Action.USE_LOADER: return self.field.use_loader(robot)
         if action is Action.CLAIM_TOGGLE and target is not None: return self.field.claim_toggle(robot, target)
         if action in (Action.SCORE_NEAREST_GOAL, Action.SCORE_ALLIANCE_GOAL, Action.SCORE_MIDFIELD_GOAL) and isinstance(target, Goal):
             return self.field.place(robot, target)
-        if action is Action.REMOVE_OWN_PIN and isinstance(target, Goal): return self.field.remove_own_pin(robot, target)
+        if action is Action.REMOVE_OWN_PIN and isinstance(target, Goal):
+            if self.field.can_descore(robot, target):        # prefer attacking the enemy
+                return self.field.descore_pin(robot, target)
+            return self.field.remove_own_pin(robot, target)
         return False
 
 
@@ -199,8 +281,9 @@ class OverrideContinuousEnv(_OverrideGymBase):
                 elif toggle and math.hypot(toggle.x-robot.x, toggle.y-robot.y) <= 10: self.field.claim_toggle(robot, toggle)
                 else: self.field.use_loader(robot)
             elif controls[5] < -0.5:
-                goal = _nearest(self.field.goals, robot, lambda g: _legal_removal_goal(self.field, robot, g))
-                if goal: self.field.remove_own_pin(robot, goal)
+                goal = _nearest(self.field.goals, robot, lambda g: _removable_goal(self.field, robot, g))
+                if goal:
+                    self.field.descore_pin(robot, goal) if self.field.can_descore(robot, goal) else self.field.remove_own_pin(robot, goal)
         for i, act in opponent_actions.items(): controller.interact(i, act)
         return self._obs(), self._reward(), self.field.done, False, self._info()
 
@@ -226,13 +309,13 @@ class OverrideStrategyEnv(_OverrideGymBase):
             values[Action.COLLECT_PIN] = robot.held_pin is None and self.field.nearest_object(robot, "pin") is not None
             values[Action.COLLECT_CUP] = robot.held_cup is None and self.field.nearest_object(robot, "cup") is not None
             holding = robot.held_pin is not None or robot.held_cup is not None
-            values[Action.SCORE_NEAREST_GOAL] = holding and any(len(g.stack) < 8 for g in self.field.goals)
-            values[Action.SCORE_ALLIANCE_GOAL] = holding and any(g.protected_by is robot.alliance and len(g.stack) < 8 for g in self.field.goals)
-            values[Action.SCORE_MIDFIELD_GOAL] = holding and any(g.y == 72.0 and len(g.stack) < 8 for g in self.field.goals)
+            values[Action.SCORE_NEAREST_GOAL] = holding and any(len(g.stack) < GOAL_CAPACITY for g in self.field.goals)
+            values[Action.SCORE_ALLIANCE_GOAL] = holding and any(g.protected_by is robot.alliance and len(g.stack) < GOAL_CAPACITY for g in self.field.goals)
+            values[Action.SCORE_MIDFIELD_GOAL] = holding and any(g.y == 72.0 and len(g.stack) < GOAL_CAPACITY for g in self.field.goals)
             values[Action.USE_LOADER] = (robot.held_pin is None and inv["pin"] > 0) or (robot.held_cup is None and inv["cup"] > 0)
             values[Action.CLAIM_TOGGLE] = any(t.owner is not robot.alliance for t in self.field.toggles)
             values[Action.DEFEND_MIDFIELD] = True
-            values[Action.REMOVE_OWN_PIN] = any(_legal_removal_goal(self.field, robot, g) for g in self.field.goals)
+            values[Action.REMOVE_OWN_PIN] = any(_removable_goal(self.field, robot, g) for g in self.field.goals)
             masks.extend(values)
         return np.asarray(masks, dtype=bool)
 

@@ -1,0 +1,49 @@
+# Canonical contested-task environment contract (plan Section 3.1).
+# Strict loader: unknown keys are rejected. `alpha` is the knob; `tau_rev` is
+# DERIVED (tau_rev = tau_com / alpha), and `alpha: 0.0` maps to tau_rev = inf.
+canonical:
+  # episode
+  dt: 0.05                  # physics tick, seconds. Matches offSim.
+  decision_dt: 0.5          # allocator cadence, seconds. Must be a multiple of dt.
+  horizon_T: 120.0          # seconds. Matches an Override match.
+
+  # counts
+  n_robots: 4
+  n_tasks: 12
+  n_adversaries: 4
+  max_robots: 8             # padding bound for the graph
+  max_tasks: 20
+  max_adversaries: 8
+
+  # field
+  field_size: [3.66, 3.66]  # metres. 144 inches, matches Override.
+  service_radius: 0.20      # metres
+
+  # dynamics
+  v_max: 1.5                # m/s
+  a_max: 3.0                # m/s^2
+  adv_v_max: 1.5
+  adv_a_max: 3.0
+
+  # the contested mechanic
+  tau_com: 2.0              # seconds
+  alpha: 1.0                # tau_rev is DERIVED: tau_rev = tau_com / alpha
+  beta: 1.0                 # contest parameter, see paper Section III-B
+  contest_mode: majority    # majority | suppress | none
+
+  # task layout
+  weight_dist: lognormal    # uniform | lognormal | bimodal
+  weight_range: [1.0, 5.0]
+  layout: clustered         # uniform | clustered | polarized
+  n_clusters: 3
+  protected_fraction: 0.0   # fraction of tasks that are irreversible (Override alliance-goal analogue)
+
+  # allocation
+  allow_multi_defend: true
+  allow_multi_acquire: false
+
+  # adversaries
+  adversary_population: [greedy_nearest, value_targeting, feinter]
+  holdout_population: [camper, learned_selfplay]
+
+  seed: 0

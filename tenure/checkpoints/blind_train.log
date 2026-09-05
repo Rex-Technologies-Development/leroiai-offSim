@@ -1,0 +1,3 @@
+device=cuda params=468002 mode=multiplicative alpha=1.0 D=90
+[----------------------]    5/250   2%  J_H~-0.216  MAE~0.453  ent~10.199  eta 35m35s
+[#---------------------]   10/250   4%  J_H~-0.206  MAE~0.274  ent~10.161  eta 34m51s

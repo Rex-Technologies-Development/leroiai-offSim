@@ -1,0 +1,4 @@
+[21:22:20] phase2: hd2 complete -> training e9_vanilla
+device=cuda params=434845 mode=multiplicative alpha=1.0 D=240
+[21:27:05] phase2: e9_vanilla done
+[21:27:06] PHASE2 COMPLETE

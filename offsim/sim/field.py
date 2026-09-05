@@ -6,7 +6,7 @@ from typing import Iterable
 import numpy as np
 from .config import (
     Alliance, ChassisType, Phase, ALLIANCE_HALF_POINTS, AUTONOMOUS_LINES,
-    DT, GOAL_CAPACITY, INTERACTION_RANGE, LOAD_ZONE_DEPTH, LOAD_ZONE_SPAN,
+    CONTESTED, DT, GOAL_CAPACITY, INTERACTION_RANGE, LOAD_ZONE_DEPTH, LOAD_ZONE_SPAN,
     MATCH_DURATION,
     MIDFIELD_ROBOT_POINTS, OBJECTS, OPENING_BONUS_POINTS, OPENING_DURATION,
     OWNED_YELLOW_POINTS,
@@ -177,6 +177,16 @@ class OverrideField:
         self._next_id = 0
         self._setup()
 
+        # TENURE contested mechanic (plan Section 4). OFF by default; when enabled,
+        # Toggle ownership becomes dwell-based (Channel 1, territory reversal).
+        self.contested = dict(CONTESTED)
+        self.contested_enabled = bool(self.contested["enabled"])
+        self._toggle_claim_timer: dict[int, float] = {t.toggle_id: 0.0 for t in self.toggles}
+        self._toggle_pending: dict[int, Alliance | None] = {t.toggle_id: None for t in self.toggles}
+        self._descore_timer: dict[int, float] = {g.goal_id: 0.0 for g in self.goals}
+        self.held_value: dict[Alliance, float] = {Alliance.BLUE: 0.0, Alliance.RED: 0.0}
+        self.reversal_events: list[dict] = []
+
     @property
     def time_remaining(self) -> float:
         return max(0.0, MATCH_DURATION - self.elapsed)
@@ -265,13 +275,21 @@ class OverrideField:
         values = self.pins.values() if kind == "pin" else self.cups.values()
         return (obj for obj in values if obj.x is not None and obj.placed_goal is None)
 
-    def nearest_object(self, robot: Robot, kind: str) -> Pin | Cup | None:
-        return min(self.objects_on_field(kind), key=lambda o: math.hypot(float(o.x)-robot.x, float(o.y)-robot.y), default=None)
+    def nearest_object(self, robot: Robot, kind: str, alliance: Alliance | None = None) -> Pin | Cup | None:
+        """Nearest loose object. For Pins with an ``alliance`` hint, prefer pins that
+        carry no opponent-colored half (own-color + yellow only), so a team does not
+        hand the opponent free points; falls back to any Pin when none remain."""
+        pool = list(self.objects_on_field(kind))
+        if kind == "pin" and alliance is not None:
+            opponent = alliance.opponent.value
+            friendly = [obj for obj in pool if opponent not in obj.halves]
+            pool = friendly or pool
+        return min(pool, key=lambda o: math.hypot(float(o.x)-robot.x, float(o.y)-robot.y), default=None)
 
-    def collect(self, robot: Robot, kind: str) -> bool:
+    def collect(self, robot: Robot, kind: str, alliance: Alliance | None = None) -> bool:
         if (kind == "pin" and robot.held_pin is not None) or (kind == "cup" and robot.held_cup is not None):
             robot.blocked_interactions += 1; return False
-        obj = self.nearest_object(robot, kind)
+        obj = self.nearest_object(robot, kind, alliance)
         if obj is None or math.hypot(float(obj.x)-robot.x, float(obj.y)-robot.y) > INTERACTION_RANGE:
             return False
         obj.x = obj.y = None
@@ -330,9 +348,169 @@ class OverrideField:
             self.telemetry.append(f"neutral_removal_block:r{robot.robot_id}:g{goal.goal_id}"); robot.blocked_interactions += 1; return False
         goal.stack.pop(); pin.placed_goal = None; robot.held_pin = pin.object_id; return True
 
+    def can_descore(self, robot: Robot, goal: Goal) -> bool:
+        """Whether ``robot`` may remove the opponent's top Pin from ``goal``.
+
+        You can descore the enemy's top Pin from any Goal *except their own protected
+        Alliance Goal*. The top entry must be a Pin carrying the opponent's colour.
+        """
+        if goal.protected_by is robot.alliance.opponent:
+            return False
+        if not goal.stack or goal.stack[-1].kind != "pin":
+            return False
+        pin = self.pins[goal.stack[-1].object_id]
+        return robot.alliance.opponent.value in pin.halves
+
+    def descore_pin(self, robot: Robot, goal: Goal) -> bool:
+        """Remove the opponent's top Pin from ``goal`` and drop it loose on the field
+        just outside the Goal (so the credit is lost and the Pin returns to play).
+
+        When the contested mechanic is on, descoring is dwell-based and contested
+        (Channel 2) — handled by ``update_contested`` — so this instant path is
+        disabled, exactly like the instant Toggle claim."""
+        if self.contested_enabled:
+            return False
+        if math.hypot(robot.x-goal.x, robot.y-goal.y) > INTERACTION_RANGE+self.goal_radius:
+            return False
+        if goal.protected_by is robot.alliance.opponent:
+            self.telemetry.append(f"protected_descore_block:r{robot.robot_id}:g{goal.goal_id}")
+            robot.blocked_interactions += 1; return False
+        if not self.can_descore(robot, goal):
+            return False
+        entry = goal.stack.pop(); pin = self.pins[entry.object_id]; pin.placed_goal = None
+        angle = float(self.rng.uniform(0.0, 2*math.pi))
+        pin.x = goal.x + math.cos(angle)*(self.goal_radius+4.0)
+        pin.y = goal.y + math.sin(angle)*(self.goal_radius+4.0)
+        robot.telemetry.append("descore")
+        self.telemetry.append(f"descore:r{robot.robot_id}:g{goal.goal_id}")
+        return True
+
     def claim_toggle(self, robot: Robot, toggle: Toggle) -> bool:
+        # When the contested mechanic is on, ownership is dwell-based (Channel 1);
+        # the instantaneous claim is disabled and update_contested() flips owners.
+        if self.contested_enabled:
+            return False
         if math.hypot(robot.x-toggle.x, robot.y-toggle.y) > INTERACTION_RANGE: return False
         toggle.owner = robot.alliance; return True
+
+    def _toggle_challenger(self, near: dict, owner: Alliance | None, beta: float, mode: str) -> Alliance | None:
+        """Which alliance (if any) is currently winning the dwell contest for a Toggle."""
+        blue, red = near[Alliance.BLUE], near[Alliance.RED]
+        if owner is None:                                   # unclaimed: majority (or sole, if suppress) takes it
+            if mode == "suppress":
+                if blue >= 1 and red == 0: return Alliance.BLUE
+                if red >= 1 and blue == 0: return Alliance.RED
+                return None
+            if blue > red and blue >= 1: return Alliance.BLUE
+            if red > blue and red >= 1: return Alliance.RED
+            return None
+        attackers, defenders = near[owner.opponent], near[owner]
+        if attackers < 1:
+            return None
+        if mode == "none":
+            return owner.opponent                           # defenders have no effect
+        if mode == "suppress":
+            return owner.opponent if defenders == 0 else None
+        return owner.opponent if attackers > beta * defenders else None   # majority (default)
+
+    def _toggle_quadrant_value(self, toggle: Toggle) -> int:
+        """Owned-yellow value in this Toggle's quadrant — the credit that flips hands."""
+        return sum(
+            g.placed_pin_halves(self.pins).count(YELLOW) * OWNED_YELLOW_POINTS
+            for g in self.goals if g.quadrant == toggle.quadrant
+        )
+
+    def _pin_owner(self, pin: Pin) -> Alliance | None:
+        """The alliance whose colour is on a Pin (the side that would defend it)."""
+        has_blue = Alliance.BLUE.value in pin.halves
+        has_red = Alliance.RED.value in pin.halves
+        if has_blue and not has_red:
+            return Alliance.BLUE
+        if has_red and not has_blue:
+            return Alliance.RED
+        return None                                              # neutral (yellow) or mixed
+
+    def _update_goal_descore(self, dt: float, beta: float, mode: str) -> None:
+        """Channel 2: dwell-based, contested descoring. The opponent must linger at
+        your Goal to remove your top Pin, and a defender of your alliance present
+        cancels it (same majority rule as Toggles). Alliance Goals are protected."""
+        dwell = float(self.contested["pin_removal_dwell"]) * float(self.contested["alpha_scale"])
+        for goal in self.goals:
+            gid = goal.goal_id
+            owner = None
+            if goal.stack and goal.stack[-1].kind == "pin":
+                owner = self._pin_owner(self.pins[goal.stack[-1].object_id])
+            if owner is None or goal.protected_by is owner:      # nothing descorable / protected goal
+                self._descore_timer[gid] = 0.0
+                continue
+            attacker = owner.opponent
+            near = {owner: 0, attacker: 0}
+            for robot in self.robots:
+                if math.hypot(robot.x - goal.x, robot.y - goal.y) <= INTERACTION_RANGE + self.goal_radius:
+                    near[robot.alliance] += 1
+            if not self._descore_contest(near[attacker], near[owner], beta, mode):
+                self._descore_timer[gid] = 0.0                   # defended (or no attacker): reset
+                continue
+            self._descore_timer[gid] += dt
+            if self._descore_timer[gid] >= dwell:
+                entry = goal.stack.pop(); pin = self.pins[entry.object_id]; pin.placed_goal = None
+                angle = float(self.rng.uniform(0.0, 2 * math.pi))
+                pin.x = goal.x + math.cos(angle) * (self.goal_radius + 4.0)
+                pin.y = goal.y + math.sin(angle) * (self.goal_radius + 4.0)
+                self.reversal_events.append({
+                    "t": self.elapsed, "channel": "object", "site_id": gid,
+                    "from_alliance": owner.value, "to_alliance": None, "value_delta": ALLIANCE_HALF_POINTS,
+                })
+                self._descore_timer[gid] = 0.0
+
+    @staticmethod
+    def _descore_contest(attackers: int, defenders: int, beta: float, mode: str) -> bool:
+        if attackers < 1:
+            return False
+        if mode == "none":
+            return True
+        if mode == "suppress":
+            return defenders == 0
+        return attackers > beta * defenders                      # majority (default)
+
+    def update_contested(self, dt: float) -> None:
+        """Advance dwell-based Toggle (Channel 1) and Goal descore (Channel 2)
+        contests, and integrate held value."""
+        for alliance in (Alliance.BLUE, Alliance.RED):
+            self.held_value[alliance] += self.raw_score(alliance) * dt
+        scale = float(self.contested["alpha_scale"])
+        claim_dwell = float(self.contested["toggle_claim_dwell"]) * scale
+        beta = float(self.contested["beta"])
+        mode = str(self.contested["contest_mode"])
+        for toggle in self.toggles:
+            near = {Alliance.BLUE: 0, Alliance.RED: 0}
+            for robot in self.robots:
+                if math.hypot(robot.x - toggle.x, robot.y - toggle.y) <= INTERACTION_RANGE:
+                    near[robot.alliance] += 1
+            tid = toggle.toggle_id
+            challenger = self._toggle_challenger(near, toggle.owner, beta, mode)
+            if challenger is None or challenger is toggle.owner:
+                self._toggle_claim_timer[tid] = 0.0
+                self._toggle_pending[tid] = None
+                continue
+            if self._toggle_pending.get(tid) is not challenger:         # reset dwell if the challenger changed
+                self._toggle_pending[tid] = challenger
+                self._toggle_claim_timer[tid] = 0.0
+            self._toggle_claim_timer[tid] += dt
+            if self._toggle_claim_timer[tid] >= claim_dwell:
+                old = toggle.owner
+                delta = self._toggle_quadrant_value(toggle)
+                toggle.owner = challenger
+                self.reversal_events.append({
+                    "t": self.elapsed, "channel": "territory", "site_id": tid,
+                    "from_alliance": None if old is None else old.value,
+                    "to_alliance": challenger.value, "value_delta": delta,
+                })
+                self._toggle_claim_timer[tid] = 0.0
+                self._toggle_pending[tid] = None
+
+        if self.contested.get("enable_opponent_removal", True):
+            self._update_goal_descore(dt, beta, mode)
 
     def toggle_count(self, alliance: Alliance) -> int:
         return sum(t.owner is alliance for t in self.toggles)
@@ -387,6 +565,12 @@ class OverrideField:
         self.elapsed = MATCH_DURATION if advanced >= MATCH_DURATION-1e-9 else advanced
         if previous < OPENING_DURATION <= self.elapsed+1e-9: self._finish_opening()
         if self.elapsed >= MATCH_DURATION: self.phase = Phase.FINISHED
+
+    def static_obstacles(self) -> list[tuple[float, float, float]]:
+        """(x, y, radius) of every static obstacle — Goals and Loaders — for the
+        navigation controller's forward look-ahead avoidance."""
+        return ([(g.x, g.y, self.goal_radius) for g in self.goals]
+                + [(l.x, l.y, self.loader_radius) for l in self.loaders])
 
     def _resolve_static(self, robot: Robot, old: tuple[float, float]) -> None:
         obstacles = [(g.x, g.y, self.goal_radius) for g in self.goals] + [(l.x, l.y, self.loader_radius) for l in self.loaders]
@@ -459,4 +643,6 @@ class OverrideField:
             self._resolve_robot_collisions()
             for robot in self.robots:
                 self._project_robot_constraints(robot)
+        if self.contested_enabled:
+            self.update_contested(dt)
         self.advance_clock(dt)

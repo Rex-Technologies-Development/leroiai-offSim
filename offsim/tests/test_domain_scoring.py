@@ -56,6 +56,24 @@ def test_removable_alliance_pin_toggle_and_midfield_robot_points():
     assert field.raw_score(Alliance.BLUE)>=16
 
 
+def test_descore_removes_enemy_pin_and_respects_protection():
+    field=OverrideField(); red=field.robots[2]; assert red.alliance is Alliance.RED
+    # blue scores a Pin in a neutral Goal; red can come descore it
+    neutral=field.goals[1]
+    blue_pin=field._new_pin(("blue",YELLOW),None,None); field.pins[blue_pin].placed_goal=neutral.goal_id
+    neutral.stack.append(StackEntry("pin",blue_pin)); near(red,neutral)
+    before=field.raw_score(Alliance.BLUE)
+    assert field.can_descore(red,neutral) and field.descore_pin(red,neutral)
+    assert not neutral.stack                                   # pin removed from the goal
+    assert field.pins[blue_pin].placed_goal is None and field.pins[blue_pin].x is not None  # dropped loose
+    assert field.raw_score(Alliance.BLUE) < before            # blue's credit dropped
+    # a blue-protected Alliance Goal cannot be descored by red
+    blue_goal=next(g for g in field.goals if g.protected_by is Alliance.BLUE)
+    bp=field._new_pin(("blue",YELLOW),None,None); field.pins[bp].placed_goal=blue_goal.goal_id
+    blue_goal.stack.append(StackEntry("pin",bp)); near(red,blue_goal)
+    assert not field.can_descore(red,blue_goal) and not field.descore_pin(red,blue_goal)
+
+
 def test_midfield_owner_scores_centered_robot_and_owns_center_pin():
     field=OverrideField()
     for robot in field.robots: robot.x=robot.y=20

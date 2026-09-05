@@ -15,6 +15,11 @@ WHITE = (235, 238, 238)
 DARK = (25, 30, 34)
 NEUTRAL = (48, 53, 57)
 TILE = (72, 76, 77)
+BG = (16, 20, 23)
+
+# How many rendered frames a pickup pulse lasts. In human mode draw() is called
+# once per 0.05 s physics tick, so 12 frames is roughly a 0.6 s flash.
+PICKUP_PULSE_FRAMES = 12
 
 class PygameRenderer:
     GOAL_LEGEND_LABELS = (
@@ -45,6 +50,11 @@ class PygameRenderer:
         self.should_reset = False
         self.running = True
         self.speed = 1.0
+        # pickup-animation state (renderer is otherwise stateless per tick)
+        self._prev_pin: dict[int, int | None] = {}
+        self._prev_cup: dict[int, int | None] = {}
+        self._pickup_pulse: dict[int, int] = {}
+        self._field_id: int | None = None
 
     @property
     def scale(self) -> float:
@@ -213,11 +223,42 @@ class PygameRenderer:
         if tall:
             inset = p.Rect(cx - half + 4, cy - half + 4, half * 2 - 8, half * 2 - 8)
             p.draw.rect(self.screen, (160, 164, 166), inset, 2, border_radius=max(3, half // 4))
+        self._draw_goal_contents(field, goal, cx, cy, half)
         # Subtle ownership halo when a yellow Pin is owned (gameplay cue, not diagram ink).
         owner = field.goal_status_owner(goal)
         if owner is not None:
             p.draw.rect(self.screen, self._element_color(owner), rect.inflate(8, 8), 2,
                         border_radius=max(5, half // 3 + 2))
+
+    def _draw_goal_contents(self, field, goal, cx, cy, half):
+        """Show what's scored in a Goal on the field: a filled core that grows with
+        stack height, the visible Pin-half pips, and the entry count."""
+        p = self.pg
+        count = len(goal.stack)
+        if count == 0:
+            return
+        visible = goal.visible_pin_halves(field.pins)
+        frac = min(1.0, count / 8.0)                      # goal capacity is 8
+        inner = max(3, int(half * (0.35 + 0.5 * frac)))
+        core = p.Rect(cx - inner, cy - inner, 2 * inner, 2 * inner)
+        br = max(2, inner // 2)
+        if len(visible) >= 2:                             # two-tone core shows BOTH pin halves
+            p.draw.rect(self.screen, self._element_color(visible[0]), core, border_radius=br)
+            clip = self.screen.get_clip()
+            self.screen.set_clip(p.Rect(cx, cy - inner, inner, 2 * inner))   # right half only
+            p.draw.rect(self.screen, self._element_color(visible[1]), core, border_radius=br)
+            self.screen.set_clip(clip)
+        else:
+            p.draw.rect(self.screen, (150, 155, 158), core, border_radius=br)
+        p.draw.rect(self.screen, (15, 17, 19), core, 1, border_radius=br)
+        # visible Pin-half pips just above the Goal
+        for i, half_color in enumerate(visible[:2]):
+            px, py = cx - 5 + i * 10, cy - half - 6
+            p.draw.circle(self.screen, self._element_color(half_color), (px, py), 4)
+            p.draw.circle(self.screen, (18, 18, 18), (px, py), 4, 1)
+        # entry count centered over the core
+        num = self.tiny.render(str(count), True, WHITE)
+        self.screen.blit(num, num.get_rect(center=(cx, cy)))
 
     def _draw_toggle(self, toggle):
         p = self.pg
@@ -242,16 +283,85 @@ class PygameRenderer:
         direction = 1 if loader.alliance is Alliance.RED else -1
         p.draw.polygon(self.screen,color,[(cx+direction*15,cy),(cx+direction*8,cy-5),(cx+direction*8,cy+5)])
 
-    def _draw_robot(self, robot):
+    @staticmethod
+    def _lerp(a, b, t):
+        return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+    def _update_pickup_pulses(self, field):
+        """Detect None->held transitions per robot and arm a pulse; reset on a new match."""
+        if id(field) != self._field_id:                      # new field (reset): seed, don't flash
+            self._field_id = id(field)
+            self._pickup_pulse.clear()
+            self._prev_pin = {r.robot_id: r.held_pin for r in field.robots}
+            self._prev_cup = {r.robot_id: r.held_cup for r in field.robots}
+            return
+        for r in field.robots:
+            rid = r.robot_id
+            if self._prev_pin.get(rid) is None and r.held_pin is not None:
+                self._pickup_pulse[rid] = PICKUP_PULSE_FRAMES
+            if self._prev_cup.get(rid) is None and r.held_cup is not None:
+                self._pickup_pulse[rid] = PICKUP_PULSE_FRAMES
+            self._prev_pin[rid] = r.held_pin
+            self._prev_cup[rid] = r.held_cup
+
+    def _decay_pickup_pulses(self):
+        for rid in list(self._pickup_pulse):
+            self._pickup_pulse[rid] -= 1
+            if self._pickup_pulse[rid] <= 0:
+                del self._pickup_pulse[rid]
+
+    def _carry_anchor(self, robot, forward=5.0, perp=0.0):
+        fx, fy = math.cos(robot.heading), math.sin(robot.heading)
+        return self._xy(robot.x + forward * fx - perp * fy, robot.y + forward * fy + perp * fx)
+
+    def _draw_mini_pin(self, center, halves):
         p = self.pg
-        pos = self._xy(robot.x,robot.y)
+        cx, cy = center
+        colors = [self._element_color(h) for h in halves]
+        for axis, color in ((0, colors[0]), (1, colors[1])):
+            ux, uy = math.cos(axis * math.pi / 2), -math.sin(axis * math.pi / 2)
+            p.draw.line(self.screen, color, (int(cx - ux * 6), int(cy - uy * 6)), (int(cx + ux * 6), int(cy + uy * 6)), 3)
+        p.draw.circle(self.screen, (18, 18, 18), (int(cx), int(cy)), 2)
+
+    def _draw_mini_cup(self, center):
+        p = self.pg
+        cx, cy = int(center[0]), int(center[1])
+        p.draw.circle(self.screen, (30, 34, 36), (cx, cy), 5)
+        p.draw.circle(self.screen, (160, 168, 170), (cx, cy), 5, 2)
+
+    def _draw_carried(self, field, robot):
+        """Draw the Pin/Cup the robot is currently holding, in its 'gripper' (heading)."""
+        if robot.held_pin is not None and robot.held_pin in field.pins:
+            self._draw_mini_pin(self._carry_anchor(robot, forward=6, perp=3.5), field.pins[robot.held_pin].halves)
+        if robot.held_cup is not None:
+            self._draw_mini_cup(self._carry_anchor(robot, forward=6, perp=-3.5))
+
+    def _robot_rect_points(self, robot):
+        """Screen corners of the robot's rotated rectangular footprint (length along heading)."""
+        hl, hw = robot.length / 2.0, robot.width / 2.0
+        c, s = math.cos(robot.heading), math.sin(robot.heading)
+        return [self._xy(robot.x + lx * c - ly * s, robot.y + lx * s + ly * c)
+                for lx, ly in ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))]
+
+    def _draw_robot(self, field, robot):
+        p = self.pg
+        pos = self._xy(robot.x, robot.y)
         color = BLUE if robot.alliance is Alliance.BLUE else RED
-        p.draw.circle(self.screen,(17,20,22),pos,23)
-        p.draw.circle(self.screen,color,pos,21)
-        tip = self._xy(robot.x+8*math.cos(robot.heading),robot.y+8*math.sin(robot.heading))
-        p.draw.line(self.screen,WHITE,pos,tip,3)
-        label = self.tiny.render(f"R{robot.robot_id} P{int(robot.held_pin is not None)} C{int(robot.held_cup is not None)}",True,WHITE)
-        self.screen.blit(label,(pos[0]-24,pos[1]+23))
+        rpx = max(10, int(max(robot.width, robot.length) / 2 * self.scale))
+        pulse = self._pickup_pulse.get(robot.robot_id, 0)
+        if pulse > 0:                                        # expanding, fading pickup ring
+            frac = pulse / PICKUP_PULSE_FRAMES
+            p.draw.circle(self.screen, self._lerp(YELLOW, BG, 1 - frac), pos, rpx + 3 + int((1 - frac) * 16), 3)
+        points = self._robot_rect_points(robot)
+        p.draw.polygon(self.screen, color, points)
+        p.draw.polygon(self.screen, (17, 20, 22), points, 2)
+        # heading indicator: from center to the middle of the front edge
+        front = self._xy(robot.x + (robot.length / 2) * math.cos(robot.heading),
+                         robot.y + (robot.length / 2) * math.sin(robot.heading))
+        p.draw.line(self.screen, WHITE, pos, front, 3)
+        self._draw_carried(field, robot)
+        label = self.tiny.render(f"R{robot.robot_id} P{int(robot.held_pin is not None)} C{int(robot.held_cup is not None)}", True, WHITE)
+        self.screen.blit(label, (pos[0] - 24, pos[1] + rpx + 4))
 
     def _draw_compass(self, x, y):
         p = self.pg
@@ -293,7 +403,8 @@ class PygameRenderer:
     def draw(self, field):
         p = self.pg
         self.handle_events()
-        self.screen.fill((16,20,23))
+        self._update_pickup_pulses(field)
+        self.screen.fill(BG)
         low, high = self._xy(0,0), self._xy(144,144)
         rect = p.Rect(low[0],high[1],high[0]-low[0],low[1]-high[1])
         p.draw.rect(self.screen,(57,62,63),rect)
@@ -303,7 +414,8 @@ class PygameRenderer:
         for goal in field.goals: self._draw_goal(field,goal)
         for loader in field.loaders: self._draw_loader(loader)
         for toggle in field.toggles: self._draw_toggle(toggle)
-        for robot in field.robots: self._draw_robot(robot)
+        for robot in field.robots: self._draw_robot(field, robot)
+        self._decay_pickup_pulses()
         p.draw.rect(self.screen,(206,211,212),rect,4)
         self._draw_panel(field)
         p.display.flip()

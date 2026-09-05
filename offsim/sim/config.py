@@ -48,6 +48,8 @@ OPENING_DURATION = float(PROFILE["opening_duration"])
 DT = float(PROFILE["dt"])
 DECISION_INTERVAL = float(PROFILE["decision_interval"])
 ROBOT_RADIUS = float(ROBOT["radius"])
+ROBOT_WIDTH = float(ROBOT.get("width", 2.0 * ROBOT_RADIUS))
+ROBOT_LENGTH = float(ROBOT.get("length", 2.0 * ROBOT_RADIUS))
 MAX_FORWARD_SPEED = float(ROBOT["max_forward_speed"])
 MAX_LATERAL_SPEED = float(ROBOT["max_lateral_speed"])
 MAX_YAW_RATE = float(ROBOT["max_yaw_rate"])
@@ -62,3 +64,22 @@ ALLIANCE_HALF_POINTS = int(SCORING["alliance_half"])
 OWNED_YELLOW_POINTS = int(SCORING["owned_yellow_half"])
 MIDFIELD_ROBOT_POINTS = int(SCORING["midfield_robot"])
 OPENING_BONUS_POINTS = int(SCORING["opening_bonus"])
+
+# TENURE contested mechanic (plan Section 4). Merged with defaults so a config
+# file without a `contested:` block still loads and stays OFF by default.
+CONTESTED_DEFAULTS = {
+    "enabled": False,
+    "objective_set": "v1",
+    "toggle_claim_dwell": 1.0,
+    "pin_removal_dwell": 1.5,
+    "enable_opponent_removal": True,
+    "alpha_scale": 1.0,
+    "contest_mode": "majority",
+    "beta": 1.0,
+    "opponent_archetype": "greedy_nearest",
+}
+CONTESTED = {**CONTESTED_DEFAULTS, **(SHARED_CONFIG.get("contested") or {})}
+if CONTESTED["contest_mode"] not in ("majority", "suppress", "none"):
+    raise ValueError(f"contested.contest_mode must be majority|suppress|none, got {CONTESTED['contest_mode']!r}")
+if CONTESTED["objective_set"] not in ("v1", "v2"):
+    raise ValueError(f"contested.objective_set must be v1|v2, got {CONTESTED['objective_set']!r}")

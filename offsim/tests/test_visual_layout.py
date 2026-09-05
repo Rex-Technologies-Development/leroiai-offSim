@@ -81,6 +81,21 @@ def test_corrected_renderer_frame_includes_expanded_status_panel(monkeypatch):
     env.close()
 
 
+def test_pickup_pulse_arms_on_new_object_and_seeds_without_flashing(monkeypatch):
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    field = OverrideField("tank", seed=1)
+    renderer = PygameRenderer(render_mode="rgb_array", size=400)
+    robot = field.robots[0]
+    robot.held_pin = None; robot.held_cup = None
+    renderer.draw(field)                              # first draw seeds prev-held; must not flash
+    assert 0 not in renderer._pickup_pulse
+    cup = field.nearest_object(robot, "cup"); robot.x, robot.y = cup.x, cup.y
+    assert field.collect(robot, "cup")
+    renderer.draw(field)                              # None -> held triggers the pulse
+    assert renderer._pickup_pulse.get(0, 0) > 0
+    renderer.close()
+
+
 def test_match_load_pin_color_split_and_goal_halo_gating():
     field=OverrideField(); robot=field.robots[0]
     robot.held_pin=None; robot.held_cup=None

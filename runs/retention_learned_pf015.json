@@ -1,0 +1,84 @@
+{
+  "regime": {
+    "alpha": 3.0,
+    "n_tasks": 16,
+    "n_robots": 2,
+    "n_adversaries": 6,
+    "tau_com": 5.0,
+    "adversary_population": [
+      "camper"
+    ],
+    "horizon_T": 60.0,
+    "protected_fraction": 0.15
+  },
+  "args": {
+    "modes": [
+      "off",
+      "multiplicative"
+    ],
+    "updates": 100,
+    "seeds": 3,
+    "window": 15,
+    "batch": 192,
+    "lr": 0.0003,
+    "lam_r": 0.5,
+    "pf": 0.15,
+    "horizon": 60.0,
+    "alpha": 3.0,
+    "n_tasks": 16,
+    "n_robots": 2,
+    "n_adversaries": 6,
+    "tau_com": 5.0,
+    "adversary": "camper",
+    "log_every": 5,
+    "out": "runs/retention_learned_pf015.json"
+  },
+  "results": {
+    "off": [
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.05696973204612732,
+        "J_H_train": 8.723716503785301e-06,
+        "ret_MAE": 0.4392639696598053
+      },
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.0656454935669899,
+        "J_H_train": 6.376769403383756e-05,
+        "ret_MAE": 0.20154889952391386
+      },
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.05507412552833557,
+        "J_H_train": 3.088981460071712e-06,
+        "ret_MAE": 0.2586330200235049
+      }
+    ],
+    "multiplicative": [
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.0704273134469986,
+        "J_H_train": 0.0,
+        "ret_MAE": NaN
+      },
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.04762391373515129,
+        "J_H_train": 2.001704948876674e-06,
+        "ret_MAE": 0.3019969314336777
+      },
+      {
+        "device": "cuda",
+        "params": 434845,
+        "J_H_eval": 0.054249249398708344,
+        "J_H_train": 2.438753526803339e-05,
+        "ret_MAE": 0.1648120954632759
+      }
+    ]
+  }
+}

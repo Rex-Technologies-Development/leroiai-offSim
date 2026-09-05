@@ -20,6 +20,10 @@ field:
   load_zone_span: 26.0
 robot:
   radius: 7.5
+  # Visual/footprint dimensions (inches). Square by default; set length != width
+  # for a rectangular chassis. Collision physics still uses `radius`.
+  width: 15.0
+  length: 15.0
   max_forward_speed: 30.0
   max_lateral_speed: 26.0
   max_yaw_rate: 3.141592653589793
@@ -34,7 +38,8 @@ objects:
   match_load_pins_per_alliance: 13
   match_load_yellow_pins_per_alliance: 3
   match_load_cups_per_alliance: 10
-  goal_capacity: 8
+  # Max stack height a robot can reach to place onto in a single Goal (~5 realistic).
+  goal_capacity: 5
 scoring:
   alliance_half: 5
   owned_yellow_half: 10
@@ -54,3 +59,16 @@ actions:
 num_actions: 10
 state:
   per_robot_dim: 80
+# TENURE contested mechanic (plan Section 4). Default OFF so existing behaviour,
+# tests, and models/final_model.zip are byte-compatible. Channel 1 = territory
+# (dwell-based Toggle claim + opponent re-claim); see offsim/sim/field.py.
+contested:
+  enabled: false
+  objective_set: v1          # v1 = shipped 10 objectives; v2 = extended [13,13]
+  toggle_claim_dwell: 1.0    # seconds to claim/flip a Toggle (tau_com for territory)
+  pin_removal_dwell: 1.5     # seconds for opponent Pin removal (Channel 2)
+  enable_opponent_removal: true
+  alpha_scale: 1.0           # multiplies dwell times; 1.0 is the rules operating point
+  contest_mode: majority     # majority | suppress | none
+  beta: 1.0
+  opponent_archetype: greedy_nearest

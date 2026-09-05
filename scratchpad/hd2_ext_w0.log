@@ -1,0 +1,211 @@
+[x0 21:28:19] EXTEND off_aware_s0 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_aware_s0.pt (mode=off); optimizer restarts
+device=cuda params=468514 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.215  MAE~0.164  ent~5.424  eta 23m40s
+[######----------------]   40/150  26%  J_H~0.260  MAE~0.168  ent~5.344  eta 17m38s
+[#########-------------]   60/150  40%  J_H~0.327  MAE~0.158  ent~5.209  eta 13m45s
+[############----------]   80/150  53%  J_H~0.375  MAE~0.160  ent~5.185  eta 10m28s
+[###############-------]  100/150  66%  J_H~0.420  MAE~0.153  ent~5.155  eta 7m21s
+[##################----]  120/150  80%  J_H~0.460  MAE~0.151  ent~4.766  eta 4m21s
+[#####################-]  140/150  93%  J_H~0.460  MAE~0.145  ent~4.565  eta 1m26s
+[######################]  150/150 100%  J_H~0.489  MAE~0.145  ent~4.438  eta 0s
+done: best J_H(train)=0.5253
+saved checkpoint -> tenure/checkpoints/hd2370_off_aware_s0.pt
+[x0 21:49:59] DONE off_aware_s0
+[x0 21:49:59] EXTEND off_blind_s0 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_blind_s0.pt (mode=off); optimizer restarts
+device=cuda params=468002 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.084  MAE~0.150  ent~7.127  eta 17m54s
+[######----------------]   40/150  26%  J_H~0.102  MAE~0.143  ent~7.108  eta 15m28s
+[#########-------------]   60/150  40%  J_H~0.102  MAE~0.147  ent~7.129  eta 12m59s
+[############----------]   80/150  53%  J_H~0.122  MAE~0.142  ent~6.882  eta 10m15s
+[###############-------]  100/150  66%  J_H~0.147  MAE~0.141  ent~6.804  eta 7m20s
+[##################----]  120/150  80%  J_H~0.137  MAE~0.145  ent~6.900  eta 4m23s
+[#####################-]  140/150  93%  J_H~0.173  MAE~0.139  ent~6.524  eta 1m28s
+[######################]  150/150 100%  J_H~0.188  MAE~0.141  ent~6.448  eta 0s
+done: best J_H(train)=0.2043
+saved checkpoint -> tenure/checkpoints/hd2370_off_blind_s0.pt
+[x0 22:12:07] DONE off_blind_s0
+[x0 22:12:07] EXTEND mult_aware_s0 (220->370)
+resumed weights from tenure/checkpoints/hd2_mult_aware_s0.pt (mode=multiplicative); optimizer restarts
+device=cuda params=468514 mode=multiplicative alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.104  MAE~0.166  ent~6.490  eta 19m46s
+[######----------------]   40/150  26%  J_H~0.171  MAE~0.168  ent~5.404  eta 17m02s
+[#########-------------]   60/150  40%  J_H~0.191  MAE~0.161  ent~5.098  eta 13m58s
+[############----------]   80/150  53%  J_H~0.202  MAE~0.164  ent~5.409  eta 10m48s
+[###############-------]  100/150  66%  J_H~0.261  MAE~0.160  ent~4.822  eta 7m42s
+[##################----]  120/150  80%  J_H~0.297  MAE~0.153  ent~4.517  eta 4m36s
+[#####################-]  140/150  93%  J_H~0.365  MAE~0.153  ent~4.308  eta 1m32s
+[######################]  150/150 100%  J_H~0.383  MAE~0.149  ent~4.497  eta 0s
+done: best J_H(train)=0.4133
+saved checkpoint -> tenure/checkpoints/hd2370_mult_aware_s0.pt
+[x0 22:35:14] DONE mult_aware_s0
+[x0 22:35:14] EXTEND off_aware_s1 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_aware_s1.pt (mode=off); optimizer restarts
+device=cuda params=468514 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.142  MAE~0.144  ent~3.867  eta 22m52s
+[######----------------]   40/150  26%  J_H~0.179  MAE~0.144  ent~3.325  eta 17m40s
+[#########-------------]   60/150  40%  J_H~0.233  MAE~0.138  ent~3.141  eta 14m13s
+[############----------]   80/150  53%  J_H~0.260  MAE~0.144  ent~3.697  eta 10m43s
+[###############-------]  100/150  66%  J_H~0.348  MAE~0.134  ent~3.810  eta 7m28s
+[##################----]  120/150  80%  J_H~0.387  MAE~0.139  ent~4.341  eta 4m25s
+[#####################-]  140/150  93%  J_H~0.400  MAE~0.141  ent~4.936  eta 1m27s
+[######################]  150/150 100%  J_H~0.401  MAE~0.147  ent~4.510  eta 0s
+done: best J_H(train)=0.4612
+saved checkpoint -> tenure/checkpoints/hd2370_off_aware_s1.pt
+[x0 22:57:02] DONE off_aware_s1
+[x0 22:57:02] EXTEND off_blind_s1 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_blind_s1.pt (mode=off); optimizer restarts
+device=cuda params=468002 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.102  MAE~0.138  ent~6.763  eta 17m25s
+[######----------------]   40/150  26%  J_H~0.110  MAE~0.140  ent~7.076  eta 14m41s
+[#########-------------]   60/150  40%  J_H~0.112  MAE~0.149  ent~6.978  eta 12m03s
+[############----------]   80/150  53%  J_H~0.150  MAE~0.161  ent~6.698  eta 9m22s
+[###############-------]  100/150  66%  J_H~0.180  MAE~0.161  ent~6.653  eta 6m41s
+[##################----]  120/150  80%  J_H~0.192  MAE~0.152  ent~6.658  eta 4m01s
+[#####################-]  140/150  93%  J_H~0.221  MAE~0.161  ent~6.112  eta 1m20s
+[######################]  150/150 100%  J_H~0.263  MAE~0.149  ent~6.117  eta 0s
+done: best J_H(train)=0.3009
+saved checkpoint -> tenure/checkpoints/hd2370_off_blind_s1.pt
+[x0 23:17:12] DONE off_blind_s1
+[x0 23:17:12] EXTEND mult_aware_s1 (220->370)
+resumed weights from tenure/checkpoints/hd2_mult_aware_s1.pt (mode=multiplicative); optimizer restarts
+device=cuda params=468514 mode=multiplicative alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.050  MAE~0.119  ent~7.510  eta 17m27s
+[######----------------]   40/150  26%  J_H~0.033  MAE~0.109  ent~7.669  eta 14m43s
+[#########-------------]   60/150  40%  J_H~0.041  MAE~0.100  ent~7.530  eta 12m00s
+[############----------]   80/150  53%  J_H~0.043  MAE~0.112  ent~7.596  eta 9m19s
+[###############-------]  100/150  66%  J_H~0.044  MAE~0.109  ent~7.656  eta 6m39s
+[##################----]  120/150  80%  J_H~0.065  MAE~0.118  ent~7.279  eta 3m59s
+[#####################-]  140/150  93%  J_H~0.098  MAE~0.130  ent~6.907  eta 1m19s
+[######################]  150/150 100%  J_H~0.115  MAE~0.126  ent~6.467  eta 0s
+done: best J_H(train)=0.1345
+saved checkpoint -> tenure/checkpoints/hd2370_mult_aware_s1.pt
+[x0 23:37:14] DONE mult_aware_s1
+[x0 23:37:14] EXTEND off_aware_s2 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_aware_s2.pt (mode=off); optimizer restarts
+device=cuda params=468514 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.173  MAE~0.152  ent~5.979  eta 20m40s
+[######----------------]   40/150  26%  J_H~0.243  MAE~0.158  ent~5.184  eta 17m24s
+[#########-------------]   60/150  40%  J_H~0.340  MAE~0.157  ent~4.853  eta 13m29s
+[############----------]   80/150  53%  J_H~0.373  MAE~0.159  ent~4.745  eta 10m12s
+[###############-------]  100/150  66%  J_H~0.429  MAE~0.151  ent~4.513  eta 7m10s
+[##################----]  120/150  80%  J_H~0.414  MAE~0.155  ent~4.879  eta 4m15s
+[#####################-]  140/150  93%  J_H~0.441  MAE~0.151  ent~4.755  eta 1m24s
+[######################]  150/150 100%  J_H~0.467  MAE~0.143  ent~4.828  eta 0s
+done: best J_H(train)=0.5007
+saved checkpoint -> tenure/checkpoints/hd2370_off_aware_s2.pt
+[x0 23:58:19] DONE off_aware_s2
+[x0 23:58:19] EXTEND off_blind_s2 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_blind_s2.pt (mode=off); optimizer restarts
+device=cuda params=468002 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.280  MAE~0.158  ent~5.189  eta 17m31s
+[######----------------]   40/150  26%  J_H~0.325  MAE~0.155  ent~5.208  eta 14m47s
+[#########-------------]   60/150  40%  J_H~0.362  MAE~0.150  ent~5.063  eta 12m05s
+[############----------]   80/150  53%  J_H~0.385  MAE~0.149  ent~5.112  eta 9m23s
+[###############-------]  100/150  66%  J_H~0.395  MAE~0.149  ent~5.042  eta 6m42s
+[##################----]  120/150  80%  J_H~0.417  MAE~0.142  ent~4.841  eta 4m01s
+[#####################-]  140/150  93%  J_H~0.446  MAE~0.142  ent~4.881  eta 1m20s
+[######################]  150/150 100%  J_H~0.452  MAE~0.144  ent~5.110  eta 0s
+done: best J_H(train)=0.4947
+saved checkpoint -> tenure/checkpoints/hd2370_off_blind_s2.pt
+[x0 00:18:28] DONE off_blind_s2
+[x0 00:18:28] EXTEND mult_aware_s2 (220->370)
+resumed weights from tenure/checkpoints/hd2_mult_aware_s2.pt (mode=multiplicative); optimizer restarts
+device=cuda params=468514 mode=multiplicative alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.085  MAE~0.145  ent~6.361  eta 21m02s
+[######----------------]   40/150  26%  J_H~0.154  MAE~0.149  ent~3.642  eta 18m23s
+[#########-------------]   60/150  40%  J_H~0.186  MAE~0.149  ent~3.403  eta 14m04s
+[############----------]   80/150  53%  J_H~0.207  MAE~0.148  ent~3.814  eta 10m33s
+[###############-------]  100/150  66%  J_H~0.298  MAE~0.148  ent~3.612  eta 7m22s
+[##################----]  120/150  80%  J_H~0.302  MAE~0.155  ent~4.303  eta 4m21s
+[#####################-]  140/150  93%  J_H~0.343  MAE~0.161  ent~4.636  eta 1m26s
+[######################]  150/150 100%  J_H~0.382  MAE~0.147  ent~4.556  eta 0s
+done: best J_H(train)=0.4278
+saved checkpoint -> tenure/checkpoints/hd2370_mult_aware_s2.pt
+[x0 00:39:57] DONE mult_aware_s2
+[x0 00:39:57] EXTEND off_aware_s3 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_aware_s3.pt (mode=off); optimizer restarts
+device=cuda params=468514 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.117  MAE~0.147  ent~7.122  eta 21m57s
+[######----------------]   40/150  26%  J_H~0.146  MAE~0.136  ent~6.646  eta 18m49s
+[#########-------------]   60/150  40%  J_H~0.179  MAE~0.138  ent~6.613  eta 14m28s
+[############----------]   80/150  53%  J_H~0.196  MAE~0.141  ent~6.449  eta 10m57s
+[###############-------]  100/150  66%  J_H~0.210  MAE~0.142  ent~6.397  eta 7m39s
+[##################----]  120/150  80%  J_H~0.201  MAE~0.140  ent~6.468  eta 4m31s
+[#####################-]  140/150  93%  J_H~0.212  MAE~0.141  ent~6.307  eta 1m29s
+[######################]  150/150 100%  J_H~0.212  MAE~0.143  ent~6.383  eta 0s
+done: best J_H(train)=0.2469
+saved checkpoint -> tenure/checkpoints/hd2370_off_aware_s3.pt
+[x0 01:02:08] DONE off_aware_s3
+[x0 01:02:09] EXTEND off_blind_s3 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_blind_s3.pt (mode=off); optimizer restarts
+device=cuda params=468002 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.049  MAE~0.139  ent~7.211  eta 17m47s
+[######----------------]   40/150  26%  J_H~0.080  MAE~0.141  ent~7.042  eta 14m55s
+[#########-------------]   60/150  40%  J_H~0.105  MAE~0.138  ent~5.989  eta 12m10s
+[############----------]   80/150  53%  J_H~0.163  MAE~0.139  ent~4.185  eta 9m27s
+[###############-------]  100/150  66%  J_H~0.243  MAE~0.142  ent~3.789  eta 6m44s
+[##################----]  120/150  80%  J_H~0.256  MAE~0.154  ent~4.369  eta 4m02s
+[#####################-]  140/150  93%  J_H~0.303  MAE~0.146  ent~4.420  eta 1m20s
+[######################]  150/150 100%  J_H~0.305  MAE~0.146  ent~4.022  eta 0s
+done: best J_H(train)=0.3385
+saved checkpoint -> tenure/checkpoints/hd2370_off_blind_s3.pt
+[x0 01:22:26] DONE off_blind_s3
+[x0 01:22:26] EXTEND mult_aware_s3 (220->370)
+resumed weights from tenure/checkpoints/hd2_mult_aware_s3.pt (mode=multiplicative); optimizer restarts
+device=cuda params=468514 mode=multiplicative alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.193  MAE~0.092  ent~3.984  eta 17m36s
+[######----------------]   40/150  26%  J_H~0.209  MAE~0.103  ent~3.798  eta 14m53s
+[#########-------------]   60/150  40%  J_H~0.230  MAE~0.095  ent~3.814  eta 12m09s
+[############----------]   80/150  53%  J_H~0.241  MAE~0.111  ent~3.806  eta 9m26s
+[###############-------]  100/150  66%  J_H~0.289  MAE~0.106  ent~3.587  eta 6m45s
+[##################----]  120/150  80%  J_H~0.319  MAE~0.111  ent~3.496  eta 4m02s
+[#####################-]  140/150  93%  J_H~0.341  MAE~0.125  ent~3.669  eta 1m20s
+[######################]  150/150 100%  J_H~0.367  MAE~0.127  ent~3.616  eta 0s
+done: best J_H(train)=0.3796
+saved checkpoint -> tenure/checkpoints/hd2370_mult_aware_s3.pt
+[x0 01:42:42] DONE mult_aware_s3
+[x0 01:42:42] EXTEND off_aware_s4 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_aware_s4.pt (mode=off); optimizer restarts
+device=cuda params=468514 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.360  MAE~0.151  ent~4.344  eta 22m59s
+[######----------------]   40/150  26%  J_H~0.356  MAE~0.155  ent~4.253  eta 19m37s
+[#########-------------]   60/150  40%  J_H~0.383  MAE~0.153  ent~4.439  eta 14m58s
+[############----------]   80/150  53%  J_H~0.409  MAE~0.153  ent~4.537  eta 11m08s
+[###############-------]  100/150  66%  J_H~0.467  MAE~0.144  ent~4.233  eta 7m44s
+[##################----]  120/150  80%  J_H~0.457  MAE~0.145  ent~4.319  eta 4m33s
+[#####################-]  140/150  93%  J_H~0.422  MAE~0.152  ent~4.781  eta 1m29s
+[######################]  150/150 100%  J_H~0.454  MAE~0.151  ent~4.832  eta 0s
+done: best J_H(train)=0.5344
+saved checkpoint -> tenure/checkpoints/hd2370_off_aware_s4.pt
+[x0 02:05:02] DONE off_aware_s4
+[x0 02:05:02] EXTEND off_blind_s4 (220->370)
+resumed weights from tenure/checkpoints/hd2_off_blind_s4.pt (mode=off); optimizer restarts
+device=cuda params=468002 mode=off alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.196  MAE~0.126  ent~3.417  eta 17m47s
+[######----------------]   40/150  26%  J_H~0.231  MAE~0.148  ent~4.047  eta 19m45s
+[#########-------------]   60/150  40%  J_H~0.223  MAE~0.148  ent~3.887  eta 14m51s
+[############----------]   80/150  53%  J_H~0.236  MAE~0.147  ent~3.384  eta 11m01s
+[###############-------]  100/150  66%  J_H~0.274  MAE~0.139  ent~3.701  eta 7m38s
+[##################----]  120/150  80%  J_H~0.307  MAE~0.136  ent~3.559  eta 4m29s
+[#####################-]  140/150  93%  J_H~0.338  MAE~0.139  ent~3.742  eta 1m28s
+[######################]  150/150 100%  J_H~0.348  MAE~0.140  ent~3.446  eta 0s
+done: best J_H(train)=0.3771
+saved checkpoint -> tenure/checkpoints/hd2370_off_blind_s4.pt
+[x0 02:27:02] DONE off_blind_s4
+[x0 02:27:02] EXTEND mult_aware_s4 (220->370)
+resumed weights from tenure/checkpoints/hd2_mult_aware_s4.pt (mode=multiplicative); optimizer restarts
+device=cuda params=468514 mode=multiplicative alpha=1.0 D=90
+[###-------------------]   20/150  13%  J_H~0.046  MAE~0.142  ent~7.340  eta 17m24s
+[######----------------]   40/150  26%  J_H~0.090  MAE~0.141  ent~6.849  eta 14m42s
+[#########-------------]   60/150  40%  J_H~0.118  MAE~0.149  ent~6.597  eta 12m02s
+[############----------]   80/150  53%  J_H~0.129  MAE~0.158  ent~6.476  eta 9m21s
+[###############-------]  100/150  66%  J_H~0.181  MAE~0.159  ent~6.134  eta 6m41s
+[##################----]  120/150  80%  J_H~0.261  MAE~0.164  ent~4.654  eta 4m00s
+[#####################-]  140/150  93%  J_H~0.324  MAE~0.166  ent~4.916  eta 1m20s
+[######################]  150/150 100%  J_H~0.343  MAE~0.164  ent~5.027  eta 0s
+done: best J_H(train)=0.3780 (stopped @ 150 updates)
+saved checkpoint -> tenure/checkpoints/hd2370_mult_aware_s4.pt
+[x0 02:47:10] DONE mult_aware_s4
+[x0 02:47:10] EXT WORKER 0 EXIT (queue drained)
